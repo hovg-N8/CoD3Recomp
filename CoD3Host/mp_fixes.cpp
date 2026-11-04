@@ -10,6 +10,7 @@
 #include "kernel.h"
 #include "bot_loadouts.h"
 #include "input.h"
+#include "button_prompts.h"
 #include "tactical_point_input.h"
 #include "overlay.h"
 #include "render.h"
@@ -4413,7 +4414,7 @@ namespace
                 draw->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), gold, 6.0f * scale, 0, 2.0f * scale);
                 draw->AddText(font, big, ImVec2(x + 14 * scale, y + 6 * scale), view.ready ? gold : white, text);
                 draw->AddText(font, small, ImVec2(x + 14 * scale, y + 36 * scale), white,
-                              view.ready ? "RT FIRE    LOOK UP/DOWN: RANGE    D-PAD RIGHT: PUT AWAY" : "LOADING...    D-PAD RIGHT: PUT AWAY");
+                              (ButtonPrompts::KeyboardActive() ? (view.ready ? (ButtonPrompts::ActionKey(Settings::Fire) + " FIRE    MOUSE: RANGE    [RIGHT]: PUT AWAY").c_str() : "LOADING...    [RIGHT]: PUT AWAY") : (view.ready ? "RT FIRE    LOOK UP/DOWN: RANGE    D-PAD RIGHT: PUT AWAY" : "LOADING...    D-PAD RIGHT: PUT AWAY")));
             }
         }
         if (!box.active) return;
@@ -4446,6 +4447,13 @@ namespace
         const char* hint = box.mortar ? "D-PAD RIGHT put the mortar away"
                          : box.armed ? (box.typhoon ? "MARK THE RUN: fire the binoculars" : "MARK THE SPOT: fire the binoculars")
                                      : "D-PAD DOWN pick   D-PAD RIGHT call";
+        std::string keyboardHint;
+        if (ButtonPrompts::KeyboardActive()) {
+            keyboardHint = box.mortar ? "[Right] put the mortar away" : box.armed ?
+                (ButtonPrompts::ActionKey(Settings::Fire) + (box.typhoon ? " mark the run" : " mark the spot")) :
+                (ButtonPrompts::ActionKey(Settings::BinocularsAway) + " pick   [Right] call");
+            hint = keyboardHint.c_str();
+        }
         draw->AddText(font, small, ImVec2(x + 12 * scale, y + h + 4 * scale), dim, hint);
     }
 }

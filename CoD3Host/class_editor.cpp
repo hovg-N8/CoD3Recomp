@@ -13,6 +13,7 @@
 
 #include "class_editor.h"
 #include "input.h"
+#include "button_prompts.h"
 #include "kernel.h"
 #include "overlay.h"
 #include "settings.h"
@@ -119,7 +120,7 @@ namespace
             draw->AddText(font, size, ImVec2(at.x + 300 * scale, y), colour, shown.c_str());
         }
         draw->AddText(font, size * 0.7f, ImVec2(at.x + 28 * scale, at.y + panelH - 40 * scale), IM_COL32(200, 190, 160, 255),
-                      "UP/DOWN: ROW    LEFT/RIGHT: CHANGE    A: USE    B: CLOSE    (NAMES: F11)");
+                      (ButtonPrompts::KeyboardActive() ? ("UP/DOWN: ROW    LEFT/RIGHT: CHANGE    " + ButtonPrompts::ActionKey(Settings::Jump) + ": USE    " + ButtonPrompts::ActionKey(Settings::Crouch) + ": CLOSE    (NAMES: F11)").c_str() : "UP/DOWN: ROW    LEFT/RIGHT: CHANGE    A: USE    B: CLOSE    (NAMES: F11)"));
     }
 }
 

@@ -122,6 +122,7 @@ void Settings::Set(const Values& values)
         std::lock_guard<std::mutex> lock(g_mutex);
         g_values = values;
     }
+    Blood::Configure(values.blood);
     Save();
 }
 
@@ -129,6 +130,7 @@ void Settings::Preview(const Values& values)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_values = values;
+    Blood::Configure(values.blood);
 }
 void Settings::Load(const std::filesystem::path& exeDirectory)
 {
@@ -275,6 +277,26 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
                 }
             }
             else if (key == "direct_mouse") v.directMouse = atoi(value.c_str()) != 0;
+            else if (key == "blood_enabled") v.blood.enabled = atoi(value.c_str()) != 0;
+            else if (key == "blood_amount") v.blood.amount = atoi(value.c_str());
+            else if (key == "blood_density") v.blood.density = atoi(value.c_str());
+            else if (key == "blood_cloud_size") v.blood.cloudSize = float(atof(value.c_str()));
+            else if (key == "blood_cloud_opacity") v.blood.cloudOpacity = float(atof(value.c_str()));
+            else if (key == "blood_size") v.blood.size = float(atof(value.c_str()));
+            else if (key == "blood_decals") v.blood.decals = atoi(value.c_str()) != 0;
+            else if (key == "blood_physics") v.blood.physics = atoi(value.c_str()) != 0;
+            else if (key == "blood_persistence") v.blood.persistence = atoi(value.c_str());
+            else if (key == "blood_max_decals") v.blood.maxDecals = atoi(value.c_str());
+            else if (key == "blood_red") v.blood.color[0] = float(atof(value.c_str()));
+            else if (key == "blood_green") v.blood.color[1] = float(atof(value.c_str()));
+            else if (key == "blood_blue") v.blood.color[2] = float(atof(value.c_str()));
+            else if (key == "hitmarkers") v.hitmarkers = atoi(value.c_str()) != 0;
+            else if (key == "hitmarker_sound") v.hitmarkerSound = atoi(value.c_str()) != 0;
+            else if (key == "hitmarker_red_kill") v.hitmarkerRedKill = atoi(value.c_str()) != 0;
+            else if (key == "hitmarker_size") v.hitmarkerSize = atoi(value.c_str());
+            else if (key == "hitmarker_opacity") v.hitmarkerOpacity = atoi(value.c_str());
+            else if (key == "hitmarker_duration") v.hitmarkerDuration = atoi(value.c_str());
+            else if (key == "hitmarker_volume") v.hitmarkerVolume = atoi(value.c_str());
             else if (key == "toggle_sprint") v.toggleSprint = atoi(value.c_str()) != 0;
             else if (key == "shell_shock_blur") v.shellShockBlur = atoi(value.c_str()) != 0;
             else if (key == "melee_lunge") v.meleeLunge = atoi(value.c_str()) != 0;
@@ -300,6 +322,11 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
         }
         fclose(file);
     }
+    Blood::Clamp(v.blood);
+    v.hitmarkerSize = std::clamp(v.hitmarkerSize, 16, 160);
+    v.hitmarkerOpacity = std::clamp(v.hitmarkerOpacity, 0, 100);
+    v.hitmarkerDuration = std::clamp(v.hitmarkerDuration, 50, 1000);
+    v.hitmarkerVolume = std::clamp(v.hitmarkerVolume, 0, 100);
     if (v.renderer < 0 || v.renderer > 2) v.renderer = 0;
     if (v.resolutionWidth < 320 || v.resolutionHeight < 240 || v.resolutionWidth > 16384 || v.resolutionHeight > 16384) { v.resolutionWidth = 0; v.resolutionHeight = 0; }
     if (v.resolutionScale < 25 || v.resolutionScale > 200) v.resolutionScale = 100;
@@ -338,6 +365,7 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
     if (!(v.mouseSensitivity >= 0.1f && v.mouseSensitivity <= 3.0f)) v.mouseSensitivity = 1.0f;
     std::lock_guard<std::mutex> lock(g_mutex);
     g_values = v;
+    Blood::Configure(v.blood);
 }
 
 void Settings::Save()
@@ -368,6 +396,11 @@ void Settings::Save()
                 v.hdrFlare, v.hdrHueCorrection, v.hdrConeResponse, v.hdrBloom, v.hdrTvRamp, v.hdrFilmUpgrade ? 1 : 0, v.hdrHudMatch ? 1 : 0);
         fprintf(file, "[game]\nplayer_name = %s\nlan_address = %s\nsystem_link_peers = %s\nmaster_volume = %d\naudio_channels = %d\naim_assist = %d\nbounces = %d\ncontroller = %d\nrumble = %d\nstick_deadzone = %d\nmouse_sensitivity = %.2f\nstick_vertical_scale = %d\nraw_mouse = %d\ndirect_mouse = %d\ntoggle_sprint = %d\nshell_shock_blur = %d\nmelee_lunge = %d\n", v.playerName, v.lanAddress, v.systemLinkPeers, v.masterVolume, v.audioChannels, v.aimAssist ? 1 : 0, v.bounces ? 1 : 0, v.controller ? 1 : 0, v.rumble ? 1 : 0, v.stickDeadzone, v.mouseSensitivity, v.stickVerticalScale, v.rawMouse ? 1 : 0, v.directMouse ? 1 : 0, v.toggleSprint ? 1 : 0, v.shellShockBlur ? 1 : 0, v.meleeLunge ? 1 : 0);
         fprintf(file, "max_players = %d\n", v.maxPlayers >= 32 ? 32 : 24);
+        fprintf(file, "blood_enabled = %d\nblood_amount = %d\nblood_density = %d\nblood_size = %.3f\nblood_decals = %d\nblood_physics = %d\nblood_persistence = %d\nblood_max_decals = %d\nblood_red = %.4f\nblood_green = %.4f\nblood_blue = %.4f\n",
+            v.blood.enabled,v.blood.amount,v.blood.density,v.blood.size,v.blood.decals,v.blood.physics,v.blood.persistence,v.blood.maxDecals,v.blood.color[0],v.blood.color[1],v.blood.color[2]);
+        fprintf(file, "blood_cloud_size = %.3f\nblood_cloud_opacity = %.3f\n", v.blood.cloudSize,v.blood.cloudOpacity);
+        fprintf(file, "hitmarkers = %d\nhitmarker_sound = %d\nhitmarker_red_kill = %d\nhitmarker_size = %d\nhitmarker_opacity = %d\nhitmarker_duration = %d\nhitmarker_volume = %d\n",
+            v.hitmarkers, v.hitmarkerSound, v.hitmarkerRedKill, v.hitmarkerSize, v.hitmarkerOpacity, v.hitmarkerDuration, v.hitmarkerVolume);
         fprintf(file, "quick_landing = %d\nquick_sprint = %d\ncustom_primary = %d\n", v.quickLanding ? 1 : 0, v.quickSprint ? 1 : 0,
                 v.customPrimary);
         fprintf(file, "active_class = %d\ntwo_grenades = %d\nfaster_ads = %d\nfour_secondary = %d\n", v.activeClass, v.twoGrenades ? 1 : 0,

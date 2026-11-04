@@ -1,3 +1,5 @@
+#include "blood_diag.h"
+#include "blood.h"
 // The Direct3D 11 renderer: the device, the draw, the resolve and the
 // present. See render.h for where it sits.
 //
@@ -10,6 +12,7 @@
 // creates a Direct3D object on a draw.
 
 #include "render.h"
+#include "blood_render.h"
 #include "render_state.h"
 #include "render_commands.h"
 #include "render_internal.h"
@@ -656,6 +659,41 @@ namespace
         return pixels;
     }
 
+
+    struct BloodPixelAudit {
+        ComPtr<ID3D11Texture2D> scene;
+        std::vector<uint8_t> before,after;
+        uint32_t w=0,h=0;uint64_t frame=0,at=0;int captures=0;
+        bool pending=false;
+    } g_bloodPixels;
+    std::string BloodPixelPath(const char* stage){
+        const char* dir=getenv("COD3_BLOOD_CAPTURE_DIR");if(!dir)return {};
+        std::filesystem::create_directories(dir);char name[256];snprintf(name,sizeof(name),"/frame_%llu_%s.bmp",g_bloodPixels.frame,stage);return std::string(dir)+name;
+    }
+    void BloodPixelsBefore(ID3D11Texture2D* scene,uint64_t frame){
+        auto& a=g_bloodPixels;if(!BloodDiag::On()||!getenv("COD3_BLOOD_CAPTURE_DIR")||a.pending||a.captures>=(getenv("COD3_BLOOD_CONTROLLED")?36:12)||GetTickCount64()-a.at<(getenv("COD3_BLOOD_CONTROLLED")?5000:2000)||Blood::Status().decals==0||(getenv("COD3_BLOOD_CONTROLLED")&&Blood::Status().particles>0))return;
+        a.at=GetTickCount64();a.scene=scene;a.frame=frame;a.before=ReadBack(scene,a.w,a.h,1);a.pending=!a.before.empty();
+    }
+    void BloodPixelsAfter(){
+        auto& a=g_bloodPixels;if(!a.pending)return;
+        uint32_t w=0,h=0;a.after=ReadBack(a.scene.Get(),w,h,1);
+        if(a.after.size()!=a.before.size()){a.pending=false;return;}
+        size_t changed=0;for(size_t i=0;i<a.before.size();i+=4)if(memcmp(&a.before[i],&a.after[i],3))++changed;
+        BloodDiag::Log("pixel_write frame=%llu target=%p width=%u height=%u changed_rgb_pixels=%zu",a.frame,a.scene.Get(),a.w,a.h,changed);
+        WriteBmp(BloodPixelPath("before_blood").c_str(),a.before,a.w,a.h);WriteBmp(BloodPixelPath("after_blood").c_str(),a.after,a.w,a.h);
+    }
+    void BloodPixelsFinal(){
+        auto& a=g_bloodPixels;if(!a.pending||a.after.empty())return;
+        uint32_t w=0,h=0;auto end=ReadBack(a.scene.Get(),w,h,1);size_t mask=0,sameAfter=0,backBefore=0,other=0;
+        if(end.size()==a.after.size())for(size_t i=0;i<end.size();i+=4)if(memcmp(&a.before[i],&a.after[i],3)){
+          ++mask;if(!memcmp(&end[i],&a.after[i],3))++sameAfter;else if(!memcmp(&end[i],&a.before[i],3))++backBefore;else ++other;
+        }
+        BloodDiag::Log("pixel_survival frame=%llu source_scene=%p mask=%zu unchanged_after_blood=%zu restored_before_blood=%zu modified_downstream=%zu final_backbuffer=%p",a.frame,a.scene.Get(),mask,sameAfter,backBefore,other,g_backTexture.Get());
+        if(!end.empty())WriteBmp(BloodPixelPath("scene_at_present").c_str(),end,w,h);
+        auto final=ReadBack(g_backTexture.Get(),w,h,1);if(!final.empty())WriteBmp(BloodPixelPath("final_backbuffer").c_str(),final,w,h);
+        a.pending=false;a.scene.Reset();a.before.clear();a.after.clear();++a.captures;
+    }
+
     // The depth alongside, as grey on a log scale, when COD3_D3DDRAWDUMPZ is set.
     void DumpDepth(const char* prefix, int number, ID3D11Texture2D* depth)
     {
@@ -924,6 +962,33 @@ namespace
         if (command.hdrScene && HdrScenePass(command)) bloomProgram = HdrProgramFor("bloom", 0, 1, false);
         RenderStats::Enter(RenderStats::SectionBind);
         if (command.bindingsLost) ForgetBindings();
+
+        // Insert one batch after the opaque world, before foreground,
+        // native transparent effects, post processing and menus. No particle
+        // draw is required. The matrix belongs to this queued render frame.
+        static uint64_t bloodFrame=~uint64_t(0);
+        static bool bloodPending=false,bloodDrawn=false;static int opaqueAfter=0;
+        static BloodRender::Projection bloodProjection{};
+        static ID3D11RenderTargetView* bloodTarget=nullptr;
+        static ID3D11DepthStencilView* bloodDepth=nullptr;
+        if(bloodFrame!=command.bloodFrame){static int report=0;if(BloodDiag::On()&&report++%30==0){auto s=Blood::Status();BloodDiag::Log("execute frame=%llu submitted=%d pending=%d alive_decals=%d particles=%d opaque_world_draws_after_blood=%d",bloodFrame,bloodDrawn,bloodPending,s.decals,s.particles,opaqueAfter);}bloodFrame=command.bloodFrame;bloodPending=bloodDrawn=false;opaqueAfter=0;}
+        if(command.bloodWorldStage&&bloodDrawn){++opaqueAfter;bloodPending=true;}
+        if(command.bloodProjectionValid&&!bloodDrawn){
+            bloodProjection=command.bloodProjection;bloodTarget=command.targets[0];bloodDepth=command.depthView;bloodPending=true;
+        }
+        if(bloodPending&&!command.bloodWorldStage&&command.bloodScene&&command.targets[0]==bloodTarget&&command.depthView==bloodDepth){
+            bloodPending=false;bloodDrawn=true;
+            UnbindResource(command.targetResources[0]);UnbindResource(command.depthResource);
+            g_context->OMSetRenderTargets(1,&bloodTarget,bloodDepth);
+            const D3D11_VIEWPORT viewport{0,0,float(command.targetWidth),float(command.targetHeight),0,1};
+            g_context->RSSetViewports(1,&viewport);
+            if(BloodDiag::On()){static uint64_t last=0;auto now=GetTickCount64();if(now-last>=1000){last=now;BloodDiag::Log("selected frame=%llu source_vs=%016llX source_pass=%s source_depth=%08X source_mask=%08X near=%.6f far=%.6f target=%p depth_target=%p trigger_is_world=%d",bloodProjection.diagFrame,bloodProjection.diagShader,bloodProjection.diagPass?"depth_only":"opaque_color_depth_write",bloodProjection.diagDepth,bloodProjection.diagMask,bloodProjection.diagNear,bloodProjection.diagFar,bloodTarget,bloodDepth,command.bloodWorldStage);for(int row=0;row<4;row++)BloodDiag::Log("selected_matrix frame=%llu row=%d values=%.9g,%.9g,%.9g,%.9g",bloodProjection.diagFrame,row,bloodProjection.matrix[row*4],bloodProjection.matrix[row*4+1],bloodProjection.matrix[row*4+2],bloodProjection.matrix[row*4+3]);}}
+            BloodPixelsBefore(command.colorTexture,bloodProjection.diagFrame);
+            BloodRender::Draw(g_device.Get(),g_context.Get(),bloodProjection);
+            BloodPixelsAfter();
+            // Target binding also changes when the batch is empty.
+            ForgetBindings();
+        }
 
         // The targets are set before the textures so a surface about to be
         // drawn into is not still bound as one.
@@ -2283,6 +2348,7 @@ namespace
         ID3D11RenderTargetView* noTargets[1] = { nullptr };
         g_context->OMSetRenderTargets(1, noTargets, nullptr);
         ForgetBindings();
+        BloodPixelsFinal();
         DumpFrame(g_backTexture.Get());
 
         RenderStats::EndGpuFrame();
@@ -3027,3 +3093,4 @@ int Render::HdrCompiling() { return g_hdrCompiling.load(std::memory_order_relaxe
 bool RenderInternal::FrameLogged() { return ::FrameLogged(); }
 uint64_t RenderInternal::Swaps() { return g_swaps.load(std::memory_order_relaxed); }
 int RenderInternal::DumpNumber() { return g_dumpNumber; }
+

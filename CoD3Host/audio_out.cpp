@@ -1,6 +1,7 @@
 #include "audio_out.h"
 #include "kernel.h"
 #include "settings.h"
+#include "hitmarkers.h"
 
 #include <algorithm>
 #include <cmath>
@@ -308,7 +309,8 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
         for (uint32_t i = 0; i < SamplesPerChannel * Channels * 4; i++) nonzero += bytes[i] != 0;
         if (nonzero > g_nonzeroBytes.load(std::memory_order_relaxed)) g_nonzeroBytes.store(nonzero, std::memory_order_relaxed);
     }
-    const float percent = float(Settings::Get().masterVolume) / 100.0f;
+    const auto settings = Settings::Get();
+    const float percent = float(settings.masterVolume) / 100.0f;
     const float volume = percent * percent;
     const uint32_t out = g_outChannels;
     // The frame as it will go out, before the limiter: each channel to its
@@ -332,6 +334,10 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
             mixed[i * 2 + 0] = l + 0.707f * c + 0.707f * ls;
             mixed[i * 2 + 1] = r + 0.707f * c + 0.707f * rs;
         }
+    }
+    Hitmarkers::Mix(mixed, SamplesPerChannel, out, settings);
+    for (uint32_t i = 0; i < SamplesPerChannel; i++)
+    {
         for (uint32_t c = 0; c < out; c++)
         {
             float& v = mixed[i * out + c];

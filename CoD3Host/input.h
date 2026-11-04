@@ -29,6 +29,8 @@ namespace Input
     };
 
     Pad State();
+    void MainMenuSeen();
+    bool ObjectivesVisible(); // campaign keyboard objectives toggle
     // Experimental stationary L3 save/R3 return, sampled before sprint filtering.
     void SetTacticalPointInput(bool active, bool canReturn);
     bool TacticalPointSaveHeld();

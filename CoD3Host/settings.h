@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstdint>
+#include "blood.h"
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -161,6 +162,14 @@ namespace Settings
         bool meleeLunge = true;          // a melee carries the player at the enemy it locks on to (mp_fixes.cpp)
         bool shellShockBlur = false;     // the blurred, dark screen of a nearby explosion's shell shock (mp_fixes.cpp)
         bool toggleSprint = true;        // a press of sprint starts a run that lasts, not one held (input.cpp)
+        Blood::Options blood;
+        bool hitmarkers = true;
+        bool hitmarkerSound = true;
+        bool hitmarkerRedKill = true;
+        int hitmarkerSize = 56;        // full image width at 1080p
+        int hitmarkerOpacity = 100;    // percent
+        int hitmarkerDuration = 200;   // milliseconds
+        int hitmarkerVolume = 70;      // percent, also follows master volume
         int keys[ActionCount] = {};
     };
 

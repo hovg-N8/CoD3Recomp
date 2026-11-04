@@ -24,7 +24,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 # --- Toolchain -------------------------------------------------------------
 # Clang is required: the recompiled code uses Clang intrinsics and the alias
 # attribute. The MSVC environment supplies the Windows SDK headers only.
-$LlvmBin = 'C:\Program Files\LLVM\bin'
+$LlvmBin = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\Llvm\x64\bin'
 $VsInstaller = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer'
 $VcVars = @(
     'C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat'

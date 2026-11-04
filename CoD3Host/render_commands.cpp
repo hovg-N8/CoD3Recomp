@@ -1,3 +1,6 @@
+#include "blood_diag.h"
+#include "blood_projection.h"
+extern void BloodDiagnosticEye(float* eye);
 // The PC render layer: registers in, commands out. See render_commands.h.
 //
 // A draw is prepared in the order the profile names its sections: the
@@ -1470,6 +1473,43 @@ bool RenderCommands::PrepareDrawInner(uint32_t initiator, uint32_t indexBase, Dr
             out.pixelShader |= RenderShaders::OpaqueVariantBit;
         }
     }
+    // Snapshot the main world pass, independent of particle visibility.
+    // Mesh programs transform local positions to world first; c12..15 is
+    // their world-view-projection, c16..18 is the separate model transform.
+    out.bloodFrame=RenderInternal::Swaps();
+    const bool mainView=std::fabs(state.viewport[0])>std::fabs(state.viewport[2])*1.2f &&
+        std::fabs(state.viewport[0])>=320 && !(state.vteControl&0x100);
+    out.bloodScene=mainView && out.depthView && out.targets[0] && (state.depthControl&2);
+    out.bloodWorldStage=out.bloodScene && (state.colorMask&15)==15 && out.opaque && (state.depthControl&4);
+    const auto hasRow=[&](uint16_t row){return vs && (vs->constantMap.empty() || std::find(vs->constantMap.begin(),vs->constantMap.end(),row)!=vs->constantMap.end());};
+    out.bloodProjectionValid=out.bloodWorldStage && hasRow(12)&&hasRow(13)&&hasRow(14)&&hasRow(15)&&hasRow(16)&&hasRow(17)&&hasRow(18);
+    if(BloodDiag::On()){
+ static uint64_t frame=~uint64_t(0);static int world=0,valid=0,full=0;static uint64_t lastVs=0;static float eyeW=0,wLength=0;
+ if(frame!=out.bloodFrame){if(world)BloodDiag::Log("prepare frame=%llu world_draws=%d valid_projections=%d full_constant_file_draws=%d selected_vs=%016llX eye_w=%.4f w_axis_length=%.4f",frame,world,valid,full,lastVs,eyeW,wLength);frame=out.bloodFrame;world=valid=full=0;}
+ if(out.bloodWorldStage){++world;valid+=out.bloodProjectionValid;full+=vs&&vs->constantMap.empty();}
+ if(out.bloodProjectionValid){lastVs=vs->hash;float row[4];memcpy(row,RenderState::Registers()+0x4000+15*4,sizeof(row));float eye[3]{};BloodDiagnosticEye(eye);eyeW=row[0]*eye[0]+row[1]*eye[1]+row[2]*eye[2]+row[3];wLength=sqrtf(row[0]*row[0]+row[1]*row[1]+row[2]*row[2]);}
+
+
+ }
+ if(out.bloodProjectionValid){
+        auto& p=out.bloodProjection;
+        memcpy(p.matrix,RenderState::Registers()+0x4000+12*4,sizeof(p.matrix));
+        const float nearPlane=BloodRender::NearPlane(p.matrix);
+        // Short-range matrices also expose c12..18, but clip world decals.
+        out.bloodProjectionValid=nearPlane>=1.0f;
+        float ww=p.matrix[12]*p.matrix[12]+p.matrix[13]*p.matrix[13]+p.matrix[14]*p.matrix[14];
+        float a=ww>0?(p.matrix[8]*p.matrix[12]+p.matrix[9]*p.matrix[13]+p.matrix[10]*p.matrix[14])/ww:0;
+        float b=p.matrix[11]-a*p.matrix[15];
+        p.diagShader=vs->hash;p.diagFrame=out.bloodFrame;p.diagDepth=state.depthControl;p.diagMask=state.colorMask;p.diagPass=DepthOnlyMode(state)?1:0;p.diagNear=nearPlane;p.diagFar=a!=0?-b/a:INFINITY;
+        if(BloodDiag::On()){
+          static uint64_t frame=~uint64_t(0);static int accepted=0,rejected=0;static uint64_t badVs=0;static float badNear=0;
+          if(frame!=out.bloodFrame){BloodDiag::Log("selection_summary frame=%llu accepted=%d rejected_short_range=%d rejected_vs=%016llX rejected_near=%.6f reason=near_below_1_or_invalid_perspective",frame,accepted,rejected,badVs,badNear);frame=out.bloodFrame;accepted=rejected=0;}
+          if(out.bloodProjectionValid)++accepted;else{++rejected;badVs=vs->hash;badNear=nearPlane;}
+        }
+        memcpy(p.scale,constants.viewportScale,sizeof(p.scale));memcpy(p.offset,constants.viewportOffset,sizeof(p.offset));
+        memcpy(p.target,constants.targetSize,sizeof(p.target));memcpy(p.flags,constants.flags,sizeof(p.flags));
+    }
+
     // The pixel's own position, which the console writes into a register
     // of the pixel program when the program control asks (bit 18), the
     // register named by the context's bits 8 to 15. The soft particles
@@ -1778,3 +1818,5 @@ void RenderCommands::ReportSkips()
     for (int i = 0; i < SkipCount; i++) if (g_skips[i] != 0) printf(" %s x%llu;", SkipNames[i], (unsigned long long)g_skips[i]);
     printf("\n");
 }
+
+

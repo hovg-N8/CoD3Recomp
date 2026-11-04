@@ -152,3 +152,22 @@ PPC_FUNC(sub_82488B88)
     fflush(stdout);
 }
 #endif
+
+#ifndef COD3_MP
+// The SP reload eligibility handler honors WeaponDef::noPartialReload.
+// Enable the Garand's existing partial reload path, retaining native ammo checks.
+extern "C" PPC_FUNC(__imp__sub_8246FC78);
+PPC_FUNC(sub_8246FC78)
+{
+    const uint32_t weapon=Guest::Read32(base,0x82A922B0+176);
+    if(weapon>=0x10000u && weapon<0xC0000000u-2048){
+        const uint32_t name=Guest::Read32(base,weapon+8);
+        if(name>=0x10000u && name<0xC0000000u-16 &&
+           memcmp(base+name,"m1garand",9)==0 && Guest::Read32(base,weapon+1864)){
+            Guest::Write32(base,weapon+1864,0);
+            printf("weapons: M1 Garand partial reload enabled\n");
+        }
+    }
+    __imp__sub_8246FC78(ctx,base);
+}
+#endif

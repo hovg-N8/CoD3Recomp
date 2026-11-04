@@ -5,6 +5,9 @@
 
 1 ICON "CoD3.ico"
 
+201 RCDATA "hitmarker.png"
+202 RCDATA "hitmarker.pcm"
+
 1 VERSIONINFO
 FILEVERSION     0,1,0,0
 PRODUCTVERSION  0,1,0,0
