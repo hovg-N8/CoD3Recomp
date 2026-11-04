@@ -26,6 +26,7 @@
 #include "overlay.h"
 #include "input.h"
 #include "settings.h"
+#include "blood.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -1908,9 +1909,20 @@ namespace
     }
 }
 
+// loadgame_restart: the checkpoint command does not pass through
+// SV_SpawnServer. Remove transient host effects on both sides of restore.
+extern "C" PPC_FUNC(__imp__sub_82518518);
+PPC_FUNC(sub_82518518)
+{
+    Blood::Clear();
+    __imp__sub_82518518(ctx,base);
+    Blood::Clear();
+}
+
 // SV_SpawnServer: a mission starting here (its name in r3).
 PPC_FUNC(sub_82517A00)
 {
+    Blood::Clear();
     if (CoopMode() != Mode::Off && ctx.r3.u32)
     {
         std::string name;
@@ -2083,6 +2095,8 @@ namespace
 PPC_FUNC(sub_82535E80)
 {
     NativeOptionsPoll(base);
+    Blood::Update(ctx,base);
+    // Objectives visibility is maintained at the native HUD draw, not by reopening its panel.
     SprintPoll(base);
     MortarProbePoll(base);   // (0.5.316, Team Justin) the campaign mortar's camera, measured
     if (const char* shots = getenv("COD3_COOP_SHOTS"))

@@ -3,6 +3,7 @@
 #include "kernel.h"
 #include "verify.h"
 #include "settings.h"
+#include "hitmarkers.h"
 #include "input.h"
 #include "net.h"
 #include "render_stats.h"
@@ -713,6 +714,61 @@ namespace
                     }
                     ImGui::EndTabItem();
                 }
+#ifndef COD3_MP
+                if (ImGui::BeginTabItem("Gameplay"))
+                {
+                    ImGui::TextUnformatted("Hitmarkers");
+                    ImGui::Checkbox("Enable hitmarkers", &g_edit.hitmarkers);
+                    ImGui::BeginDisabled(!g_edit.hitmarkers);
+                    ImGui::SliderInt("Size (at 1080p)", &g_edit.hitmarkerSize, 16, 160, "%d px");
+                    ImGui::SliderInt("Opacity", &g_edit.hitmarkerOpacity, 0, 100, "%d%%");
+                    ImGui::SliderInt("Display duration", &g_edit.hitmarkerDuration, 50, 1000, "%d ms");
+                    ImGui::Checkbox("Red hitmarker on confirmed kill", &g_edit.hitmarkerRedKill);
+                    ImGui::Checkbox("Hitmarker sound", &g_edit.hitmarkerSound);
+                    ImGui::BeginDisabled(!g_edit.hitmarkerSound);
+                    ImGui::SliderInt("Hitmarker volume", &g_edit.hitmarkerVolume, 0, 100, "%d%%");
+                    ImGui::EndDisabled();
+                    ImGui::TextDisabled("Apply changes to save. Sound also follows master volume.");
+                    if (ImGui::Button("Test hit")) Hitmarkers::Preview(false);
+                    ImGui::SameLine();
+                    if (ImGui::Button("Test kill")) Hitmarkers::Preview(true);
+                    ImGui::EndDisabled();
+                    ImGui::Separator();
+                    if (ImGui::CollapsingHeader("Blood & Gore", ImGuiTreeNodeFlags_DefaultOpen))
+                    {
+                        bool changed=false;
+                        auto& b=g_edit.blood;
+                        changed |= ImGui::Checkbox("Enable Blood", &b.enabled);
+                        ImGui::BeginDisabled(!b.enabled);
+                        changed |= ImGui::SliderInt("Blood Amount", &b.amount,0,200,"%d%%");
+                        const char* densities[]={"Low","Medium","High","Ultra"};
+                        changed |= ImGui::Combo("Blood Particle Density", &b.density,densities,4);
+                        changed |= ImGui::SliderFloat("Blood Splatter Size", &b.size,0.25f,3.0f,"%.2fx");
+                        changed |= ImGui::SliderFloat("Blood Cloud Size", &b.cloudSize,.25f,4.f,"%.2fx");
+                        changed |= ImGui::SliderFloat("Blood Cloud Opacity", &b.cloudOpacity,0.f,3.f,"%.2fx");
+                        if(ImGui::IsItemHovered())ImGui::SetTooltip("Multiplier for COD3 native blood clouds. 1x retains the original appearance.");
+                        changed |= ImGui::Checkbox("Blood Decals", &b.decals);
+                        changed |= ImGui::Checkbox("Blood Physics", &b.physics);
+                        if(ImGui::IsItemHovered())ImGui::SetTooltip("Gravity and drag. Surface collisions remain active when gravity is off.");
+                        bool permanent=b.persistence==0;
+                        if(ImGui::Checkbox("Permanent blood decals", &permanent)){b.persistence=permanent?0:30;changed=true;}
+                        ImGui::BeginDisabled(permanent);
+                        changed |= ImGui::SliderInt("Blood Persistence", &b.persistence,1,600,"%d seconds");
+                        ImGui::EndDisabled();
+                        changed |= ImGui::SliderInt("Maximum Blood Decals", &b.maxDecals,8,Blood::MaxDecals);
+                        changed |= ImGui::ColorEdit3("Blood Color",b.color);
+                        ImGui::EndDisabled();
+                        if(ImGui::Button("Reset Blood to Defaults")){b=Blood::Options{};changed=true;}
+                        static bool pendingSave=false;
+                        if(changed){auto live=Settings::Get();live.blood=b;Settings::Preview(live);pendingSave=true;}
+                        if(pendingSave&&!ImGui::IsAnyItemActive()){Settings::Save();pendingSave=false;}
+                        ImGui::TextDisabled("Blood changes apply immediately and save automatically.");
+                        ImGui::TextDisabled("Vertical slice: impacts and static-surface splatters. Pooling and trails follow after testing.");
+                    }
+
+                    ImGui::EndTabItem();
+                }
+#endif
                 if (ImGui::BeginTabItem("Multiplayer"))
                 {
 #ifndef COD3_MP
@@ -885,6 +941,7 @@ void Overlay::Initialize(void* hwnd, ID3D11Device* device, ID3D11DeviceContext* 
     g_hwnd = static_cast<HWND>(hwnd);
     g_device = device;
     g_context = context;
+    Hitmarkers::Initialize(device);
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -1069,6 +1126,7 @@ void Overlay::SetHud(bool (*active)(), void (*draw)(int width, int height))
 
 void Overlay::NoteFrontEndText(FrontEndText text)
 {
+    if(text==FrontEndText::MainMenu) Input::MainMenuSeen();
     g_frontEndNow.fetch_or(uint32_t(text), std::memory_order_relaxed);
 }
 
@@ -1186,8 +1244,9 @@ bool Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture,
     bool (*streakHudActive)() = g_streakHudActive.load();
     void (*streakHudDraw)(int, int) = g_streakHudDraw.load();
     const bool streakHud = streakHudActive && streakHudDraw && streakHudActive();
+    const bool marker = Hitmarkers::Active(values);
     const bool notice = NoticeShown();
-    if (!open && !console && !hud && !menuHud && !streakHud && !notice && !values.fpsOverlay && !values.statsOverlay) return false;
+    if (!open && !console && !hud && !menuHud && !streakHud && !marker && !notice && !values.fpsOverlay && !values.statsOverlay) return false;
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -1214,6 +1273,7 @@ bool Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture,
         }
         ImGui::End();
     }
+    if (marker && !console) Hitmarkers::Draw(width, height, values);
     if (hud) hudDraw(width, height);
     if (streakHud) streakHudDraw(width, height);
     if (menuHud) menuHudDraw(width, height);

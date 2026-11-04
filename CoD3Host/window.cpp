@@ -15,6 +15,7 @@
 #include "settings.h"
 #include "render.h"
 #include "input.h"
+#include "button_prompts.h"
 #include "window_geometry.h"
 
 #include <atomic>
@@ -131,6 +132,9 @@ namespace
         }
         // The settings menu sees every message first: F11 and F12, and all
         // of the keys and the mouse while it is open.
+        if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN || message == WM_LBUTTONDOWN ||
+            message == WM_RBUTTONDOWN || message == WM_MBUTTONDOWN || message == WM_XBUTTONDOWN || message == WM_MOUSEWHEEL)
+            ButtonPrompts::KeyboardUsed();
         if (Overlay::HandleMessage(window, message, uint64_t(w), int64_t(l))) return 0;
         // Windows asks the window what the pointer should look like whenever it
         // moves over it, and answering with nothing is how a pointer is hidden
@@ -177,6 +181,9 @@ namespace
             if (got != UINT(-1) && got >= sizeof(RAWINPUTHEADER))
             {
                 const RAWINPUT* raw = reinterpret_cast<const RAWINPUT*>(buffer);
+                if (GetForegroundWindow() == window && raw->header.dwType == RIM_TYPEMOUSE &&
+                    (raw->data.mouse.lLastX != 0 || raw->data.mouse.lLastY != 0 || raw->data.mouse.usButtonFlags != 0))
+                    ButtonPrompts::KeyboardUsed();
                 if (raw->header.dwType == RIM_TYPEMOUSE)
                 {
                     if ((raw->data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0)

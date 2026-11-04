@@ -36,7 +36,7 @@ LEFT_OUT = {"title_trace.cpp", "heap_trace.cpp", "pool_trace.cpp", "table_trace.
 
 # Files written for the multiplayer program alone, with its own addresses:
 # copied as they are (they compile to nothing in the single player one).
-MP_NATIVE = {"lobby_rules.cpp", "mp_fixes.cpp", "bots.cpp", "dom.cpp", "class_editor.cpp", "native_options.cpp"}
+MP_NATIVE = {"blood_render.cpp", "blood.cpp", "button_prompts.cpp", "lobby_rules.cpp", "mp_fixes.cpp", "bots.cpp", "dom.cpp", "class_editor.cpp", "native_options.cpp"}
 
 STANDINS = """// Written by scripts/make_mp_host.py: the single player's diagnostic traces
 // are not in the multiplayer program, and these take the place of what the

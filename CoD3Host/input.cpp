@@ -1,4 +1,7 @@
 #include "input.h"
+#include "menu_input.h"
+#include "keyboard_actions.h"
+#include "button_prompts.h"
 #include "sprint_input.h"
 #include "weapon_cycle_input.h"
 #include "kernel.h"
@@ -179,6 +182,8 @@ namespace
     // swallows the pointer without asking cannot be left.
     std::atomic<bool> g_mouseHeld{ false };
     std::atomic<bool> g_captureSuspended{ false };
+    std::atomic<bool> g_objectivesVisible{false};
+    std::atomic<bool> g_mainMenuSeen{false};
     bool g_binocularKey = false;   // the campaign's Binoculars out key held (ReadKeyboard, under Refresh's lock)
     POINT g_centre{};
 
@@ -396,7 +401,7 @@ namespace
     // title screen fell through the main menu, the single player menu and
     // a dialogue and started a game, or landed anywhere depending on how
     // fast the screens came.
-    struct ScriptedPress { double at; uint16_t buttons; int readsLeft; bool begun; };
+    struct ScriptedPress { double at; uint16_t buttons; int readsLeft; bool begun; bool keyboardSpace=false; };
     std::vector<ScriptedPress> g_script;
     // A held trigger or stick: which (0 and 1 the left and right trigger,
     // 2 to 5 the left stick's x and y and the right stick's x and y) and how
@@ -442,6 +447,11 @@ namespace
                     if (colon == std::string::npos) continue;
                     ScriptedPress press{ atof(item.substr(0, colon).c_str()), 0, 2, false };
                     std::string rest = item.substr(colon + 1);
+                    // Replay the same conversion as a physical Space press.
+                    if(rest=="space") {press.keyboardSpace=true;g_script.push_back(press);continue;}
+                    if (rest.compare(0,5,"back/")==0) {
+                        g_holds.push_back({press.at,press.at+atof(rest.c_str()+5),6,1.0f});continue;
+                    }
                     if (rest.compare(0, 3, "lt/") == 0 || rest.compare(0, 3, "rt/") == 0)
                     {
                         g_holds.push_back({ press.at, press.at + atof(rest.c_str() + 3), rest[0] == 'l' ? 0 : 1, 1.0f });
@@ -486,6 +496,12 @@ namespace
             if (!press.begun)
             {
                 press.begun = true;
+#ifndef COD3_MP
+                if(press.keyboardSpace) {
+                    press.buttons=MenuInput::Apply(0,!g_mainMenuSeen.load(),Kernel::Stats().filesOpened.load()>=40,true,false);
+                    printf("input: replayed Space -> 0x%04X (main menu seen %d)\n",press.buttons,int(g_mainMenuSeen.load()));fflush(stdout);
+                }
+#endif
                 // A press is where something is about to happen, so the
                 // kernel trace, if one was asked for, starts here.
                 Kernel::StartKernelTrace();
@@ -512,6 +528,7 @@ namespace
             case 3: pad.thumbLY = stick; break;
             case 4: pad.thumbRX = stick; break;
             case 5: pad.thumbRY = stick; break;
+            case 6: pad.buttons |= PadBack; break;
             }
         }
     }
@@ -539,6 +556,18 @@ namespace
             return text != nullptr && text[0] != 0 && text[0] != '0';
         }();
         if (ignored) return pad;
+#ifndef COD3_MP
+        // Dedicated keyboard commands keep Reload separate from Use and avoid
+        // mapping objectives to an unbound direction on the console's D-pad.
+        static KeyboardActions::State actions;
+        const auto bindings=Settings::Get();
+        const bool enabled=Window::HasFocus() && !Overlay::IsOpen() && !g_captureSuspended.load();
+        const auto boundDown=[&](Settings::Action action) { return enabled && bindings.keys[action]!=0 && Down(bindings.keys[action]); };
+        const std::string commands=KeyboardActions::Update(actions,boundDown(Settings::Reload),boundDown(Settings::Objectives),
+            boundDown(Settings::BinocularsOut),boundDown(Settings::BinocularsAway),enabled);
+        g_objectivesVisible.store(actions.objectives,std::memory_order_relaxed);
+        if(!commands.empty()) Kernel::QueueConsoleCommand(commands);
+#endif
         if (!Window::HasFocus() || Overlay::IsOpen() || g_captureSuspended.load())
         {
             // Out of focus, or the settings menu is up and the keys and the
@@ -580,6 +609,11 @@ namespace
         }
 
         const bool held = g_mouseHeld.load();
+#ifndef COD3_MP
+        // The game owns the held/keyup state of +scores. Emulate Back for the
+        // entire toggle interval rather than injecting competing commands.
+        if (g_objectivesVisible.load(std::memory_order_relaxed)) pad.buttons |= PadBack;
+#endif
 
         // The keys, where the console's buttons are on a keyboard, from the
         // settings menu: jump is A, crouch B, use and reload X, weapon Y,
@@ -589,18 +623,25 @@ namespace
         const Settings::Values keys = Settings::Get();
         struct Mapping { int key; uint16_t button; };
         const Mapping mappings[] = {
+            #ifdef COD3_MP
             { VK_RETURN, PadStart },
+#endif
             { VK_UP, PadUp }, { VK_DOWN, PadDown },
             { VK_LEFT, PadLeft }, { VK_RIGHT, PadRight },
             { keys.keys[Settings::Jump], PadA },
             { keys.keys[Settings::Crouch], PadB },
-            { keys.keys[Settings::Use], PadX }, { keys.keys[Settings::Reload], PadX },
+            { keys.keys[Settings::Use], PadX },
+#ifdef COD3_MP
+            { keys.keys[Settings::Reload], PadX },
+#endif
             { keys.keys[Settings::Weapon], PadY },
             { keys.keys[Settings::Melee], PadRightThumb },
             { keys.keys[Settings::Sprint], PadLeftThumb },
             { keys.keys[Settings::Grenade], PadRightShoulder },
             { keys.keys[Settings::Smoke], PadLeftShoulder },
+            #ifdef COD3_MP
             { keys.keys[Settings::Objectives], PadLeft },
+#endif
 #ifdef COD3_MP
             { keys.keys[Settings::BinocularsOut], PadUp },
 #endif
@@ -634,9 +675,14 @@ namespace
         // Not in the multiplayer program: its menus take a press of A and
         // Start together as neither, and it has no press start screen.
 #ifndef COD3_MP
-        if (!held && Down(VK_SPACE)) pad.buttons |= PadStart;
+        pad.buttons=MenuInput::Apply(pad.buttons,!g_mainMenuSeen.load(),inLevel,Down(VK_SPACE),Down(VK_RETURN));
 #endif
+#ifdef COD3_MP
         if (!held && Down(VK_ESCAPE) && !inLevel) pad.buttons |= PadBack;
+#else
+        // Front-end cancel is controller B; Back is the objectives button.
+        if (!held && Down(VK_ESCAPE) && !inLevel) pad.buttons |= PadB;
+#endif
         if (inLevel && startReadsLeft > 0) { pad.buttons |= PadStart; startReadsLeft--; }
 
         // Driving a menu with the mouse.
@@ -735,6 +781,14 @@ namespace
             XInputGamepad state{};
             if (ReadPads(state))
             {
+                if (state.buttons != g_lastPadSeen.buttons ||
+                    (state.leftTrigger > 30 && std::abs(int(state.leftTrigger)-int(g_lastPadSeen.leftTrigger)) > 8) ||
+                    (state.rightTrigger > 30 && std::abs(int(state.rightTrigger)-int(g_lastPadSeen.rightTrigger)) > 8) ||
+                    (std::abs(int(state.thumbLX)) > 12000 && std::abs(int(state.thumbLX)-int(g_lastPadSeen.thumbLX)) > 2048) ||
+                    (std::abs(int(state.thumbLY)) > 12000 && std::abs(int(state.thumbLY)-int(g_lastPadSeen.thumbLY)) > 2048) ||
+                    (std::abs(int(state.thumbRX)) > 12000 && std::abs(int(state.thumbRX)-int(g_lastPadSeen.thumbRX)) > 2048) ||
+                    (std::abs(int(state.thumbRY)) > 12000 && std::abs(int(state.thumbRY)-int(g_lastPadSeen.thumbRY)) > 2048))
+                    ButtonPrompts::ControllerUsed();
                 g_lastPadSeen = state;
                 fromPad = state.buttons;
                 pad.buttons |= state.buttons;
@@ -797,7 +851,7 @@ namespace
 #ifndef COD3_MP
         // The Binoculars out key: the left stick held in, while not pushing
         // forward (forward, the title would take it for a run).
-        if (g_binocularKey && pad.thumbLY < SprintInput::RunStart) pad.buttons |= PadLeftThumb;
+        // Keyboard binoculars use the latched command above; L3 remains the physical pad control.
 #endif
         // Running, for the campaign's binoculars (movement_fixes.cpp): a run
         // latched by tap to sprint, the stick pushed well forward, or L3
@@ -808,7 +862,7 @@ namespace
         // stick that far: a player holding it in to raise them, standing,
         // was taken for a runner and they never came up.) Forward walking
         // while ADS remains walking, not a sprint report.
-        g_sprinting.store(pad.leftTrigger<=30 && (sprint.running || pad.thumbLY>20000 ||
+        g_sprinting.store(pad.leftTrigger<=30 && (sprint.running ||
                           ((pad.buttons & PadLeftThumb)!=0 && pad.thumbLY>=SprintInput::RunStart)));
         // Presses of Start and the d-pad's up and down, counted as they
         // happen here (every few milliseconds): the game's frame, where the
@@ -1031,3 +1085,9 @@ void Input::PressButton(const char* name)
     g_pressButtons.store(buttons);
     g_pressReads.store(2);
 }
+
+#ifndef COD3_MP
+bool Input::ObjectivesVisible() { return g_objectivesVisible.load(std::memory_order_relaxed); }
+#endif
+
+void Input::MainMenuSeen() { g_mainMenuSeen.store(true); }

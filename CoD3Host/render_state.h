@@ -18,6 +18,7 @@
 // Direct3D context and what it remembers having set on it.
 
 #include <cstdint>
+#include "blood_render.h"
 
 struct ID3D11ShaderResourceView;
 struct ID3D11SamplerState;
@@ -185,6 +186,9 @@ namespace RenderState
         ID3D11VertexShader* vs = nullptr;
         ID3D11PixelShader* ps = nullptr;
         bool rectangles = false;       // through the rectangle list geometry program
+        bool bloodWorldStage=false, bloodProjectionValid=false, bloodScene=false;
+        uint64_t bloodFrame=0;
+        BloodRender::Projection bloodProjection{};
         bool opaque = false;           // no blending: the flat debug view may replace the pixel program
 
         // The pipeline.
