@@ -6,7 +6,11 @@
 #include "input.h"
 #include "net.h"
 #include "render_stats.h"
+#include "render_post.h"
 #include "render.h"
+#ifdef COD3_MP
+#include "spectator.h"   // 0.5.490
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -17,6 +21,7 @@
 #include <deque>
 #include <ctime>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -368,7 +373,63 @@ namespace
                     const char* qualities[] = { "Low", "Medium", "High" };
                     ImGui::Combo("Texture quality", &g_edit.textureQuality, qualities, 3);
                     ImGui::SliderInt("Field of view", &g_edit.fov, 65, 100, g_edit.fov == 65 ? "65 (the game's own)" : "%d");
-                    ImGui::SliderInt("Brightness", &g_edit.brightness, 50, 150, g_edit.brightness == 100 ? "100%% (the game's own)" : "%d%%");
+                    {
+                        const char* shadowLevels[] = { "The game's own", "2x finer", "3x finer", "4x finer" };
+                        int level = std::clamp(g_edit.shadowDetail, 1, 4) - 1;
+                        if (ImGui::Combo("Shadow detail", &level, shadowLevels, 4)) g_edit.shadowDetail = level + 1;
+                    }
+                    ImGui::Checkbox("Fill the screen", &g_edit.fillScreen);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(the picture your screen's shape, seeing more at the sides on a wide one; off: 16:9 with bars)");
+                    ImGui::SliderInt("Brightness", &g_edit.brightness, 50, 200, g_edit.brightness == 100 ? "100%% (the game's own)" : "%d%%");
+                    const char* looks[] = { "Off (the game's own)", "Remastered", "Clean", "Cinematic", "War film", "Vivid", "Custom" };
+                    if (ImGui::Combo("Look", &g_edit.postLook, looks, 7)) RenderPost::ApplyPreset(g_edit, g_edit.postLook);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(lighting, sharpening and a colour grade over the picture)");
+                    if (g_edit.postLook != 0)
+                    {
+                        const char* nights[] = { "The same as by day", "Moonlit (brighter)", "As dark as the game" };
+                        ImGui::Combo("At night", &g_edit.postLookNight, nights, 3);
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(blended in by how dark the scene is)");
+                    }
+                    if (g_edit.postLook != 0)
+                    {
+                        // A slider moved makes the look a custom one.
+                        bool moved = false;
+                        ImGui::Indent();
+                        moved |= ImGui::SliderInt("Auto exposure", &g_edit.postExposure, 0, 100);
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(dark scenes brought up)");
+                        moved |= ImGui::SliderInt("Shadow detail", &g_edit.postShadows, 0, 100);
+                        moved |= ImGui::SliderInt("Surface light", &g_edit.postSurface, 0, 100);
+                        moved |= ImGui::SliderInt("Ambient occlusion", &g_edit.postOcclusion, 0, 100, g_edit.postOcclusion == 0 ? "Off" : "%d");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(at night: walls, ground and people lit more; the sky stays night)");
+                        moved |= ImGui::SliderInt("Clarity", &g_edit.postClarity, 0, 100);
+                        moved |= ImGui::SliderInt("Sharpening", &g_edit.postSharpen, 0, 100);
+                        moved |= ImGui::SliderInt("Bloom", &g_edit.postBloom, 0, 100);
+                        moved |= ImGui::SliderInt("Saturation", &g_edit.postSaturation, 0, 200, g_edit.postSaturation == 100 ? "100 (the game's own)" : "%d");
+                        moved |= ImGui::SliderInt("Contrast", &g_edit.postContrast, 0, 100);
+                        moved |= ImGui::SliderInt("Warmth", &g_edit.postWarmth, -50, 50, g_edit.postWarmth == 0 ? "0 (neutral)" : g_edit.postWarmth < 0 ? "%d (cooler)" : "%d (warmer)");
+                        moved |= ImGui::SliderInt("Vignette", &g_edit.postVignette, 0, 100);
+                        moved |= ImGui::SliderInt("Film grain", &g_edit.postGrain, 0, 100);
+                        ImGui::Unindent();
+                        if (moved) g_edit.postLook = 6;
+                    }
+                    ImGui::Checkbox("Smooth films (60+ fps)", &g_edit.filmSmooth);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(the intros and briefings: the frames between made from their motion, as many as the screen shows)");
+                    ImGui::SliderInt("Film sharpening", &g_edit.filmSharpen, 0, 100, g_edit.filmSharpen == 0 ? "Off" : "%d");
+                    ImGui::Checkbox("Remastered films", &g_edit.filmRemastered);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(where a film has them: its frames made again at a higher resolution and 60 a second)");
+                    ImGui::SliderInt("Film shadows", &g_edit.filmShadows, 0, 100, g_edit.filmShadows == 0 ? "Off" : "%d");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(faces and shade in the dark parts of the films brought up)");
+                    ImGui::SliderInt("Film clean-up", &g_edit.filmClean, 0, 100, g_edit.filmClean == 0 ? "Off" : "%d");
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(the video's banding and blocks smoothed)");
                     const char* details[] = { "The game's own", "Maximum" };
                     ImGui::Combo("Model detail", &g_edit.modelDetail, details, 2);
                     ImGui::SameLine();
@@ -661,6 +722,10 @@ namespace
                     }
                     ImGui::SliderFloat("Mouse sensitivity", &g_edit.mouseSensitivity, 0.1f, 3.0f, "%.2f");
                     ImGui::TextDisabled("Both axes alike.");
+                    // 0.5.600 (user: "toggle on or off so i can see my mouse cursor")
+                    ImGui::Checkbox("Hide the mouse pointer while playing", &g_edit.hideCursor);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(off: the pointer shows over the game; it always shows in a menu with the mouse free)");
                     ImGui::Checkbox("Raw mouse input", &g_edit.rawMouse);
                     ImGui::SameLine();
                     ImGui::TextDisabled("(the mouse's own movement, without Windows' pointer speed and acceleration)");
@@ -679,6 +744,14 @@ namespace
                     ImGui::SameLine();
                     ImGui::TextDisabled("(%s)", Input::ControllerStatus().c_str());
                     ImGui::Checkbox("Controller vibration", &g_edit.rumble);
+                    {
+                        // 0.5.478: the button prompts (pc_prompts.cpp)
+                        static const char* const prompts[] = { "Automatic (what you used last)", "Controller buttons", "Keyboard and mouse keys" };
+                        ImGui::Combo("Button prompts", &g_edit.buttonPrompts, prompts, 3);
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Automatic: the prompts show your keys while you play with the keyboard and\n"
+                                              "mouse, and switch to the controller's buttons as soon as you use the pad.");
+                    }
                     ImGui::SliderInt("Stick deadzone", &g_edit.stickDeadzone, 0, 50, "%d%%");
                     ImGui::SliderInt("Vertical look speed", &g_edit.stickVerticalScale, 50, 300, g_edit.stickVerticalScale == 200 ? "200%% (matches turning)" : g_edit.stickVerticalScale == 100 ? "100%% (the game's own)" : "%d%%");
                     ImGui::TextDisabled("The game looks up and down at half the speed it turns; 200%% makes them match.");
@@ -727,6 +800,13 @@ namespace
                     ImGui::InputText("System Link peers", g_edit.systemLinkPeers, sizeof(g_edit.systemLinkPeers));
                     ImGui::SameLine();
                     ImGui::TextDisabled("(friends' IPs, comma separated; after a restart)");
+                    // 0.5.427: public servers (docs/PUBLIC-SERVERS.md)
+                    ImGui::Checkbox("Public game", &g_edit.publicServer);
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(a System Link game you host goes on the public list)");
+                    ImGui::InputText("Public game name", g_edit.serverName, sizeof(g_edit.serverName));
+                    ImGui::SameLine();
+                    ImGui::TextDisabled("(empty: your name's game)");
                     ImGui::Separator();
                     ImGui::TextUnformatted("Network");
                     const Net::Summary net = Net::Status();
@@ -753,10 +833,67 @@ namespace
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("After a heavy fall you are slowed for a moment only (at most 0.15 seconds),\n"
                                           "not the game's own half a second to two seconds.");
+                    ImGui::Checkbox("Unstick", &g_edit.unstick);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("If you hold a move key and do not move for 2 seconds (caught in the scenery),\n"
+                                          "you are put back where you last stood. Not on ladders, mounted guns or prone.");
+                    ImGui::Checkbox("Mantle assist", &g_edit.mantleAssist);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("On converted maps (Seelow), walking at a window or ledge World at War lets you\n"
+                                          "climb lifts you over it. Off: jump and crouch through yourself. Bots always have it.");
                     ImGui::Checkbox("Quick sprint recovery", &g_edit.quickSprint);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Stamina starts coming back a quarter second after a sprint and is full\n"
                                           "in a second and a half, so you can sprint again sooner.");
+#ifdef COD3_MP
+                    // 0.5.490: spectating (spectator.cpp): acts at once, nothing to Apply
+                    if (ImGui::CollapsingHeader("Spectator (F6)"))
+                    {
+                        ImGui::Text("Now: %s%s", Spectator::Status().c_str(), Spectator::PureActive() ? " (the spectator's seat: no soldier)" : "");
+                        // 0.5.613: the spectator's seat (0.5.608-612): no soldier in the match at all
+                        if (!Spectator::PureActive() ? ImGui::Button("Spectator's seat (no soldier: F6)") : ImGui::Button("Leave the seat and join (F6)"))
+                        {
+                            if (Spectator::PureActive()) Spectator::LeaveSeat(); else Spectator::TakeSeat();
+                        }
+                        if (ImGui::IsItemHovered())
+                            ImGui::SetTooltip("Out of the match as the game's own spectator: no body, no HUD, only the camera.\n"
+                                              "In a match, your soldier is taken out (that life ends); leaving spawns you again\n"
+                                              "at your side's point with your kit. Also on the team choice, under Auto-assign.");
+                        ImGui::TextDisabled("Or spectate with your soldier left where he stands:");
+                        if (ImGui::Button("Free camera")) Spectator::Set(Spectator::Mode::FreeCam);
+                        ImGui::SameLine();
+                        if (ImGui::Button("Follow (his eyes)")) Spectator::Set(Spectator::Mode::FollowEyes);
+                        ImGui::SameLine();
+                        if (ImGui::Button("Follow (behind)")) Spectator::Set(Spectator::Mode::FollowBehind);
+                        ImGui::SameLine();
+                        if (ImGui::Button("Off")) Spectator::Set(Spectator::Mode::Off);
+                        if (ImGui::Button("Previous player")) Spectator::NextPlayer(-1);
+                        ImGui::SameLine();
+                        if (ImGui::Button("Next player")) Spectator::NextPlayer(1);
+                        ImGui::SliderFloat("Free camera speed", &Spectator::FreeCamSpeed(), 100.0f, 2000.0f, "%.0f");
+                        {
+                            // 0.5.593: a gun off-frame on some bots: compare with it off
+                            bool smooth = Spectator::SmoothEyes();
+                            if (ImGui::Checkbox("Smooth his eyes", &smooth)) Spectator::SetSmoothEyes(smooth);
+                            // 0.5.602: the game's own spectator state
+                            // 0.5.605: only offered for the work on it (COD3_SPECTATE_LEAVE=1): the game
+                            // puts the state straight back and moved the player (604's self-test)
+                            static const bool offerLeave = [] { const char* t = getenv("COD3_SPECTATE_LEAVE"); return t && t[0] == '1'; }();
+                            bool leave = Spectator::LeaveMatch();
+                            if (offerLeave && ImGui::Checkbox("Leave the match while spectating (host, experimental)", &leave)) Spectator::SetLeaveMatch(leave);
+                            if (offerLeave && ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Your player is taken out of the match while you spectate, as the game's own spectators are:\n"
+                                                  "not drawn, cannot be shot, the bots do not hunt him. When you stop, he is back where you left\n"
+                                                  "him. Only on the host. Turn it off if the match misbehaves.");
+                            if (ImGui::IsItemHovered())
+                                ImGui::SetTooltip("Following from his eyes: on, his view glides between the server's 20 updates a second;\n"
+                                                  "off, it is his own as the server has it (as the killcam). Off if his gun looks out of place.");
+                        }
+                        ImGui::TextDisabled("F6 (pad: Back + Y): the spectator's seat on and off (or ends the spectating below).\n"
+                                            "Y / weapon switch: free camera -> his eyes -> behind him. Following: fire / aim (RT / LT)\n"
+                                            "next / previous player. Free camera: move and look, jump up, crouch down, sprint 3x.");
+                    }
+#endif
                     if (ImGui::CollapsingHeader("Custom classes (multiplayer)", ImGuiTreeNodeFlags_DefaultOpen))
                     {
                         const char* weapons[] = { "The class's own", "M1 Garand", "Thompson", "BAR", "Springfield (scoped)",
@@ -809,15 +946,21 @@ namespace
                     ImGui::Checkbox("Killstreaks", &g_edit.killstreakArtillery);
                     if (ImGui::IsItemHovered())
                         ImGui::SetTooltip("Hosting: kills in a row without dying earn rewards. The UAV shows every enemy on the\n"
-                                          "compass; the artillery barrage and the Typhoon are called in with the binoculars\n"
-                                          "(d-pad up, then the right trigger at the spot).");
+                                          "compass; the artillery barrage is called in with the binoculars (d-pad up, then the\n"
+                                          "right trigger at the spot); the Hellfire Barrage (d-pad right) rains artillery over\n"
+                                          "the whole map.");
                     if (g_edit.killstreakArtillery)
                     {
                         ImGui::SliderInt("Kills for the UAV", &g_edit.killstreakUav, 1, 15, "%d in a row");
                         ImGui::SliderInt("UAV time", &g_edit.uavSeconds, 10, 90, "%d seconds");
                         ImGui::SliderInt("Kills for artillery", &g_edit.killstreakKills, 1, 20, "%d in a row");
-                        ImGui::SliderInt("Kills for the Typhoon", &g_edit.killstreakTyphoon, 1, 25, "%d in a row");
+                        ImGui::SliderInt("Kills for the Hellfire Barrage", &g_edit.killstreakTyphoon, 1, 25, "%d in a row");
                     }
+                    // 0.5.454: a cheat, off by default (Justin: "make that a cheat only option in the f11 menu")
+                    ImGui::Checkbox("Cheat: return point", &g_edit.returnPoint);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Standing still, hold L3 to save where you stand; hold X for 2 seconds to go back there\n"
+                                          "from anywhere. Off: L3 and X work as normal.");
                     ImGui::Checkbox("Four of the second grenade and mines", &g_edit.fourSecondary);
                     {
                         // 0.5.247: 32 players (a test): read when the game starts.
@@ -1003,6 +1146,20 @@ namespace
     std::atomic<void (*)(int, int)> g_menuHudDraw{ nullptr };
     std::atomic<bool (*)()> g_streakHudActive{ nullptr };
     std::atomic<void (*)(int, int)> g_streakHudDraw{ nullptr };
+    std::atomic<bool (*)()> g_seatHudActive{ nullptr };   // 0.5.608
+    std::atomic<void (*)(int, int)> g_seatHudDraw{ nullptr };
+    std::atomic<bool (*)()> g_matchHudActive{ nullptr };   // 0.5.641
+    std::atomic<void (*)(int, int)> g_matchHudDraw{ nullptr };
+    std::atomic<bool (*)()> g_weaponHudActive{ nullptr };   // 0.5.681
+    std::atomic<void (*)(int, int)> g_weaponHudDraw{ nullptr };
+    std::atomic<bool (*)()> g_flareHudActive{ nullptr };   // 0.5.739
+    std::atomic<void (*)(int, int)> g_flareHudDraw{ nullptr };
+    // co-op v40's lobby (Team Friend; merged 0.5.622)
+    std::atomic<bool (*)()> g_lobbyAvailable{ nullptr };
+    std::atomic<void (*)(int, int, bool)> g_lobbyDraw{ nullptr };
+    std::atomic<bool> g_lobbyOpen{ false };
+    bool LobbyAvailableNow() { bool (*a)() = g_lobbyAvailable.load(); return a && a(); }
+    std::atomic<uint64_t> g_mainMenuAt{ 0 };
 }
 
 // A short message across the top of the picture for a few seconds (the
@@ -1055,6 +1212,269 @@ void Overlay::SetMenuHud(bool (*active)(), void (*draw)(int width, int height))
     g_menuHudActive.store(active);
 }
 
+void Overlay::SetSeatHud(bool (*active)(), void (*draw)(int width, int height))
+{
+    g_seatHudDraw.store(draw);
+    g_seatHudActive.store(active);
+}
+
+void Overlay::SetMatchHud(bool (*active)(), void (*draw)(int width, int height))
+{
+    g_matchHudDraw.store(draw);
+    g_matchHudActive.store(active);
+}
+
+// 0.5.718: THE GUN OVER ITS FLAME (the user: "the fire seems to be spraying
+// from ontop of the guns model ... put the fire underneath it, and the gun
+// above"). The flame is drawn over the finished picture; the M2 is in it. So
+// before the flame, the M2's own mesh is put on the screen with its own draw's
+// transforms this frame (Render::TrackedTransform: its bone, then its view and
+// projection) into a stencil (1 where the gun is), and the weapon picture (the
+// background draw list) is drawn with a stencil test (0 only).
+extern ID3D11DepthStencilState* g_ImGuiDX11DepthStencilOverride;   // imgui_impl_dx11.cpp (CoD3 port)
+namespace
+{
+    std::mutex g_maskLock;
+    std::vector<float> g_maskVerts;        // the mesh's own space, xyz
+    std::vector<uint16_t> g_maskIndices;
+    struct Mask
+    {
+        bool tried = false, failed = false;
+        int width = 0, height = 0;
+        ID3D11Texture2D* texture = nullptr;
+        ID3D11DepthStencilView* view = nullptr;
+        ID3D11VertexShader* vs = nullptr;
+        ID3D11InputLayout* layout = nullptr;
+        ID3D11Buffer* vb = nullptr;
+        ID3D11Buffer* ib = nullptr;
+        UINT vbBytes = 0, ibBytes = 0;
+        ID3D11DepthStencilState* write = nullptr;
+        ID3D11DepthStencilState* test = nullptr;
+        ID3D11RasterizerState* raster = nullptr;
+        ID3D11BlendState* noColour = nullptr;
+    } g_mask;
+
+    bool MaskSetup()
+    {
+        Mask& m = g_mask;
+        if (m.tried) return !m.failed;
+        m.tried = true;
+        m.failed = true;
+        using Compile = HRESULT(WINAPI*)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+        HMODULE dll = LoadLibraryW(L"d3dcompiler_47.dll");
+        const Compile compile = dll ? reinterpret_cast<Compile>(GetProcAddress(dll, "D3DCompile")) : nullptr;
+        if (!compile || !g_device) { printf("overlay: the gun's mask cannot be made (no shader compiler)\n"); fflush(stdout); return false; }
+        static const char source[] = "float4 main(float4 p : POSITION) : SV_Position { return p; }";
+        ID3DBlob* code = nullptr;
+        ID3DBlob* errors = nullptr;
+        if (FAILED(compile(source, sizeof source - 1, "mask", nullptr, nullptr, "main", "vs_4_0", 0, 0, &code, &errors)) || !code)
+        {
+            printf("overlay: the gun's mask shader: %s\n", errors ? static_cast<const char*>(errors->GetBufferPointer()) : "failed");
+            if (errors) errors->Release();
+            fflush(stdout);
+            return false;
+        }
+        const D3D11_INPUT_ELEMENT_DESC element = { "POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 };
+        bool ok = SUCCEEDED(g_device->CreateVertexShader(code->GetBufferPointer(), code->GetBufferSize(), nullptr, &m.vs)) &&
+                  SUCCEEDED(g_device->CreateInputLayout(&element, 1, code->GetBufferPointer(), code->GetBufferSize(), &m.layout));
+        code->Release();
+        D3D11_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable = FALSE;
+        ds.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+        ds.DepthFunc = D3D11_COMPARISON_ALWAYS;
+        ds.StencilEnable = TRUE;
+        ds.StencilReadMask = ds.StencilWriteMask = 0xFF;
+        ds.FrontFace = { D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_REPLACE, D3D11_COMPARISON_ALWAYS };
+        ds.BackFace = ds.FrontFace;
+        ok = ok && SUCCEEDED(g_device->CreateDepthStencilState(&ds, &m.write));   // (its ref: 1)
+        ds.FrontFace = { D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_EQUAL };
+        ds.BackFace = ds.FrontFace;
+        ok = ok && SUCCEEDED(g_device->CreateDepthStencilState(&ds, &m.test));    // (ImGui's ref: 0)
+        D3D11_RASTERIZER_DESC rs{};
+        rs.FillMode = D3D11_FILL_SOLID;
+        rs.CullMode = D3D11_CULL_NONE;
+        rs.DepthClipEnable = FALSE;
+        ok = ok && SUCCEEDED(g_device->CreateRasterizerState(&rs, &m.raster));
+        D3D11_BLEND_DESC bd{};
+        bd.RenderTarget[0].RenderTargetWriteMask = 0;
+        ok = ok && SUCCEEDED(g_device->CreateBlendState(&bd, &m.noColour));
+        m.failed = !ok;
+        printf("overlay: the gun's mask %s\n", ok ? "made" : "could not be made");
+        fflush(stdout);
+        return ok;
+    }
+
+    // The stencil with the gun in it (1), for a picture width x height; false: none this frame
+    bool MaskBuild(ID3D11RenderTargetView* back, int width, int height)
+    {
+        float bone[12], vp[16];
+        if (!Render::TrackedTransform(bone, vp)) return false;
+        std::vector<float> clip;
+        std::vector<uint16_t> indices;
+        {
+            std::lock_guard<std::mutex> hold(g_maskLock);
+            if (g_maskVerts.empty() || g_maskIndices.empty()) return false;
+            const size_t n = g_maskVerts.size() / 3;
+            clip.resize(n * 4);
+            for (size_t i = 0; i < n; i++)
+            {
+                const float* p = &g_maskVerts[i * 3];
+                float w[3];
+                for (int r = 0; r < 3; r++) w[r] = bone[4 * r] * p[0] + bone[4 * r + 1] * p[1] + bone[4 * r + 2] * p[2] + bone[4 * r + 3];
+                float c[4];
+                for (int r = 0; r < 4; r++) c[r] = vp[4 * r] * w[0] + vp[4 * r + 1] * w[1] + vp[4 * r + 2] * w[2] + vp[4 * r + 3];
+                clip[i * 4] = c[0]; clip[i * 4 + 1] = c[1]; clip[i * 4 + 2] = 0.0f; clip[i * 4 + 3] = c[3];   // (depth: in range, unused)
+            }
+            indices = g_maskIndices;
+        }
+        if (!MaskSetup()) return false;
+        Mask& m = g_mask;
+        if (m.width != width || m.height != height || !m.view)
+        {
+            if (m.view) { m.view->Release(); m.view = nullptr; }
+            if (m.texture) { m.texture->Release(); m.texture = nullptr; }
+            D3D11_TEXTURE2D_DESC td{};
+            td.Width = UINT(width); td.Height = UINT(height); td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT; td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            if (FAILED(g_device->CreateTexture2D(&td, nullptr, &m.texture)) || FAILED(g_device->CreateDepthStencilView(m.texture, nullptr, &m.view))) return false;
+            m.width = width; m.height = height;
+        }
+        auto room = [&](ID3D11Buffer*& buffer, UINT& have, UINT need, UINT bind)
+        {
+            if (buffer && have >= need) return true;
+            if (buffer) { buffer->Release(); buffer = nullptr; }
+            D3D11_BUFFER_DESC b{};
+            b.ByteWidth = need; b.Usage = D3D11_USAGE_DYNAMIC; b.BindFlags = bind; b.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            if (FAILED(g_device->CreateBuffer(&b, nullptr, &buffer))) return false;
+            have = need;
+            return true;
+        };
+        const UINT vbNeed = UINT(clip.size() * 4), ibNeed = UINT(indices.size() * 2);
+        if (!room(m.vb, m.vbBytes, vbNeed, D3D11_BIND_VERTEX_BUFFER) || !room(m.ib, m.ibBytes, ibNeed, D3D11_BIND_INDEX_BUFFER)) return false;
+        D3D11_MAPPED_SUBRESOURCE map{};
+        if (FAILED(g_context->Map(m.vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
+        memcpy(map.pData, clip.data(), vbNeed);
+        g_context->Unmap(m.vb, 0);
+        if (FAILED(g_context->Map(m.ib, 0, D3D11_MAP_WRITE_DISCARD, 0, &map))) return false;
+        memcpy(map.pData, indices.data(), ibNeed);
+        g_context->Unmap(m.ib, 0);
+
+        // the context's state, put back after
+        ID3D11RasterizerState* oldRs = nullptr; g_context->RSGetState(&oldRs);
+        D3D11_VIEWPORT oldVp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE]; UINT oldVpCount = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+        g_context->RSGetViewports(&oldVpCount, oldVp);
+        ID3D11BlendState* oldBlend = nullptr; FLOAT oldFactor[4]; UINT oldMask = 0; g_context->OMGetBlendState(&oldBlend, oldFactor, &oldMask);
+        ID3D11DepthStencilState* oldDs = nullptr; UINT oldRef = 0; g_context->OMGetDepthStencilState(&oldDs, &oldRef);
+        ID3D11VertexShader* oldVs = nullptr; g_context->VSGetShader(&oldVs, nullptr, nullptr);
+        ID3D11PixelShader* oldPs = nullptr; g_context->PSGetShader(&oldPs, nullptr, nullptr);
+        ID3D11InputLayout* oldLayout = nullptr; g_context->IAGetInputLayout(&oldLayout);
+        D3D11_PRIMITIVE_TOPOLOGY oldTopology; g_context->IAGetPrimitiveTopology(&oldTopology);
+        ID3D11Buffer* oldVb = nullptr; UINT oldStride = 0, oldOffset = 0; g_context->IAGetVertexBuffers(0, 1, &oldVb, &oldStride, &oldOffset);
+        ID3D11Buffer* oldIb = nullptr; DXGI_FORMAT oldIbFormat; UINT oldIbOffset = 0; g_context->IAGetIndexBuffer(&oldIb, &oldIbFormat, &oldIbOffset);
+
+        g_context->ClearDepthStencilView(m.view, D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL, 1.0f, 0);
+        g_context->OMSetRenderTargets(1, &back, m.view);
+        const D3D11_VIEWPORT viewport = { 0.0f, 0.0f, float(width), float(height), 0.0f, 1.0f };
+        g_context->RSSetViewports(1, &viewport);
+        g_context->RSSetState(m.raster);
+        const float factor[4] = { 0, 0, 0, 0 };
+        g_context->OMSetBlendState(m.noColour, factor, 0xFFFFFFFFu);
+        g_context->OMSetDepthStencilState(m.write, 1);
+        g_context->IASetInputLayout(m.layout);
+        g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        const UINT stride = 16, offset = 0;
+        g_context->IASetVertexBuffers(0, 1, &m.vb, &stride, &offset);
+        g_context->IASetIndexBuffer(m.ib, DXGI_FORMAT_R16_UINT, 0);
+        g_context->VSSetShader(m.vs, nullptr, 0);
+        g_context->PSSetShader(nullptr, nullptr, 0);
+        g_context->DrawIndexed(UINT(indices.size()), 0, 0);
+
+        g_context->RSSetState(oldRs); if (oldRs) oldRs->Release();
+        g_context->RSSetViewports(oldVpCount, oldVp);
+        g_context->OMSetBlendState(oldBlend, oldFactor, oldMask); if (oldBlend) oldBlend->Release();
+        g_context->OMSetDepthStencilState(oldDs, oldRef); if (oldDs) oldDs->Release();
+        g_context->VSSetShader(oldVs, nullptr, 0); if (oldVs) oldVs->Release();
+        g_context->PSSetShader(oldPs, nullptr, 0); if (oldPs) oldPs->Release();
+        g_context->IASetInputLayout(oldLayout); if (oldLayout) oldLayout->Release();
+        g_context->IASetPrimitiveTopology(oldTopology);
+        g_context->IASetVertexBuffers(0, 1, &oldVb, &oldStride, &oldOffset); if (oldVb) oldVb->Release();
+        g_context->IASetIndexBuffer(oldIb, oldIbFormat, oldIbOffset); if (oldIb) oldIb->Release();
+        static bool told = false;
+        if (!told) { told = true; printf("overlay: the gun's mask drawn (%zu vertices, %zu triangles), the flame under it\n", clip.size() / 4, indices.size() / 3); fflush(stdout); }
+        return true;
+    }
+}
+
+void Overlay::SetWeaponMaskMesh(const float* xyz, size_t vertices, const uint16_t* indices, size_t count)
+{
+    std::lock_guard<std::mutex> hold(g_maskLock);
+    g_maskVerts.assign(xyz, xyz + vertices * 3);
+    g_maskIndices.assign(indices, indices + count);
+}
+
+void Overlay::SetWeaponHud(bool (*active)(), void (*draw)(int width, int height))
+{
+    g_weaponHudDraw.store(draw);
+    g_weaponHudActive.store(active);
+}
+
+void Overlay::SetFlareHud(bool (*active)(), void (*draw)(int width, int height))
+{
+    g_flareHudDraw.store(draw);
+    g_flareHudActive.store(active);
+}
+
+// 0.5.681: a PNG read with WIC into a texture ImGui can draw (straight
+// alpha, as ImGui's DX11 backend blends), made once a path and kept.
+void* Overlay::ImageTexture(const std::string& pngPath, int* width, int* height)
+{
+    struct Image { ComPtr<ID3D11ShaderResourceView> view; int w = 0, h = 0; };
+    static std::mutex lock;
+    static std::map<std::string, Image> made;
+    std::lock_guard<std::mutex> guard(lock);
+    const auto hit = made.find(pngPath);
+    if (hit != made.end())
+    {
+        if (width) *width = hit->second.w;
+        if (height) *height = hit->second.h;
+        return hit->second.view.Get();
+    }
+    Image& image = made[pngPath];
+    if (g_device == nullptr) { made.erase(pngPath); return nullptr; }
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    const std::wstring wide = std::filesystem::path(pngPath).wstring();
+    UINT w = 0, h = 0;
+    std::vector<uint8_t> pixels;
+    if (SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory))) &&
+        SUCCEEDED(factory->CreateDecoderFromFilename(wide.c_str(), nullptr, GENERIC_READ, WICDecodeMetadataCacheOnDemand, &decoder)) &&
+        SUCCEEDED(decoder->GetFrame(0, &frame)) && SUCCEEDED(factory->CreateFormatConverter(&converter)) &&
+        SUCCEEDED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) &&
+        SUCCEEDED(converter->GetSize(&w, &h)) && w > 0 && h > 0)
+    {
+        pixels.resize(size_t(w) * h * 4);
+        if (FAILED(converter->CopyPixels(nullptr, w * 4, UINT(pixels.size()), pixels.data()))) pixels.clear();
+    }
+    if (!pixels.empty())
+    {
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = w; desc.Height = h; desc.MipLevels = 1; desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_IMMUTABLE; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        const D3D11_SUBRESOURCE_DATA initial{ pixels.data(), w * 4, 0 };
+        ComPtr<ID3D11Texture2D> texture;
+        if (SUCCEEDED(g_device->CreateTexture2D(&desc, &initial, &texture))) g_device->CreateShaderResourceView(texture.Get(), nullptr, &image.view);
+        image.w = int(w); image.h = int(h);
+    }
+    printf("overlay: image %s %s (%ux%u)\n", pngPath.c_str(), image.view ? "made" : "NOT read", w, h);
+    fflush(stdout);
+    if (width) *width = image.w;
+    if (height) *height = image.h;
+    return image.view.Get();
+}
+
 void Overlay::SetStreakHud(bool (*active)(), void (*draw)(int width, int height))
 {
     g_streakHudDraw.store(draw);
@@ -1070,9 +1490,19 @@ void Overlay::SetHud(bool (*active)(), void (*draw)(int width, int height))
 void Overlay::NoteFrontEndText(FrontEndText text)
 {
     g_frontEndNow.fetch_or(uint32_t(text), std::memory_order_relaxed);
+    if (text == FrontEndText::MainMenu) g_mainMenuAt.store(GetTickCount64());   // co-op v40's lobby
 }
 
-bool Overlay::IsOpen() { return g_open.load() || g_console.load(); }
+bool Overlay::IsOpen() { return g_open.load() || g_console.load() || g_lobbyOpen.load(); }
+
+void Overlay::SetLobby(bool (*available)(), void (*draw)(int width, int height, bool open))
+{
+    g_lobbyDraw.store(draw);
+    g_lobbyAvailable.store(available);
+}
+bool Overlay::LobbyOpen() { return g_lobbyOpen.load(); }
+void Overlay::SetLobbyOpen(bool open) { g_lobbyOpen.store(open); }
+bool Overlay::MainMenuShown() { const uint64_t at = g_mainMenuAt.load(); return at != 0 && GetTickCount64() - at < 1000; }
 
 void Overlay::Toggle()
 {
@@ -1111,6 +1541,11 @@ bool Overlay::HandleMessage(void* hwnd, uint32_t message, uint64_t wParam, int64
     if (message == WM_KEYDOWN || message == WM_SYSKEYDOWN)
     {
         if (wParam == VK_F11) { Toggle(); return true; }
+        // F2: co-op v40's lobby (the campaign), when it is there
+        if (wParam == VK_F2 && g_lobbyDraw.load() && (g_lobbyOpen.load() || LobbyAvailableNow())) { g_lobbyOpen.store(!g_lobbyOpen.load()); return true; }
+#ifdef COD3_MP
+        if (wParam == VK_F6 && !g_console.load()) { Spectator::Key(); return true; }   // 0.5.490: spectating; 0.5.608 the spectator's seat on the team choice
+#endif
         // F12: the picture, and the next frame's draws to the log, so a
         // fault seen while playing can be read afterwards.
         // 0.5.228: F10, the photo mode: the HUD and the gun off (cg_draw2D,
@@ -1133,7 +1568,7 @@ bool Overlay::HandleMessage(void* hwnd, uint32_t message, uint64_t wParam, int64
     }
     // The character that key makes must not land in the console's input.
     if (message == WM_CHAR && ((lParam >> 16) & 0xFF) == 0x29 && g_console.load()) return true;
-    if (!g_ready.load() || (!g_open.load() && !g_console.load())) return false;
+    if (!g_ready.load() || (!g_open.load() && !g_console.load() && !g_lobbyOpen.load())) return false;
     // A binding waiting for a key takes the next key or mouse button.
     if (g_capturing >= 0)
     {
@@ -1145,7 +1580,8 @@ bool Overlay::HandleMessage(void* hwnd, uint32_t message, uint64_t wParam, int64
     }
     else if ((message == WM_KEYDOWN || message == WM_SYSKEYDOWN) && wParam == VK_ESCAPE)
     {
-        g_open.store(false);
+        if (g_open.load()) g_open.store(false);
+        else g_lobbyOpen.store(false);   // co-op v40's lobby
         return true;
     }
     ImGui_ImplWin32_WndProcHandler(static_cast<HWND>(hwnd), message, WPARAM(wParam), LPARAM(lParam));
@@ -1172,7 +1608,9 @@ bool Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture,
         }
     }
     // The screenshot first, of the picture alone.
-    if (backTexture != nullptr && g_screenshotWanted.exchange(false)) SaveScreenshotOf(backTexture, width, height, 0.0f);
+    // (COD3_SHOT_OVERLAY, the tests: the picture with the overlay on it, taken after it is drawn; co-op v40)
+    static const bool shotOverlay = getenv("COD3_SHOT_OVERLAY") != nullptr;
+    if (!shotOverlay && backTexture != nullptr && g_screenshotWanted.exchange(false)) SaveScreenshotOf(backTexture, width, height, 0.0f);
 
     const Settings::Values values = Settings::Get();
     const bool open = g_open.load();
@@ -1186,8 +1624,27 @@ bool Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture,
     bool (*streakHudActive)() = g_streakHudActive.load();
     void (*streakHudDraw)(int, int) = g_streakHudDraw.load();
     const bool streakHud = streakHudActive && streakHudDraw && streakHudActive();
+    bool (*seatHudActive)() = g_seatHudActive.load();
+    void (*seatHudDraw)(int, int) = g_seatHudDraw.load();
+    const bool seatHud = seatHudActive && seatHudDraw && seatHudActive();
+    bool (*matchHudActive)() = g_matchHudActive.load();   // 0.5.641
+    void (*matchHudDraw)(int, int) = g_matchHudDraw.load();
+    const bool matchHud = matchHudActive && matchHudDraw && matchHudActive();
+    bool (*weaponHudActive)() = g_weaponHudActive.load();   // 0.5.681
+    void (*weaponHudDraw)(int, int) = g_weaponHudDraw.load();
+    const bool weaponHud = weaponHudActive && weaponHudDraw && weaponHudActive();
+    bool (*flareHudActive)() = g_flareHudActive.load();   // 0.5.739
+    void (*flareHudDraw)(int, int) = g_flareHudDraw.load();
+    const bool flareHud = flareHudActive && flareHudDraw && flareHudActive();
     const bool notice = NoticeShown();
-    if (!open && !console && !hud && !menuHud && !streakHud && !notice && !values.fpsOverlay && !values.statsOverlay) return false;
+    void (*lobbyDraw)(int, int, bool) = g_lobbyDraw.load();
+    if (g_lobbyOpen.load() && !LobbyAvailableNow()) g_lobbyOpen.store(false);
+    const bool lobby = lobbyDraw && LobbyAvailableNow();
+    if (!open && !console && !hud && !menuHud && !streakHud && !seatHud && !matchHud && !weaponHud && !flareHud && !notice && !lobby && !values.fpsOverlay && !values.statsOverlay)
+    {
+        if (shotOverlay && backTexture != nullptr && g_screenshotWanted.exchange(false)) SaveScreenshotOf(backTexture, width, height, 0.0f);
+        return false;
+    }
 
     ImGui_ImplDX11_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -1214,15 +1671,43 @@ bool Overlay::Render(ID3D11RenderTargetView* back, ID3D11Texture2D* backTexture,
         }
         ImGui::End();
     }
+    if (weaponHud) weaponHudDraw(width, height);   // 0.5.681: under the rest
+    if (flareHud) flareHudDraw(width, height);     // 0.5.739: a signal flare's glow and blinding (over the M2's flame)
     if (hud) hudDraw(width, height);
     if (streakHud) streakHudDraw(width, height);
+    if (seatHud) seatHudDraw(width, height);
+    if (matchHud) matchHudDraw(width, height);
+    if (lobby) lobbyDraw(width, height, g_lobbyOpen.load() && !open);
     if (menuHud) menuHudDraw(width, height);
     if (notice) DrawNotice(width, height);
     if (open) DrawMenu(width, height);
     else if (console) DrawConsole(width, height);
     ImGui::Render();
     ID3D11RenderTargetView* targets[1] = { back };
-    g_context->OMSetRenderTargets(1, targets, nullptr);
-    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    ImDrawData* drawData = ImGui::GetDrawData();
+    // 0.5.718: the weapon picture (the background list, drawn first) only where
+    // the gun is not (MaskBuild), the rest as ever
+    ImDrawList* under = ImGui::GetBackgroundDrawList();
+    if (weaponHud && drawData && drawData->CmdListsCount > 0 && drawData->CmdLists[0] == under && MaskBuild(back, width, height))
+    {
+        ImDrawData first = *drawData, rest = *drawData;
+        first.CmdLists.clear(); first.CmdListsCount = 0; first.TotalVtxCount = first.TotalIdxCount = 0;
+        rest.CmdLists.clear(); rest.CmdListsCount = 0; rest.TotalVtxCount = rest.TotalIdxCount = 0;
+        first.AddDrawList(under);
+        for (int i = 1; i < drawData->CmdListsCount; i++) rest.AddDrawList(drawData->CmdLists[i]);
+        g_context->OMSetRenderTargets(1, targets, g_mask.view);
+        g_ImGuiDX11DepthStencilOverride = g_mask.test;
+        ImGui_ImplDX11_RenderDrawData(&first);
+        g_ImGuiDX11DepthStencilOverride = nullptr;
+        g_context->OMSetRenderTargets(1, targets, nullptr);
+        if (rest.CmdListsCount > 0) ImGui_ImplDX11_RenderDrawData(&rest);
+    }
+    else
+    {
+        g_context->OMSetRenderTargets(1, targets, nullptr);
+        ImGui_ImplDX11_RenderDrawData(drawData);
+    }
+    // (COD3_SHOT_OVERLAY: the picture with what was just drawn on it; 0.5.683)
+    if (shotOverlay && backTexture != nullptr && g_screenshotWanted.exchange(false)) SaveScreenshotOf(backTexture, width, height, 0.0f);
     return true;
 }

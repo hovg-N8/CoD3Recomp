@@ -5,6 +5,12 @@
 #include "window.h"
 #include "overlay.h"
 #include "settings.h"
+#include "menu_mouse.h"  // 0.5.595; 0.5.602 multiplayer too
+#ifdef COD3_MP
+#include "spectator.h"   // 0.5.490
+#else
+#include "sprint.h"      // 0.5.601
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +29,7 @@ namespace
     std::atomic<bool> g_scopedBreath{true};
     std::atomic<bool> g_tacticalPointActive{false}, g_tacticalPointCanReturn{false}, g_tacticalPointSaveHeld{false};
     std::atomic<bool> g_tacticalPointReturnHeld{false};
+    std::atomic<bool> g_noclipArmed{false};   // 0.5.454
     std::atomic<bool> g_weaponCycleEnabled{false};
     WeaponCycleInput::Latch g_weaponCycle;
     // The Xbox button masks, which are also the XInput ones.
@@ -179,6 +186,11 @@ namespace
     // swallows the pointer without asking cannot be left.
     std::atomic<bool> g_mouseHeld{ false };
     std::atomic<bool> g_captureSuspended{ false };
+    // 0.5.478: the button prompts (pc_prompts.cpp): whether the pad was used
+    // last, rather than the keyboard and mouse, and whether a menu (not a
+    // level) has the keys now
+    std::atomic<bool> g_padLast{ false };
+    std::atomic<bool> g_menuMode{ true };
     bool g_binocularKey = false;   // the campaign's Binoculars out key held (ReadKeyboard, under Refresh's lock)
     POINT g_centre{};
 
@@ -524,6 +536,154 @@ namespace
                 press.readsLeft--;
     }
 
+    // 0.5.595 (FrankHUN88453's, ac3b2a52): the left button in a menu of the
+    // title's, as menu_mouse.cpp says of what is under the pointer: A over
+    // the entry highlighted there (or the chapter chosen); over an arrow, an
+    // option's value or a chapter of the strip the cross's left or right,
+    // pressed as many times as it says, each press a few frames long with a
+    // gap after it, and again and again while the button stays down on an
+    // arrow, as a held cross repeats. Timed rather than counted in reads.
+    uint16_t MenuClicks(bool down)
+    {
+        using Clock = std::chrono::steady_clock;
+        constexpr auto PressFor = std::chrono::milliseconds(60), Gap = std::chrono::milliseconds(60);
+        constexpr auto RepeatAfter = std::chrono::milliseconds(450);
+        static bool wasDown = false, wasDownForList = false;
+        static int direction = 0, pressesLeft = 0;
+        static Clock::time_point downAt, pressAt;
+        const auto now = Clock::now();
+        const MenuMouse::Click click = MenuMouse::ClickUnderPointer();
+#ifdef COD3_MP
+        // 0.5.608: the spectator's seat under the team choice (spectator.cpp)
+        if (down && !wasDown && MenuMouse::PointerOnSeat())
+        {
+            wasDown = true;
+            printf("menu: click: the spectator's seat\n"); fflush(stdout);
+            Spectator::TakeSeat();
+            return 0;
+        }
+#endif
+        if (down && !wasDown)
+        {
+            downAt = now;
+            static int told = 0;   // 0.5.600: what each click did (at most 100 a run)
+            if (told < 100) { told++; printf("menu: click: %s, direction %d x%d\n", click.takes ? "A" : click.direction != 0 ? "the cross" : "nothing", click.direction, click.steps); fflush(stdout); }
+            if (click.direction != 0 && pressesLeft == 0)
+            {
+                direction = click.direction;
+                pressesLeft = std::max(1, click.steps);
+                pressAt = now;
+            }
+        }
+        else if (down && click.direction != 0 && click.steps == 1 && pressesLeft == 0 && now - downAt >= RepeatAfter)
+        {
+            direction = click.direction;
+            pressesLeft = 1;
+            pressAt = now;
+        }
+        wasDown = down;
+        uint16_t buttons = 0;
+        if (pressesLeft > 0)
+        {
+            if (now - pressAt >= PressFor + Gap)
+            {
+                pressesLeft--;
+                pressAt = now;
+            }
+            if (pressesLeft > 0 && now - pressAt < PressFor) buttons |= direction < 0 ? PadLeft : PadRight;
+        }
+        else if (down && click.takes)
+            buttons |= PadA;
+        // 0.5.621: a click on a lobby list's row while its highlight is still on
+        // its way there: A once it has arrived (at most 1.5 s later)
+        {
+            static bool pending = false, taking = false;
+            static Clock::time_point pendingAt, takeAt;
+            if (down && !wasDownForList && !click.takes && MenuMouse::ListStep() != 0) { pending = true; pendingAt = now; }
+            wasDownForList = down;
+            if (pending && now - pendingAt > std::chrono::milliseconds(3000)) pending = false;   // 0.5.639: was 1.5 s
+            if (pending && MenuMouse::ListStep() == 0 && click.takes) { pending = false; taking = true; takeAt = now; }
+            if (taking) { if (now - takeAt < PressFor) buttons |= PadA; else taking = false; }
+        }
+        return buttons;
+    }
+
+    // 0.5.618: a lobby list's highlight brought to the row under the pointer
+    // (menu_mouse.cpp, ListStep), one press of the cross at a time (60 ms down,
+    // 90 ms apart)
+    uint16_t ListSteps()
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point pressAt;
+        static int pressing = 0;
+        const auto now = Clock::now();
+        const int step = MenuMouse::ListStep();
+        // 0.5.639 (user: "scroll through the menu's fast ... get directly to the
+        // one we highlight without having to watch it scroll"; "if i click it it
+        // clicks instantly"; "1 to 1 with how other pc menus work and feel"):
+        // a press is down until a whole frame of the title's has read it and up
+        // until a whole frame has read that (two swaps each: one may have
+        // begun before), at least 8 ms each, not 60 ms every 150: a row in
+        // about 25 ms at 144 fps, 60 at 60. A press the menu drops is made
+        // again, as the highlight is compared with the row under the pointer.
+        static uint64_t swapAt = 0, upAt = 0;
+        static Clock::time_point upTime;
+        const uint64_t swaps = Kernel::Stats().swaps.load(std::memory_order_relaxed);
+        // 0.5.646: the team choice takes a press held as a key is (645's log:
+        // its highlight never moved for the 2-frame presses; only a row
+        // written by us, which it does not show either): 90 ms down and up
+        const auto least = std::chrono::milliseconds(MenuMouse::SlowSteps() ? 90 : 8);
+        if (pressing == 0 && step != 0 && swaps >= upAt + 2 && now - upTime >= least) { pressing = step; pressAt = now; swapAt = swaps; }
+        if (pressing == 0) return 0;
+        if (swaps < swapAt + 2 || now - pressAt < least) return pressing > 0 ? PadDown : PadUp;
+        pressing = 0; upAt = swaps; upTime = now;
+        return 0;
+    }
+
+#ifdef COD3_MP
+    // 0.5.637: the right button, back in every multiplayer menu (user, 636:
+    // "the rmb isnt working in the game rules menus ... the create a match
+    // screen i couldnt back out of"). 636's play log: those screens (82082F0C,
+    // 8208310C) took no Back, which the right button pressed outside a level;
+    // in a match B goes back. A click presses B (80 ms); when the menu up is
+    // still the same 250 ms later, Back (80 ms). Held, it does nothing more.
+    uint16_t RightBack(bool down)
+    {
+        using Clock = std::chrono::steady_clock;
+        static bool wasDown = false;
+        static int phase = 0;   // 0 none, 1 B, 2 waiting, 3 Back
+        static Clock::time_point at;
+        static uint32_t menuAt = 0;
+        const auto now = Clock::now();
+        if (down && !wasDown && phase == 0) { phase = 1; at = now; menuAt = MenuMouse::CurrentMenu(); }
+        wasDown = down;
+        const auto since = now - at;
+        if (phase == 1)
+        {
+            if (since < std::chrono::milliseconds(80)) return PadB;
+            phase = 2;
+        }
+        if (phase == 2)
+        {
+            if (since < std::chrono::milliseconds(250)) return 0;
+            // not asked again soon after (the menu went: called only while one is up)
+            if (since > std::chrono::milliseconds(600)) { phase = 0; return 0; }
+            const uint32_t menu = MenuMouse::CurrentMenu();
+            if (menu == 0 || menu != menuAt) { phase = 0; return 0; }   // B took it
+            phase = 3; at = now;
+            static int told = 0;
+            if (told < 20) { told++; printf("menu: right button: B did not go back from %08X, Back\n", menu); fflush(stdout); }
+            return PadBack;
+        }
+        if (phase == 3)
+        {
+            if (since < std::chrono::milliseconds(80)) return PadBack;
+            phase = 0;
+        }
+        return 0;
+    }
+#endif
+
     // The keyboard and mouse stand in for a pad. Only while the title's own
     // window is in front, so typing anywhere else is not taken as input.
     Input::Pad ReadKeyboard()
@@ -538,7 +698,14 @@ namespace
             if (text == nullptr) text = getenv("COD3_BACKGROUND");   // a run nobody is playing
             return text != nullptr && text[0] != 0 && text[0] != '0';
         }();
-        if (ignored) return pad;
+        if (ignored)
+        {
+            // 0.5.619: a test's scripted pointer (COD3_MENUCURSOR) steers the
+            // lobby's lists with nobody at the keyboard too
+            static const bool cursor = getenv("COD3_MENUCURSOR") != nullptr;
+            if (cursor) pad.buttons |= ListSteps();
+            return pad;
+        }
         if (!Window::HasFocus() || Overlay::IsOpen() || g_captureSuspended.load())
         {
             // Out of focus, or the settings menu is up and the keys and the
@@ -559,6 +726,22 @@ namespace
         // also Start, so the pause menu opens with the pointer free to leave.
         const bool inLevel = Kernel::Stats().filesOpened.load(std::memory_order_relaxed) >= 40;
         const bool escapeDown = Down(VK_ESCAPE);
+        // 0.5.595: a menu of the title's own up in a level (the pause menu, a
+        // mission's end) is pointed at (menu_mouse.cpp): the pointer is let go
+        // while it is up and taken again when it goes, for looking around.
+        // 0.5.602: the multiplayer's menus are pointed at too, but there the
+        // pointer is not let go by itself (Escape lets it go, as before),
+        // until a log shows which of its menus are up during play.
+        // 0.5.613: 603-612's self-tests: in a match a menu is up only for the
+        // team and kit choices (and the pause menu): none during play. So the
+        // multiplayer's let the pointer go as the campaign's do.
+        const bool menuUp = MenuMouse::MenuUp();
+        {
+            static bool wasUp = false;
+            if (inLevel && menuUp && !wasUp && g_mouseHeld.load()) SetHold(false);
+            if (inLevel && !menuUp && wasUp && !g_mouseHeld.load()) SetHold(true);
+            wasUp = menuUp;
+        }
         // Start is held for a few reads after Escape frees the pointer, so
         // the title's own poll, which is slower than these reads, sees it.
         static int startReadsLeft = 0;
@@ -572,7 +755,7 @@ namespace
             const HWND captureWindow=static_cast<HWND>(Window::Handle());
             const bool inClient=captureWindow && GetCursorPos(&pointer) &&
                 ScreenToClient(captureWindow,&pointer) && GetClientRect(captureWindow,&client) && PtInRect(&client,pointer);
-            if (Down(VK_F1) || (inClient && Down(VK_MBUTTON)) || firstTime || (inLevel && inClient && Down(VK_LBUTTON) && !escapeDown))
+            if (Down(VK_F1) || (inClient && Down(VK_MBUTTON)) || firstTime || (inLevel && !menuUp && inClient && Down(VK_LBUTTON) && !escapeDown))
             {
                 SetHold(true);
                 if (inLevel) takenForLevel = true;
@@ -634,10 +817,26 @@ namespace
         // Not in the multiplayer program: its menus take a press of A and
         // Start together as neither, and it has no press start screen.
 #ifndef COD3_MP
-        if (!held && Down(VK_SPACE)) pad.buttons |= PadStart;
+        if (!held && Down(VK_SPACE) && (!menuUp || MenuMouse::TitleScreen())) pad.buttons |= PadStart;
+        // 0.5.595: in a menu of the title's own, Escape goes back as its B
+        // does, once a press (the press that let the pointer go and opened
+        // the pause menu is not one), held for a few reads so the title's
+        // poll sees it.
+        {
+            static bool escapeWasDown = false;
+            static int backReadsLeft = 0;
+            if (!held && menuUp && escapeDown && !escapeWasDown && startReadsLeft == 0) backReadsLeft = 6;
+            escapeWasDown = escapeDown;
+            if (backReadsLeft > 0) { pad.buttons |= PadB; backReadsLeft--; }
+        }
 #endif
-        if (!held && Down(VK_ESCAPE) && !inLevel) pad.buttons |= PadBack;
+#ifdef COD3_MP
+        if (!held && Down(VK_ESCAPE) && !inLevel) pad.buttons |= PadBack;   // the multiplayer's menus go back with Back
+#else
+        if (!held && Down(VK_ESCAPE) && !inLevel && !menuUp) pad.buttons |= PadBack;
+#endif
         if (inLevel && startReadsLeft > 0) { pad.buttons |= PadStart; startReadsLeft--; }
+        g_menuMode.store(!held && (!inLevel || menuUp), std::memory_order_relaxed);   // 0.5.478; 0.5.595 a menu in a level too
 
         // Driving a menu with the mouse.
         //
@@ -648,10 +847,37 @@ namespace
         // down steps the highlight, one step per movement rather than one per
         // pixel, and the left button takes the entry. It is not pointing and
         // clicking, but it is a menu driven with the mouse.
-        if (!held && !inLevel)
+        // 0.5.595: in the campaign, where the title's menu is known
+        // (menu_mouse.cpp), the entry under the pointer is highlighted and
+        // the left button takes it, only over it; the right button is B.
+        // 0.5.602: the multiplayer's too; there the right button stays Back
+        // and Page Up and Page Down the bumpers, as below.
+        // 0.5.614: only where the pointer finds something (MenuMouse::Pointable);
+        // a screen of no entries of its own goes the old way below, in a match too
+        if (!held && menuUp && MenuMouse::Pointable())
+        {
+            pad.buttons |= MenuClicks(Down(VK_LBUTTON));
+            pad.buttons |= ListSteps();   // 0.5.618
+#ifdef COD3_MP
+            // 0.5.635 (user: "the right click (RMB) should allow you to go back
+            // to the previous menu"): in a match the menus (the pause menu, its
+            // quit question) go back with B, the front end's with Back
+            pad.buttons |= RightBack(Down(VK_RBUTTON));   // 0.5.637
+            if (Down(VK_PRIOR)) pad.buttons |= PadLeftShoulder;
+            if (Down(VK_NEXT)) pad.buttons |= PadRightShoulder;
+#else
+            if (Down(VK_RBUTTON)) pad.buttons |= PadB;
+#endif
+        }
+        else
+        if (!held && (!inLevel || menuUp))
         {
             if (Down(VK_LBUTTON)) pad.buttons |= PadA;
+#ifdef COD3_MP
+            pad.buttons |= RightBack(Down(VK_RBUTTON));   // 0.5.637
+#else
             if (Down(VK_RBUTTON)) pad.buttons |= PadBack;
+#endif
             // Page Up and Page Down are the bumpers, which turn a menu's
             // pages (the System Link custom rules, lobby_rules.cpp).
             if (Down(VK_PRIOR)) pad.buttons |= PadLeftShoulder;
@@ -685,6 +911,8 @@ namespace
     std::atomic<int> g_aimPresses{0}, g_startPresses{0}, g_upPresses{0}, g_downPresses{0}, g_rightPresses{0};
     bool g_aimWasDown = false;
     std::atomic<bool> g_mortar{false};   // 0.5.285
+    std::atomic<bool> g_dualHeld{false}, g_dualNoFire{false};   // 0.5.811: the dual pistols
+    std::atomic<int> g_testFire{0}, g_testReload{0};             // 0.5.812: Input::TestHold
     std::atomic<int> g_mortarFires{0};
     std::atomic<bool> g_mortarPassFire{false};   // 0.5.300
     bool g_mortarFireWas = false;
@@ -719,6 +947,20 @@ namespace
         // which looks exactly like input not working at all.
         Input::Pad pad = ReadKeyboard();
         const uint16_t fromKeyboard = pad.buttons;
+        // 0.5.478: the keyboard and mouse used (for the prompts): a key, the
+        // movement keys or the mouse's buttons as the sticks and triggers, or
+        // the pointer moved or clicked in the window
+        bool keysUsed = fromKeyboard != 0 || pad.thumbLX != 0 || pad.thumbLY != 0 || pad.thumbRX != 0 || pad.thumbRY != 0 ||
+                        pad.leftTrigger != 0 || pad.rightTrigger != 0;
+        if (Window::HasFocus())
+        {
+            static POINT lastPointer{};
+            POINT pointer{};
+            if (GetCursorPos(&pointer) && (pointer.x != lastPointer.x || pointer.y != lastPointer.y) && !g_mouseHeld.load()) keysUsed = true;
+            lastPointer = pointer;
+            if (Down(VK_LBUTTON) || Down(VK_RBUTTON) || Down(VK_MBUTTON)) keysUsed = true;
+        }
+        bool padThere = false, padUsed = false;
         const uint16_t fromScript = ScriptedButtons();
         uint16_t fromPad = 0;
         pad.buttons |= fromScript;
@@ -737,6 +979,11 @@ namespace
             {
                 g_lastPadSeen = state;
                 fromPad = state.buttons;
+                // 0.5.478: the pad used: a button, a trigger pulled, a stick
+                // past its deadzone (ReadPads gives a stick at rest as 0)
+                padThere = true;
+                padUsed = state.buttons != 0 || state.leftTrigger > 40 || state.rightTrigger > 40 ||
+                          state.thumbLX != 0 || state.thumbLY != 0 || state.thumbRX != 0 || state.thumbRY != 0;
                 pad.buttons |= state.buttons;
                 pad.leftTrigger = std::max(pad.leftTrigger, state.leftTrigger);
                 pad.rightTrigger = std::max(pad.rightTrigger, state.rightTrigger);
@@ -755,6 +1002,10 @@ namespace
             }
             else g_lastPadSeen = {};
         }
+        // 0.5.478: the prompts follow what was used last
+        if (!padThere) g_padLast.store(false);
+        else if (padUsed) g_padLast.store(true);
+        else if (keysUsed) g_padLast.store(false);
 
 #ifdef COD3_MP
         // Use real held buttons before SprintInput removes stationary L3.
@@ -774,6 +1025,32 @@ namespace
             }
         }
 #endif
+
+        // 0.5.454: noclip by a double tap of A (Justin: "double tap a to come out
+        // of it or to activate it if i use the console commands to put it on,
+        // that way i can just drop to the ground"), once the console's noclip
+        // has been used: two presses within 350 ms send noclip again.
+#ifdef COD3_MP
+        // 0.5.490: spectating (spectator.cpp) takes its own buttons and holds
+        // back the ones that would move or fire your player
+        Spectator::FilterPad(pad);
+        const bool spectating = Spectator::Active();
+#else
+        const bool spectating = false;
+#endif
+        if (g_noclipArmed.load() && !Overlay::IsOpen() && !spectating)
+        {
+            static bool wasDown = false;
+            static uint64_t lastPress = 0;
+            const bool down = (pad.buttons & PadA) != 0;
+            if (down && !wasDown)
+            {
+                const uint64_t now = GetTickCount64();
+                if (lastPress && now - lastPress <= 350) { Kernel::QueueConsoleCommand("noclip"); lastPress = 0; }
+                else lastPress = now;
+            }
+            wasDown = down;
+        }
 
         // Tap to sprint (a PC addition, as later games of the series have it).
         // The title runs only while the left stick is held in, so a press
@@ -795,6 +1072,9 @@ namespace
         }
         g_sprintHeld.store((pad.buttons & PadLeftThumb)!=0 && pad.thumbLY>8000 && pad.leftTrigger<=30);
 #ifndef COD3_MP
+        // 0.5.601: the campaign's own sprint (sprint.cpp, FrankHUN88453's):
+        // +sprint while sprint is held, -sprint when it is let go.
+        Sprint::Hold(g_sprintHeld.load());
         // The Binoculars out key: the left stick held in, while not pushing
         // forward (forward, the title would take it for a run).
         if (g_binocularKey && pad.thumbLY < SprintInput::RunStart) pad.buttons |= PadLeftThumb;
@@ -859,6 +1139,11 @@ namespace
             pad.buttons &= uint16_t(~(PadA | PadB | PadX | PadY | PadLeftThumb | PadRightThumb | PadLeftShoulder | PadRightShoulder));
         }
         else g_mortarFireWas = false;
+        // 0.5.812: a test's fire or reload (Input::TestHold)
+        if (g_testFire.load() > 0) { pad.rightTrigger = 255; g_testFire.fetch_sub(1); }
+        if (g_testReload.load() > 0) { pad.buttons |= PadX; g_testReload.fetch_sub(1); }
+        // 0.5.811: the dual pistols: hip fire only; no fire while the left gun is reloaded
+        if (g_dualHeld.load()) { pad.leftTrigger = 0; if (g_dualNoFire.load()) pad.rightTrigger = 0; }
         // 0.5.307: a crouch tap asked for by the mortar (down at it, up after).
         if (g_crouchTap.load() > 0) { pad.buttons |= PadB; g_crouchTap.fetch_sub(1); }
 
@@ -891,6 +1176,19 @@ namespace
     }
 }
 
+// (co-op v46, merged in 0.5.671) the real controllers as they are now, for the co-op lobby's own
+// navigation while the game's input is held. Under the lock Refresh reads them with (the lobby
+// asks from the drawing thread).
+bool Input::RealPad(uint16_t& buttons, int16_t& leftX, int16_t& leftY)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    FindXInput();
+    XInputGamepad pad{};
+    const bool any = ReadPads(pad);
+    buttons = pad.buttons; leftX = pad.thumbLX; leftY = pad.thumbLY;
+    return any;
+}
+
 Input::Pad Input::State()
 {
     Refresh();
@@ -914,6 +1212,8 @@ void Input::TakePresses(int& start, int& up, int& down)
     down = g_downPresses.exchange(0);
 }
 int Input::TakeRightPresses() { Refresh(); return g_rightPresses.exchange(0); }
+void Input::TestHold(bool reload, int reads) { (reload ? g_testReload : g_testFire).store(reads); }
+void Input::SetDualPistols(bool held, bool noFire) { g_dualHeld.store(held); g_dualNoFire.store(held && noFire); }
 void Input::SetMortar(bool on) { g_mortar.store(on); if (!on) { g_mortarFires.store(0); g_mortarPassFire.store(false); } }
 void Input::SetMortarPassFire(bool pass) { g_mortarPassFire.store(pass); }
 void Input::PressCrouch() { g_crouchTap.store(3); }
@@ -991,8 +1291,18 @@ bool Input::TakeLook(long& dx, long& dy)
     dx = g_lookX;
     dy = g_lookY;
     g_lookX = g_lookY = 0;
+    if (dx != 0 || dy != 0) g_padLast.store(false);   // 0.5.478: the mouse turned the view
     return true;
 }
+
+// 0.5.478: the button prompts' choice (pc_prompts.cpp): the setting, or
+// (automatic) the pad's icons when the pad was used last.
+bool Input::PadPrompts()
+{
+    const int chosen = Settings::Get().buttonPrompts;
+    return chosen == 1 || (chosen == 0 && g_padLast.load(std::memory_order_relaxed));
+}
+bool Input::MenuMode() { return g_menuMode.load(std::memory_order_relaxed); }
 
 void Input::LookByStick()
 {
@@ -1020,6 +1330,7 @@ uint16_t Input::NativeButtons(uint16_t buttons,bool paused)
     return WeaponCycleInput::Report(buttons,g_weaponCycleEnabled.load(),paused);
 }
 
+void Input::ArmNoclipTap() {g_noclipArmed.store(true);}
 void Input::SetTacticalPointInput(bool active,bool canReturn) {g_tacticalPointActive.store(active);g_tacticalPointCanReturn.store(canReturn);}
 bool Input::TacticalPointSaveHeld() {Refresh();return g_tacticalPointSaveHeld.load();}
 bool Input::TacticalPointReturnHeld() {Refresh();return g_tacticalPointReturnHeld.load();}

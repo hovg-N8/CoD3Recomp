@@ -79,3 +79,6 @@
 82A57900 82C2ECF0  # data: the local clients' state, by the pad look's code
 82A2A1C8 82BCBE9C  # data: the local client playing, by the pad look's code
 82A90A6A 82C73024  # data: a byte per local client that stops the turn, by the pad look's code
+82420F48 82438DF0  # code: the coronas' depth lookup (cpu_depth.cpp), matched by hand: the same code, scheduled otherwise (0.87 of the lines alike, the next 0.17)
+82A2ABDC 82BCC8AC  # data: its depth texture object, by the same instruction (r30) in both
+82A8DF2C 82C6B1FC  # data: the front end's manager (its fonts; pc_prompts.cpp), by 25 functions' twins, all agreeing

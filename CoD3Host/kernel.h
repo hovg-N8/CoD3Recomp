@@ -238,6 +238,9 @@ namespace Kernel
     void WatchWrite(uint32_t guestAddress, bool reads = false);
     void ArmWatchpoints();
     bool ReportWatchpoint(void* winContext);
+    // 0.5.556: the watched word is a count, not a pointer: a value above
+    // this is the one to report whoever wrote it (0: the pointer test).
+    void WatchSuspiciousAbove(uint32_t threshold);
     bool SelfTestWatchpoint();
 
     // Signals an event by handle, for a kernel call that completes work the

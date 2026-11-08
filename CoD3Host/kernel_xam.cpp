@@ -1073,6 +1073,22 @@ PPC_FUNC(__imp__XamLoaderSetLaunchData)
 
 #ifndef COD3_MP
 void CoopBeforeRelaunch();   // coop.cpp
+// (co-op v45, merged in 0.5.671) the joining copy started again from nothing, this program once more
+// with this process's environment (its co-op mode and the host's address in it): it joins the host and
+// follows him into his mission as it first did. Used when the host goes back to a checkpoint
+// (coop_lobby.cpp ReloadMission, coop_swap.cpp).
+void CoopRelaunchFresh()
+{
+    if (StartSibling(L"CoD3.exe"))
+    {
+        printf("coop: started again from nothing; this process ends.\n");
+        fflush(stdout);
+        // (v45g) at once: ExitProcess from the game's thread waited for ever on the second time (the log's
+        // own shutdown, with this process's output already sent to coop-join-reload.log)
+        TerminateProcess(GetCurrentProcess(), 0);
+    }
+    printf("coop: could not start this program again (error %lu)\n", GetLastError()); fflush(stdout);
+}
 #endif
 PPC_FUNC(__imp__XamLoaderLaunchTitle)
 {

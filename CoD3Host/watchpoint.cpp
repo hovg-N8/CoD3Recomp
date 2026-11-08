@@ -31,6 +31,7 @@ namespace
     bool g_reads = false;            // reads too, not only writes
     std::set<uint32_t> g_armed;      // os thread ids already carrying the watch
     std::atomic<int> g_reports{ 0 };
+    uint32_t g_above = 0;            // 0.5.556: nonzero: a value above this is the suspicious one (a count, not a pointer)
 
     bool ArmThread(HANDLE thread, uintptr_t address)
     {
@@ -177,6 +178,12 @@ bool Kernel::SelfTestWatchpoint()
     return fired;
 }
 
+void Kernel::WatchSuspiciousAbove(uint32_t threshold)
+{
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_above = threshold;
+}
+
 bool Kernel::ReportWatchpoint(void* winContext)
 {
     {
@@ -206,7 +213,17 @@ bool Kernel::ReportWatchpoint(void* winContext)
     // Not read here when reads are watched: the handler's own read would
     // trip the watch again, inside itself, without end.
     const uint32_t now = g_reads ? 0 : Guest::Read32(Guest::Base, g_watched);
-    const bool suspicious = !g_reads && (now < 0x10000u || now >= 0xC0000000u);
+    const bool suspicious = !g_reads && (g_above != 0 ? now > g_above : (now < 0x10000u || now >= 0xC0000000u));
+    // 0.5.556: how often the word is written, once a minute (the watch's cost)
+    {
+        static std::atomic<uint32_t> perMinute{ 0 }; static std::atomic<uint64_t> since{ 0 };
+        const uint64_t ms = GetTickCount64();
+        perMinute++;
+        uint64_t was = since.load();
+        if (was == 0) since.store(ms);
+        else if (ms - was >= 60000 && since.compare_exchange_strong(was, ms))
+        { printf("watchpoint: 0x%08X written %u times in the last minute\n", g_watched, perMinute.exchange(0)); fflush(stdout); }
+    }
     if (!suspicious && (!guestCode || report >= 40)) return true;
 
     printf("\nwatchpoint: guest address 0x%08X was %s\n", g_watched, g_reads ? "touched" : "written");
@@ -217,7 +234,11 @@ bool Kernel::ReportWatchpoint(void* winContext)
             printf("%ssub_%08X", i == 0 ? " " : " <- ", functions[i]);
         printf("\n");
     }
-    printf("  it now holds 0x%08X%s\n", now, suspicious ? ", which is not a pointer" : "");
+    if (g_above != 0)   // 0.5.556: the list it belongs to (buffer, capacity, count)
+        printf("  it now holds 0x%08X (%u)%s; the words before it: %08X %08X\n", now, now, suspicious ? ", far above any real count" : "",
+               Guest::Read32(Guest::Base, g_watched - 8), Guest::Read32(Guest::Base, g_watched - 4));
+    else
+        printf("  it now holds 0x%08X%s\n", now, suspicious ? ", which is not a pointer" : "");
     // The instruction itself, and the thread's link register: the host
     // walk above goes astray through host frames, these two do not.
     {

@@ -1,4 +1,55 @@
-# Current source / local install: 0.5.409 / 0.5.409; built OK, Rimling test running. Source-only GitHub release407 published; see top NEXT-SESSION STATE. Read PICK-ME-UP.md and top STATE lines.
+<!-- claude-2026-11-05-handoff -->
+**Claude handoff 2026-11-05 ~22:20 (0.5.795 built and installed; nothing committed; friend zip on hold):** docs/CLAUDE-SESSION-2026-11-05.md is the handoff. 0.5.781-0.5.795: map changes with tanks fixed and tested both ways; tanks visible (Saint-Lo cut 7 of 8 blocks); Stuka cut (game\sp\crssrds\vehicles_stuka.cod); kapf.py decompresses campaign blocks; tank events through sub_82555160 + Merville's mp_merville.fx (0.5.795, unverified).
+<!-- /claude-2026-11-05-handoff -->
+
+<!-- claude-2026-11-03-handoff -->
+**UPDATE 2026-11-03 ~20:05 (Claude; source+install 0.5.758; nothing committed): flares have WaW's own sounds, burn whoever stands on them, and bots throw them (kits with the Mosin, Webley and flares). Bot smoke throws were broken before and now work. Read the top of docs/CLAUDE-SESSION-2026-11-03.md.**
+**UPDATE 2026-11-03 ~19:00 (Claude; source+install 0.5.751; nothing committed): the signal flare is finished: thrown, flies, lights after 1 s where it lands, no smoke (its grenade sunk, WaW stick left), blinding verified. Read the top of docs/CLAUDE-SESSION-2026-11-03.md.**
+**UPDATE 2026-11-03 ~17:30 (Claude; source+install 0.5.743; nothing committed): the signal flare now looks like WaW's flare stick (thrown, lying, in others' hands; first person keeps the game's grenade). Read the top of docs/CLAUDE-SESSION-2026-11-03.md.**
+**UPDATE 2026-11-03 ~16:40 (Claude; source+install 0.5.741; nothing committed): World at War's SIGNAL FLARE (class editor SPECIAL row) + Seelow fires centred + drain pipe roof. Read the top section of docs/CLAUDE-SESSION-2026-11-03.md.** Open: ask the user to throw a flare (scripts cannot throw); WaW's flare stick model; bots cannot throw it.
+**Claude handoff 2026-11-03 ~01:00 (0.5.738 built and installed; nothing committed; friend zip on hold):** docs/CLAUDE-SESSION-2026-11-03.md is the handoff. Seelow collision finished with the user live (4 .cgb files via the level's unzoned.cgb, WaW hull triangles' sign fixed, ladders, pipe, wall hole, tunnel kerb); night lighting kept to rooms, user's lanterns (my_lights.txt), CoD3 vehicle fire on WaW's 5 burning cars; Mantle assist setting.
+<!-- /claude-2026-11-03-handoff -->
+
+<!-- claude-2026-11-02-evening-handoff -->
+**Claude handoff 2026-11-02 ~20:45 (0.5.737 built and installed; nothing committed; friend zip on hold):** docs/CLAUDE-SESSION-2026-11-02-evening.md is the handoff (detail: ...-afternoon.md). Seelow/Seelow Night collision WaW-exact, models and foliage fixed, night lit; open: small WaW clip brushes (user's call), daylit arms at night.
+<!-- /claude-2026-11-02-evening-handoff -->
+
+<!-- claude-2026-11-02-afternoon-handoff -->
+**Claude handoff 2026-11-02 ~15:40 (0.5.734 installed; nothing committed; friend zip on hold):** docs/CLAUDE-SESSION-2026-11-02-afternoon.md is the handoff. Seelow collision: clip-bit swap removed, glass out, prop budget 30000; wheat upright; Seelow Night brighter and Longyard's fog (side session). Collision complaints not yet re-tested.
+<!-- /claude-2026-11-02-afternoon-handoff -->
+
+<!-- claude-2026-11-02-midday-handoff -->
+**Claude handoff 2026-11-02 ~12:15 (0.5.731 built and installed; nothing committed; friend zip on hold):** docs/CLAUDE-SESSION-2026-11-02-midday.md is the handoff. Seelow (day) clean and tested; Seelow Night new (devmap seelownight, NIGHT=1 tools/waw/seelow_install.sh); vehicles parked; tools/kapf/repack.py is the archive repacker (rules in the session file).
+<!-- /claude-2026-11-02-midday-handoff -->
+
+<!-- claude-2026-11-02-handoff -->
+**Claude handoff 2026-11-02 ~09:25 (0.5.728 built and installed; nothing committed):** docs/CLAUDE-SESSION-2026-11-02.md is the handoff (Seelow pipeline in tools/waw, data in seelow-work, install with tools/waw/seelow_install.sh; hard-won limits listed there and in memory converted-map-cell-limits).
+<!-- /claude-2026-11-02-handoff -->
+
+<!-- claude-2026-11-01-night-handoff -->
+**Claude handoff 2026-11-01 ~23:05 (source and install 0.5.725, built OK; nothing committed; friend zip on hold; Carentan still set P, "perfect now" per the user): read docs/CLAUDE-SESSION-2026-11-01-night.md FIRST (whole file is the handoff).** Done: World at War's M2 flamethrower nearly finished: fire not bullets (impact records cleared), WaW's own arm animations on CoD3's arms (tools/waw xanim.py / wawpose.py / make_flame_arms.py), the flame starting at the nozzle as the game draws it (the M2 draw's own constants), the gun drawn over its flame (stencil mask), others' flames in the world (fading with distance, hidden behind walls), WaW's overheating instead of a reload (heat bar over the ammo box), damage 26. UAV: an oval fitted to the map and to the draw distance (Isle 3113 x 1722). Next: the user plays 0.5.725, then CoD2's scoped Mosin-Nagant (plan in CLAUDE-SESSION-2026-11-01.md), Webley fingers, Seelow. Open: grey wall puffs with the M2; Isle deathmatch's closed gates (a smaller layout? not checked).
+<!-- /claude-2026-11-01-night-handoff -->
+
+<!-- claude-2026-11-01-evening-handoff -->
+**Claude handoff 2026-11-01 ~18:40 (source and install 0.5.702, built OK; Carentan installed as set P; nothing committed; friend zip on hold): read docs/CLAUDE-SESSION-2026-11-01-evening.md FIRST (whole file is the handoff).** Done today: Webley + flamethrower kill-feed icons; Carentan: CoD2-exact lightmaps, Rouen collision/props/trees/grass removed (renamed files are still loaded: drop them from the directory), floor gaps fixed (266 CoD2 triangles rebuilt), white-outs fixed (BSP leaves -> one cell), black walls fixed (decals on e_decal, drawn after walls; additive decals out). User: "the walls look perfect now". Open: the player "frozen" spot at -689 1601 (0.5.702 logs "player still"), check the last test's 23 low-triangle seconds, then flamethrower / Seelow / scoped Mosin.
+<!-- /claude-2026-11-01-evening-handoff -->
+
+<!-- claude-2026-11-01-handoff -->
+**Claude handoff 2026-11-01 ~10:30 (source and install 0.5.689, built; nothing committed): read the top section of docs/CLAUDE-SESSION-2026-11-01.md first ("END OF SESSION HANDOFF").** Carentan (CoD2's real map, its own map, never a Rouen reskin): collision converted and proven in game; the drawn level converts (tools/cod2import/cod2cells.py) and IS DRAWN in game in a scratch harness of the placeholder pack. One open bug: our own textures come out white (their imports never find them); 0.5.689's COD3_TEXLOOKUP=1 logs the texture handler and binds: run tools/carentan/runvariant.sh "" <case> with EXTRA_ENV="COD3_TEXLOOKUP=1" next (warn the user before any launch). Work data: D:\Call of Duty 3 (USA, Europe)\carentan-work\ (game data, not in git). The pack is back to its placeholder.
+<!-- /claude-2026-11-01-handoff -->
+
+# Current source / local install: 0.5.633 (2026-10-30 12:40), MG42 fix validated on Isle. Read docs/PICK-ME-UP.md, then docs/CODEX-SESSION-2026-10-30.md and docs/CLAUDE-SESSION-2026-10-30.md.
+<!-- codex-2026-10-30-handoff -->
+**Codex handoff 2026-10-30: source633; install0.5.632; 633 runtime UNTESTED.**
+Read [CODEX-SESSION-2026-10-30.md](CODEX-SESSION-2026-10-30.md).
+Root cause: Isle's mounted `mg42` animation entry shadows our handheld alias.
+633 scopes the MG34 override to handheld setup. Build status: building: 0.5.633 handheld MG42 animation-table collision fix; no test request.
+User requested wrap-up; all games stopped, original INI restored, no test queued.
+<!-- /codex-2026-10-30-handoff -->
+
+# Current source / local install: 0.5.631 (2026-10-30 00:08). Read docs/PICK-ME-UP.md, then docs/CLAUDE-SESSION-2026-10-30.md and docs/CLAUDE-SESSION-2026-10-29.md.
+# Current source / local install: 0.5.479 (2026-10-25 22:50). Read docs/PICK-ME-UP.md, then docs/CLAUDE-SESSION-2026-10-25.md.
+# (was) Current source / local install: 0.5.409 / 0.5.409; built OK, Rimling test running. Source-only GitHub release407 published; see top NEXT-SESSION STATE. Read PICK-ME-UP.md and top STATE lines.
 
 # CoD3 Recomp: handoff for the next assistant
 

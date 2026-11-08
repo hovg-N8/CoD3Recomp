@@ -307,7 +307,7 @@ namespace
                     BotsOnRoster(packet, got, from);   // 0.5.194: the host's bots (bots.cpp)
                 else if (got >= 8 && memcmp(packet, "C3BS", 4) == 0)
                     BotsOnStates(packet, got, from);   // 0.5.207: their lives (bots.cpp)
-                else if (got >= 6 && (memcmp(packet, "C3UP", 4) == 0 || memcmp(packet, "C3UH", 4) == 0 || memcmp(packet, "C3UD", 4) == 0 || memcmp(packet, "C3KS", 4) == 0 || memcmp(packet, "C3KU", 4) == 0 || memcmp(packet, "C3KM", 4) == 0 || memcmp(packet, "C3MF", 4) == 0 || memcmp(packet, "C3MP", 4) == 0))
+                else if (got >= 6 && (memcmp(packet, "C3UP", 4) == 0 || memcmp(packet, "C3UH", 4) == 0 || memcmp(packet, "C3UD", 4) == 0 || memcmp(packet, "C3KS", 4) == 0 || memcmp(packet, "C3KU", 4) == 0 || memcmp(packet, "C3KM", 4) == 0 || memcmp(packet, "C3KB", 4) == 0 || memcmp(packet, "C3KH", 4) == 0 || memcmp(packet, "C3MF", 4) == 0 || memcmp(packet, "C3MP", 4) == 0))
                     MpFixesOnPlanePacket(packet, got, from);   // 0.5.275: the UAV plane on every machine (mp_fixes.cpp)
                 else if (got >= 10 && memcmp(packet, "C3R1", 4) == 0 && !g_chosen.load())
                 {
@@ -674,4 +674,57 @@ void LobbyRulesTick(PPCContext& ctx, uint8_t* base)
 bool LobbyDomination() { return g_domination != 0; }
 bool LobbyIsHost() { return g_chosen.load(); }
 
+// 0.5.461: THE LOBBY'S MAX PLAYERS TO 32 (Justin: "in game settings it only
+// goes up to 24 ... can we raise the in game menu to 32 now?"), with the F11
+// "32 players" setting on. The count is the settings block's byte +91 (458's
+// log: 12 and 24 in Justin's two matches; 460's: 8 and 24). 459 hooked
+// another screen's (sub_823AA900; 460: never called on Justin's). The System
+// Link create screen's own setup is sub_823AA120: its max players list (the
+// menu's +276) is built from a table of six counts (0x82061990), each made
+// text and added with sub_824E8E18, and the counts kept in the menu (+156,
+// room for 30) for taking the choice back. Now 28 and 32 are added the same
+// way after it, their counts in the menu's table after the six.
+// 0.5.462: 461's two adds were refused: the list is made with room for six
+// (FEMenuListBox's constructor sub_824E8FC8: r5, kept at +30, its choices'
+// array allocated for that many) and every add stops there. While the create
+// screen's setup runs, a list made with room for six gets room for eight.
+static bool g_inCreateSetup = false;
+extern "C" PPC_FUNC(__imp__sub_824E8FC8);
+PPC_FUNC(sub_824E8FC8)
+{
+    if (g_inCreateSetup && ctx.r5.u32 == 6 && ::Settings::Get().maxPlayers >= 32) ctx.r5.u64 = 8;
+    __imp__sub_824E8FC8(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_823AA120);
+PPC_FUNC(sub_823AA120)
+{
+    const uint32_t menu = ctx.r3.u32;
+    g_inCreateSetup = true;
+    __imp__sub_823AA120(ctx, base);
+    g_inCreateSetup = false;
+    const uint32_t list = Guest::Read32(base, menu + 276);
+    const bool ok = list >= 0x40000000u && list < 0xA0000000u;
+    const int choices = ok ? int16_t(Guest::Read16(base, list + SpinnerCount)) : -1;
+    {
+        static int told = 0;
+        if (told++ < 20)
+        {
+            printf("lobby: create screen setup: menu %08X list %08X choices %d (counts %u %u %u %u %u %u) 32 players %s\n", menu, list, choices,
+                   Guest::Read32(base, menu + 156), Guest::Read32(base, menu + 160), Guest::Read32(base, menu + 164), Guest::Read32(base, menu + 168),
+                   Guest::Read32(base, menu + 172), Guest::Read32(base, menu + 176), ::Settings::Get().maxPlayers >= 32 ? "on" : "off");
+            fflush(stdout);
+        }
+    }
+    if (!ok || ::Settings::Get().maxPlayers < 32 || choices != 6 || Guest::Read32(base, menu + 176) != 24) return;
+    const uint32_t slot = (ctx.r1.u32 - 0x800) & ~0xFu;
+    static const char* const more[2] = { "28", "32" };
+    for (int k = 0; k < 2; k++)
+    {
+        Call(ctx, base, MakeString, slot, GuestString(base, more[k]));
+        Call(ctx, base, 0x824E8E18, list, slot);
+        Guest::Write32(base, menu + 156 + 4 * uint32_t(6 + k), k ? 32u : 28u);
+    }
+    printf("lobby: max players list to 32 (%d choices)\n", int16_t(Guest::Read16(base, list + SpinnerCount)));
+    fflush(stdout);
+}
 #endif

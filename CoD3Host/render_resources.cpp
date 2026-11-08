@@ -8,6 +8,7 @@
 #include "verify.h"
 #include "texture_pack.h"
 #include "render_queue.h"
+#include "render.h"   // 0.5.677: Render::SetTextureImage
 
 #include <algorithm>
 #include <atomic>
@@ -71,6 +72,10 @@ namespace
     ID3D11Device* g_device = nullptr;
     ID3D11DeviceContext* g_context = nullptr;
     uint64_t g_frame = 0;
+    // 0.5.432: the map being loaded or played (TexturePack::CurrentMapKey),
+    // looked at once a frame, and a count that moves on when it changes
+    std::string g_mapKey;
+    uint32_t g_mapGeneration = 0;
 
     // Released when unused this long: half a minute of frames, so a level
     // change lets the last level's textures go.
@@ -85,6 +90,8 @@ namespace
 
     float g_scale = 1.0f;
     float g_requestedScale = 1.0f;
+    float g_widen = 1.0f, g_requestedWiden = 1.0f;   // the width's own factor over the scale (RequestWiden)
+    uint32_t g_shadowDetail = 1, g_requestedShadowDetail = 1;   // the shadow maps' own factor (RequestShadowDetail)
     double g_effectsScale = 1.0, g_requestedEffectsScale = 1.0;   // the 560 pitch surfaces' scale over the frame's (PitchScale)
     uint32_t g_samples = 1;
     uint32_t g_requestedSamples = 1;
@@ -326,11 +333,19 @@ namespace
         return (!halfSize && pitch == 560) ? g_effectsScale : 1.0;
     }
 
+    // A target's size on the host. The frame's (and those of its shape:
+    // the half size smoke's) widened when filling the screen; the shadow
+    // maps (a power of two across, below the frame's: the sun's 512, the
+    // 256 ones) left square and made finer by the shadow detail, their
+    // edges sharper where they fall near. (Team Friend's look, merged on
+    // 0.5.546 with this tree's effects scale, PitchScale.)
     void HostSize(uint32_t pitch, uint32_t rows, uint32_t& width, uint32_t& height)
     {
         const double scale = double(g_scale) * PitchScale(pitch);
-        width = std::max(1u, uint32_t(std::lround(double(pitch) * scale)));
-        height = std::max(1u, uint32_t(std::lround(double(rows) * scale)));
+        const bool shadow = pitch < 640 && (pitch & (pitch - 1)) == 0;
+        const double across = shadow ? scale * g_shadowDetail : scale * g_widen, down = shadow ? scale * g_shadowDetail : scale;
+        width = std::max(1u, uint32_t(std::lround(double(pitch) * across)));
+        height = std::max(1u, uint32_t(std::lround(double(rows) * down)));
     }
 
     // --- resolved surfaces -----------------------------------------------------------------------
@@ -452,11 +467,17 @@ namespace
         uint64_t bytes = 0;
         bool live = false;
         std::string replacedFor;        // 0.5.234: the map whose own replacement this is ("" none)
+        std::string packKey;            // 0.5.432: its texture pack key (when the pack was looked at)
+        uint32_t mapGeneration = 0;     // 0.5.432: g_mapGeneration when it was made or last checked
         std::vector<uint8_t> sourceMirror;   // verify mode: the memory it was last made from
         uint32_t mirrorEpoch = 0;
         uint64_t verifiedFrame = 0;
     };
     StableArray<TextureEntry> g_textures;   // by handle less one; handle 1 is the white texture (0.5.413: was a std::deque)
+    // 0.5.677: pictures given for textures by their place (Render::SetTextureImage), by GPU offset
+    std::mutex g_placedLock;
+    std::map<uint32_t, std::string> g_placedImages;
+    std::atomic<uint32_t> g_placedLast{ 0 };   // 0.5.695: the last place given (a fetch of it is logged)
 
     // --- the texture pool ------------------------------------------------------------------
     //
@@ -1011,6 +1032,41 @@ namespace
         // (rare once a map is in; the staging copies map the context).
         RenderQueue::Sync(3);
         entry.replacedFor.clear();   // 0.5.234: set again by a map's own replacement
+        entry.packKey.clear();
+        entry.mapGeneration = g_mapGeneration;
+        // 0.5.677: a picture given for this texture's place (Render::
+        // SetTextureImage: the Webley's kill feed icon, CoD2's hud_webley)
+        {
+            std::string png;
+            {
+                std::lock_guard<std::mutex> lock(g_placedLock);
+                const auto hit = g_placedImages.find(Guest::GpuOffset(fetch[1] & 0xFFFFF000u));
+                if (hit != g_placedImages.end()) png = hit->second;
+            }
+            uint32_t w = 0, h = 0;
+            std::vector<uint8_t> rgba;
+            if (!png.empty() && TexturePack::ReadPngFile(std::filesystem::path(png), w, h, rgba) && w && h)
+            {
+                D3D11_TEXTURE2D_DESC desc{};
+                desc.Width = w; desc.Height = h; desc.MipLevels = 1; desc.ArraySize = 1;
+                desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.SampleDesc.Count = 1;
+                desc.Usage = D3D11_USAGE_IMMUTABLE; desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                const D3D11_SUBRESOURCE_DATA initial{ rgba.data(), w * 4, 0 };
+                ComPtr<ID3D11Texture2D> texture;
+                ComPtr<ID3D11ShaderResourceView> view;
+                if (SUCCEEDED(g_device->CreateTexture2D(&desc, &initial, &texture)) && SUCCEEDED(g_device->CreateShaderResourceView(texture.Get(), nullptr, &view)))
+                {
+                    entry.texture = texture; entry.resource = view;
+                    entry.cube = false; entry.face.Reset();
+                    entry.width = (fetch[2] & 0x1FFF) + 1; entry.height = ((fetch[2] >> 13) & 0x1FFF) + 1; entry.levels = 1;
+                    entry.bytes = rgba.size();
+                    printf("render: texture at %08X given the picture %s (%ux%u)\n", fetch[1] & 0xFFFFF000u, png.c_str(), w, h);
+                    fflush(stdout);
+                    g_textureUploads.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+        }
         // The upload's two parts, timed for the hitch lines: laying the
         // texels out, then making the texture on the device.
         const auto uploadStarted = std::chrono::steady_clock::now();
@@ -1103,6 +1159,7 @@ namespace
             if (skip == 0) top = pixels[0];
             else LinearLevel(data, format, endian, width, height, pitch, tiled, packedX, packedY, top, topRow);
             const std::string key = TexturePack::Key(format, width, height, top);
+            entry.packKey = key;   // 0.5.432
             TexturePack::NoteMap(key);   // 0.5.197: textures\maps\<map>.txt (texture_dump only)
             ID3D11Texture2D* replaced = nullptr;
             ID3D11ShaderResourceView* replacedView = nullptr;
@@ -1369,6 +1426,11 @@ bool RenderResources::BeginFrame(uint64_t frame)
 {
     RenderQueue::Sync(4);
     g_frame = frame;
+    {
+        // 0.5.432: the map, once a frame (not at each of the frame's texture looks)
+        std::string map = TexturePack::CurrentMapKey();
+        if (map != g_mapKey) { g_mapKey.swap(map); g_mapGeneration++; }
+    }
     bool remade = false;
     if (g_requestedMipSkip != g_mipSkip)
     {
@@ -1418,16 +1480,18 @@ bool RenderResources::BeginFrame(uint64_t frame)
         g_depthKeys.Clear();
         printf("render: the half size surfaces are drawn at %.2f times their size\n", g_effectsScale);
     }
-    if (g_requestedScale != g_scale)
+    if (g_requestedScale != g_scale || g_requestedWiden != g_widen || g_requestedShadowDetail != g_shadowDetail)
     {
         remade = true;
         g_scale = g_requestedScale;
+        g_widen = g_requestedWiden;
+        g_shadowDetail = g_requestedShadowDetail;
         // The targets are made again at the new size as they are asked for.
         g_colorTargets.clear();
         g_depthTargets.clear();
         g_colorKeys.Clear();
         g_depthKeys.Clear();
-        printf("render: the frame is drawn at %.3f times the title's size\n", g_scale);
+        printf("render: the frame is drawn at %.3f times the title's size, its width %.3f times more, the shadow maps %u times finer\n", g_scale, g_widen, g_shadowDetail);
     }
     // The release of what has not been used: a walk every few seconds.
     if (frame % 300 != 0) return remade;
@@ -1541,6 +1605,16 @@ void RenderResources::RequestScale(float scale)
 float RenderResources::Scale() { return g_scale; }
 
 uint32_t RenderResources::TargetSamples(uint32_t pitch) { return SamplesFor(pitch); }
+
+void RenderResources::RequestShadowDetail(uint32_t times)
+{
+    g_requestedShadowDetail = times < 1 ? 1 : times > 4 ? 4 : times;
+}
+
+void RenderResources::RequestWiden(float widen)
+{
+    g_requestedWiden = widen < 0.5f ? 0.5f : widen > 3.0f ? 3.0f : std::round(widen * 1000.0f) / 1000.0f;
+}
 
 void RenderResources::RequestMipSkip(uint32_t levels) { g_requestedMipSkip = levels > 4 ? 4 : levels; }
 
@@ -1880,6 +1954,18 @@ RenderState::Handle RenderResources::TextureForUnchecked(const uint32_t fetch[6]
     height = ((fetch[2] >> 13) & 0x1FFF) + 1;
     resolved = false;
     if ((fetch[0] & 3) != 2 || base == 0 || width > 8192 || height > 8192) { g_whiteReason = "no texture in the fetch constant"; return 1; }
+    // 0.5.695: a fetch of a place given a picture (SetTextureImage), or of
+    // that place less its top bits (an address cut to 29 bits), said a few times
+    if (const uint32_t last = g_placedLast.load(std::memory_order_relaxed))
+    {
+        static std::atomic<int> said{ 0 };
+        const bool placed = last == Guest::GpuOffset(base) || (last & 0x1FFFFFFFu) == (base & 0x1FFFFFFFu);
+        if (placed && said.fetch_add(1) < 6)
+        {
+            printf("render: a fetch of the placed picture's texture %08X: %08X %08X %08X %08X %08X %08X\n", base, fetch[0], fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
+            fflush(stdout);
+        }
+    }
 
     // 0.5.411: a small front cache of the lookups that found a texture.
     // Every texture of every draw asked the resolves' table (ResolvedAt)
@@ -1975,7 +2061,19 @@ RenderState::Handle RenderResources::TextureForUnchecked(const uint32_t fetch[6]
         // taken up again once another map is loading: the DLC maps' shared
         // loading picture can sit at the same place with the same texels
         // from one map to the next, and would keep the first map's copy.
-        if (!entry.replacedFor.empty() && entry.replacedFor != TexturePack::CurrentMapKey())
+        // 0.5.432: and a texture made with no replacement (the loading picture
+        // first drawn while no map was known yet: right after choosing a map
+        // in a lobby) taken up again once a map that has its own copy of it
+        // is known. Justin: the photo tour's DLC loading pictures no longer
+        // showed; only the benchmark, which loads the map first, still got one.
+        const bool otherMap = !entry.replacedFor.empty() && entry.replacedFor != g_mapKey;
+        bool mapPicture = false;
+        if (entry.replacedFor.empty() && entry.mapGeneration != g_mapGeneration)
+        {
+            mapPicture = TexturePack::HasMapReplacement(entry.packKey, g_mapKey);
+            if (!mapPicture) entry.mapGeneration = g_mapGeneration;   // nothing of this map's for it
+        }
+        if (otherMap || mapPicture)
         {
             entry.checkedFrame = entry.usedFrame = g_frame;
             entry.stable = 0;
@@ -2845,4 +2943,17 @@ RenderResources::Statistics RenderResources::Stats()
     s.resolved = g_resolvedKeys.Size();
     s.released = g_released;
     return s;
+}
+
+// 0.5.677: a picture for the texture at a guest place (its base address, as
+// the texture's fetch constant has it), used whenever a texture there is
+// made (UploadTexture); an empty path takes it away. The Webley's kill feed
+// icon is a copy of the Colt's image pointing at a place of its own, given
+// CoD2's hud_webley this way (mp_fixes.cpp).
+void Render::SetTextureImage(uint32_t address, const char* pngPath)
+{
+    std::lock_guard<std::mutex> lock(g_placedLock);
+    const uint32_t key = Guest::GpuOffset(address & 0xFFFFF000u);
+    if (!pngPath || !*pngPath) g_placedImages.erase(key);
+    else { g_placedImages[key] = pngPath; g_placedLast = key; }
 }

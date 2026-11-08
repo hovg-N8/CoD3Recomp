@@ -18,6 +18,7 @@
 
 #include "kernel.h"
 #include "input.h"
+#include "pc_prompts.h"
 #include "sampler.h"
 #include "audio_out.h"
 #include "scheduler.h"
@@ -31,6 +32,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -53,9 +55,12 @@ void BotsPoseTest(const std::string& args);   // bot_pose_test
 void BotsSetup(int bits);                           // bots.cpp
 void BotsRemote(int enabled);                       // bots.cpp (0.5.135)
 void BotsLocal(int enabled);                        // bots.cpp (0.5.137)
+void BotsTankFire(int seconds, int crew);           // bots.cpp (0.5.796): tank_fire
+void MpFixesMortarTest(int rounds);                 // mp_fixes.cpp (0.5.801): mortar_test
 void MpFixesVehiclesEverywhere(bool on);           // mp_fixes.cpp
 void MpFixesKangaroo(bool on);                     // mp_fixes.cpp
 void MpFixesKangarooType(int type);
+void MpFixesQueueTankBlast(const float* at, const char* event);   // mp_fixes.cpp (0.5.780; console 0.5.791)
 void MpFixesKangarooTread(int mode);                // mp_fixes.cpp
 void MpFixesKangarooEntry(int enabled);
 void MpFixesKangarooExit(int mode);
@@ -786,6 +791,56 @@ namespace
                 Kernel::ReportFileReads();
                 Gpu::ReportPolling();
                 if (clockSecond >= 10) Kernel::ReportWaitTraffic();
+                // COD3_FOVSCAN=second[,fov]: at that second, where the view's
+                // field is kept: floats in the title's memory that are the
+                // tangents (or angles) of half the field of cg_fov fov (65)
+                // across at 16:9 and up and down, two within 64 bytes.
+                if (const char* scan = getenv("COD3_FOVSCAN"); scan && clockSecond == uint64_t(atoi(scan)))
+                {
+                    const char* comma = strchr(scan, ',');
+                    const double fov = comma ? atof(comma + 1) : 65.0;
+                    const double ty = std::tan(fov * 0.5 * 3.14159265358979 / 180.0) * 0.75, tx = ty * 16.0 / 9.0;
+                    const float wanted[4] = { float(tx), float(ty), float(2.0 * std::atan(tx) * 180.0 / 3.14159265358979), float(2.0 * std::atan(ty) * 180.0 / 3.14159265358979) };
+                    printf("fovscan: looking for %.4f %.4f %.3f %.3f\n", wanted[0], wanted[1], wanted[2], wanted[3]);
+                    int found = 0;
+                    for (uint64_t at = 0x40000000; at < 0xA0000000 && found < 60; )
+                    {
+                        MEMORY_BASIC_INFORMATION info{};
+                        uint8_t* host = reinterpret_cast<uint8_t*>(Guest::Base) + at;
+                        if (VirtualQuery(host, &info, sizeof(info)) == 0) break;
+                        const uint64_t end = at + uint64_t(reinterpret_cast<uint8_t*>(info.BaseAddress) + info.RegionSize - host);
+                        if (info.State == MEM_COMMIT && (info.Protect & (PAGE_READWRITE | PAGE_READONLY | PAGE_EXECUTE_READWRITE)) && !(info.Protect & PAGE_GUARD))
+                            for (uint64_t a = at; a + 4 <= end && found < 60; a += 4)
+                            {
+                                uint32_t raw; memcpy(&raw, reinterpret_cast<uint8_t*>(Guest::Base) + a, 4);
+                                raw = _byteswap_ulong(raw); float v; memcpy(&v, &raw, 4);
+                                int kind = -1;
+                                for (int k = 0; k < 4; k++) if (std::fabs(v - wanted[k]) < wanted[k] * 2e-4f) kind = k;
+                                if (kind < 0) continue;
+                                for (uint64_t b = a + 4; b < a + 64 && b + 4 <= end; b += 4)
+                                {
+                                    uint32_t r2; memcpy(&r2, reinterpret_cast<uint8_t*>(Guest::Base) + b, 4);
+                                    r2 = _byteswap_ulong(r2); float w; memcpy(&w, &r2, 4);
+                                    for (int k = 0; k < 4; k++)
+                                        if (k != kind && std::fabs(w - wanted[k]) < wanted[k] * 2e-4f)
+                                        {
+                                            printf("fovscan: %08llX = %.4f (%d), %08llX = %.4f (%d)\n", (unsigned long long)a, v, kind, (unsigned long long)b, w, k);
+                                            found++;
+                                        }
+                                }
+                            }
+                        at = end;
+                    }
+                    printf("fovscan: %d pairs\n", found);
+                    fflush(stdout);
+                }
+                // COD3_FOVWATCH=second,hexaddress[,r]: the watchpoint armed then.
+                if (const char* fw = getenv("COD3_FOVWATCH"); fw && clockSecond == uint64_t(atoi(fw)))
+                    if (const char* comma = strchr(fw, ','))
+                    {
+                        Kernel::WatchWrite(uint32_t(strtoul(comma + 1, nullptr, 16)), strstr(comma + 1, ",r") != nullptr);
+                        Kernel::ArmWatchpoints();
+                    }
                 if (Sampler::ThreadTimesWanted() && clockSecond % 5 == 0)
                     Sampler::ReportThreadTimes({
                         { GetThreadId(video.commandThread.native_handle()), "command processor" },
@@ -1018,6 +1073,7 @@ namespace
                 // on the way, since va takes a format.
                 for (std::string command = TakeConsoleCommand(); !command.empty(); command = TakeConsoleCommand())
                 {
+                    if (command.rfind("noclip", 0) == 0) Input::ArmNoclipTap();   // 0.5.454: a double tap of A from now on
 #ifdef COD3_MP
                     // Multiplayer: the text straight to Cbuf_AddText
                     // (sub_8247FA38, which copies it), from a block of
@@ -1070,6 +1126,28 @@ namespace
                         MpFixesKangarooType(atoi(command.c_str() + 14));
                         continue;
                     }
+                    // 0.5.791: "tankblast x y z event": a tank shell's explosion
+                    // (the named event on one of our origins, as a shell's hit
+                    // makes it) where asked, for a test to look at (tests cannot
+                    // fire a tank's gun)
+                    if (command.compare(0, 10, "tankblast ") == 0)
+                    {
+                        float at[3] = {};
+                        char event[96] = {};
+                        if (sscanf(command.c_str() + 10, "%f %f %f %95s", &at[0], &at[1], &at[2], event) == 4) MpFixesQueueTankBlast(at, event);
+                        printf("video: tankblast %s at %.0f %.0f %.0f\n", event, at[0], at[1], at[2]);
+                        fflush(stdout);
+                        continue;
+                    }
+                    // 0.5.796: "tank_fire [seconds]": a bot gets into the tank
+                    // nearest the host and fires its gun (bots.cpp), for tests
+                    if (command.compare(0, 9, "tank_fire") == 0)
+                    {
+                        int seconds = 60, crew = 2;
+                        if (command.size() > 10) sscanf(command.c_str() + 10, "%d %d", &seconds, &crew);
+                        BotsTankFire(seconds, crew);
+                        continue;
+                    }
                     if (command.compare(0, 9, "kangaroo ") == 0 || command == "kangaroo")
                     {
                         const bool on = command.size() <= 9 || atoi(command.c_str() + 9) != 0;
@@ -1105,6 +1183,12 @@ namespace
                     }
                     // streak_give <uav|artillery|typhoon>: a killstreak for the host's
                     // own player, for testing (mp_fixes.cpp).
+                    // 0.5.801: mortar_test [rounds]: the host's mortar set up and fired (mp_fixes.cpp)
+                    if (command.compare(0, 11, "mortar_test") == 0)
+                    {
+                        MpFixesMortarTest(command.size() > 12 ? atoi(command.c_str() + 12) : 10);
+                        continue;
+                    }
                     if (command.compare(0, 11, "streak_give") == 0)
                     {
                         std::string kind = command.size() > 12 ? command.substr(12) : std::string();
@@ -1283,6 +1367,26 @@ namespace
                         }
                     }
                 }
+#ifdef COD3_MP
+                // 0.5.556: the renderer list 82C89A60's count (+8) watched in
+                // every multiplayer game from 15 s, to name whatever writes
+                // float data over the list (count 0x3F800000, 1.0; the 0.5.185
+                // guard repairs the list, the writer never found). 555's
+                // freeze followed five of these, the last a moment before the
+                // game's malloc (sub_820DF428) looped on a broken heap. Off with
+                // COD3_LISTWATCH=0; not when COD3_WATCH names another word.
+                {
+                    static bool listWatchArmed = false;
+                    static const bool listWatch = []() { const char* t = getenv("COD3_LISTWATCH"); return !(t && t[0] == '0') && getenv("COD3_WATCH") == nullptr; }();
+                    if (listWatch && !listWatchArmed && clockSecond >= 15)
+                    {
+                        listWatchArmed = true;
+                        Kernel::WatchWrite(0x82C89A68u, false);
+                        Kernel::WatchSuspiciousAbove(100000u);
+                        Kernel::ArmWatchpoints();
+                    }
+                }
+#endif
                 // COD3_DUMPMEM=hexaddress,bytes,second: that much of guest
                 // memory, once, that many seconds in (five by default), as
                 // words and text.
@@ -1610,6 +1714,13 @@ PPC_FUNC(__imp__VdSwap)
     // piece of information the window needs to show a real frame, so it is
     // decoded here and handed over.
     const uint32_t fetchConstant = ctx.r4.u32;
+    // 0.5.478: the key caps the button prompts are drawn as, for what the
+    // player used last (pc_prompts.cpp).
+    PcPrompts::Frame(base);
+#ifdef COD3_MP
+    // 0.5.479: the game heap's fill every 30 s (mp_fixes.cpp)
+    { extern void MpFixesHeapReport(uint8_t*); MpFixesHeapReport(base); }
+#endif
 
     // Every argument, the first few times. Only the fetch constant was ever
     // read, and a swap the console performs is more than a picture: the first

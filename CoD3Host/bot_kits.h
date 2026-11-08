@@ -30,6 +30,7 @@ struct Kit {
     char secondary[24] = {};
     bool sticky = false;
     bool mills = false;         // 0.5.329: "mills": the campaign's Mills bomb (Rusher 2)
+    bool flare = false;         // 0.5.753: "flare" (any optional column): his smokes are World at War's signal flares
     char label[16] = {};
 };
 
@@ -50,7 +51,10 @@ inline int ClassFromText(const std::string& t) {
 inline bool KnownPrimary(const std::string& name) {
     static const char* const known[] = { "m1garand", "thompson", "bar", "springfield", "mg30cal", "bazooka", "shotgun", "kar98", "mp40",
                                          "mp44", "kar98_sniper", "mg34", "panzerschreck", "lee_enfield", "bren", "sten", "fg42", "fg42_scoped",
-                                         "gewehr43", "mg42", "lee_enfield_sniper" };   // 0.5.199/0.5.203: Team Friend's G43, MG42, scoped Lee-Enfield
+                                         "gewehr43", "mg42", "lee_enfield_sniper",   // 0.5.199/0.5.203: Team Friend's G43, MG42, scoped Lee-Enfield
+                                         "webley",     // 0.5.659: CoD2's revolver (a pistol: best as a second weapon)
+                                         "flamethrower",   // 0.5.687: World at War's M2
+                                         "mosin_scoped" };   // 0.5.726: CoD2's scoped Mosin-Nagant
     for (const char* k : known) if (name == k) return true;
     return false;
 }
@@ -65,7 +69,8 @@ inline const char* DefaultText() {
         "# main-weapon: - for the class's own, or one of m1garand thompson bar\n"
         "#   springfield mg30cal bazooka shotgun kar98 mp40 mp44 kar98_sniper mg34\n"
         "#   panzerschreck, or the campaign guns lee_enfield bren sten fg42 fg42_scoped\n"
-        "#   gewehr43 mg42 lee_enfield_sniper.\n"
+        "#   gewehr43 mg42 lee_enfield_sniper, or CoD2's webley (a pistol) and\n"
+        "#   mosin_scoped, or World at War's flamethrower.\n"
         "# frags / smokes: grenades at each spawn (- for the class's own; 0 to 4).\n"
         "# class may also be demolitionist (a rifleman with rifle grenades) or\n"
         "#   rusher2 (a scout: artillery called with his binoculars).\n"
@@ -98,6 +103,14 @@ inline const char* DefaultText() {
         "1 rifleman   gewehr43     2 1\n"
         "1 heavy      mg42         2 0\n"
         "1 scout      lee_enfield_sniper 1 1\n"
+        "# 0.5.659: CoD2's Webley revolver in the medics' pistol's place.\n"
+        "1 medic      -            1 1 webley\n"
+        "# 0.5.753: CoD2's scoped Mosin-Nagant, the Webley as a rifleman's second,\n"
+        "#   and World at War's signal flare: \"flare\" in any optional column makes\n"
+        "#   the kit's smokes flares.\n"
+        "1 scout      mosin_scoped 1 1 flare\n"
+        "1 rifleman   -            2 1 webley flare\n"
+        "1 light      -            2 1 flare\n"
         "# 0.5.284 (Justin): the Demolitionist: the Bren, sticky bombs, rifle\n"
         "#   grenades (his rifleman base's special) and the MG42 as his second.\n"
         "#   Optional columns after smokes: second main weapon (- none), then\n"
@@ -124,9 +137,13 @@ inline std::vector<Kit> Parse(const std::string& text, std::string* problems = n
         std::string w, c, p, f, s, second, grenade;
         if (!(words >> w)) continue;
         Kit kit; bool ok = (words >> c >> p >> f >> s) ? true : false;
-        if (ok && (words >> second)) {
+        // 0.5.753: "flare" may stand in any of the optional columns
+        std::vector<std::string> extra;
+        for (std::string e; ok && (words >> e);) { if (e == "flare") kit.flare = true; else extra.push_back(e); }
+        if (ok && extra.size() > 0) {
+            second = extra[0];
             if (second != "-") { ok = KnownPrimary(second); if (ok) strncpy(kit.secondary, second.c_str(), sizeof(kit.secondary) - 1); }
-            if (ok && (words >> grenade)) { if (grenade == "sticky") kit.sticky = true; else if (grenade == "mills") kit.mills = true; else if (grenade != "frag" && grenade != "-") ok = false; }
+            if (ok && extra.size() > 1) { grenade = extra[1]; if (grenade == "sticky") kit.sticky = true; else if (grenade == "mills") kit.mills = true; else if (grenade != "frag" && grenade != "-") ok = false; }
         }
         if (ok && c == "demolitionist") strncpy(kit.label, "demolitionist", sizeof(kit.label) - 1);
         if (ok && c == "rusher2") strncpy(kit.label, "rusher2", sizeof(kit.label) - 1);

@@ -56,7 +56,7 @@ struct MapKnowledge {
     }
     static float Flat(Point a, Point b) { return std::hypot(a.x - b.x, a.y - b.y); }
 
-    void Clear() { nodes.clear(); index.clear(); tracks = {}; changes = 0; shapeAt = 0xFFFFFFFFu; shape = {}; }
+    void Clear() { nodes.clear(); index.clear(); crossings.clear(); tracks = {}; changes = 0; shapeAt = 0xFFFFFFFFu; shape = {}; }
     bool Ready() const { return nodes.size() >= 40; }
 
     int32_t Exact(Point p) const {
@@ -84,6 +84,54 @@ struct MapKnowledge {
                     if (score < bestScore) { bestScore = score; best = it->second; }
                 }
         return best;
+    }
+    // 0.5.553: the known cells within `radius` of p (the same cells and score
+    // as Nearest), nearest first, at most `most`: for a start the bot can walk
+    // to, the nearest by distance being past a wall often enough.
+    std::vector<int32_t> NearestList(Point p, float radius, size_t most) const {
+        std::vector<std::pair<float, int32_t>> found;
+        if (!Finite(p)) return {};
+        const int32_t cx = CellOf(p.x, Cell), cy = CellOf(p.y, Cell), cz = CellOf(p.z, Layer);
+        const int reach = std::max(1, int(std::ceil(radius / Cell)));
+        for (int dx = -reach; dx <= reach; dx++)
+            for (int dy = -reach; dy <= reach; dy++)
+                for (int dz = -2; dz <= 2; dz++) {
+                    auto it = index.find(Key(cx + dx, cy + dy, cz + dz));
+                    if (it == index.end()) continue;
+                    const Node& n = nodes[size_t(it->second)];
+                    const float flat = Flat(n.at, p), up = std::fabs(n.at.z - p.z);
+                    if (flat > radius || up > 200) continue;
+                    found.push_back({ flat + up * 2.0f, it->second });
+                }
+        std::sort(found.begin(), found.end());
+        std::vector<int32_t> out;
+        for (size_t i = 0; i < found.size() && out.size() < most; i++) out.push_back(found[i].second);
+        return out;
+    }
+    Point At(int32_t cell) const { return cell >= 0 && size_t(cell) < nodes.size() ? nodes[size_t(cell)].at : Point{ NAN, NAN, NAN }; }
+    // 0.5.554: links a bot cannot walk straight from spot to spot (a player's
+    // jump or climb, or two cells' spots with a corner between), found by the
+    // bots' route checks this session: dearer by BadLinkCost in PathFrom, not
+    // removed (a place with no other way still has one).
+    // 0.5.594: 20000 (was 2500): a way round a corner on Rouen is often longer
+    // than 2500, so the route still took the bad link. 592's play: bots round
+    // 610 1280 had 453 1090 next (no straight way: no step at all), the route
+    // made again sent them back to 622 1277, then 453 1090 again (30 of 202 stalls).
+    static constexpr float BadLinkCost = 20000.0f;
+    std::unordered_map<uint64_t, uint8_t> badLinks;
+    static uint64_t LinkKey(int32_t a, int32_t b) { return (uint64_t(uint32_t(a)) << 32) | uint32_t(b); }
+    void BadLink(int32_t a, int32_t b) { badLinks[LinkKey(a, b)] = 1; }
+    bool IsBadLink(int32_t a, int32_t b) const { return badLinks.count(LinkKey(a, b)) != 0; }
+    // 0.5.580: where a player last walked each link this session: the half
+    // second's step from the one cell into the other (two real standing spots
+    // he went between), so a link whose two cells' spots have a corner between
+    // them can still be walked the way he went (the doorways into buildings).
+    struct Crossing { Point from{}, to{}; };
+    std::unordered_map<uint64_t, Crossing> crossings;
+    bool CrossingOf(int32_t a, int32_t b, Crossing& out) const {
+        auto it = crossings.find(LinkKey(a, b));
+        if (it == crossings.end()) return false;
+        out = it->second; return true;
     }
     int32_t Touch(Point p) {
         const int32_t cx = CellOf(p.x, Cell), cy = CellOf(p.y, Cell), cz = CellOf(p.z, Layer);
@@ -114,7 +162,7 @@ struct MapKnowledge {
         const int32_t n = Touch(feet);
         if (n < 0) return;
         if (t.node >= 0 && n != t.node && now - t.time <= 1500 && Flat(t.at, feet) <= 260.0f && std::fabs(t.at.z - feet.z) <= 200.0f)
-            Link(t.node, n);
+        { Link(t.node, n); crossings[LinkKey(t.node, n)] = { t.at, feet }; }
         t.node = n; t.at = feet; t.time = now;
     }
     static void Bump(uint16_t& v) { if (v < 60000) v++; }
@@ -227,10 +275,32 @@ struct MapKnowledge {
     // cells' standing spots in order (A*, a death costs 200 units). Empty
     // when there is no known way.
     std::vector<Point> Path(Point from, int32_t goal, size_t maxExpand = 8000) const {
+        return PathFrom(Nearest(from, 300), goal, maxExpand, false);
+    }
+    // 0.5.553: from a start cell chosen by the caller; `withStart`: the start's
+    // own spot first in the route (Path leaves it out).
+    std::vector<Point> PathFrom(int32_t start, int32_t goal, size_t maxExpand = 8000, bool withStart = true) const {
         std::vector<Point> out;
-        const int32_t start = Nearest(from, 300);
-        if (start < 0 || goal < 0 || size_t(goal) >= nodes.size()) return out;
-        if (start == goal) { out.push_back(nodes[size_t(goal)].at); return out; }
+        for (const int32_t c : PathCells(start, goal, maxExpand, withStart)) out.push_back(nodes[size_t(c)].at);
+        return out;
+    }
+    // 0.5.564: a lane: spots on the far side of the line a..b from the lane's
+    // side (lane -1 or +1, by the line's left/right) cost `perUnit` per unit
+    // they lie over it, so a route keeps to its side where the streets allow.
+    struct Lane { Point a{}, b{}; int side = 0; float perUnit = 0.0f; };
+    float LaneCost(const Lane& lane, Point p) const {
+        if (lane.side == 0) return 0.0f;
+        const float dx = lane.b.x - lane.a.x, dy = lane.b.y - lane.a.y, len = std::max(1.0f, std::hypot(dx, dy));
+        const float across = ((p.x - lane.a.x) * -dy + (p.y - lane.a.y) * dx) / len;   // + on the left of a->b
+        const float wrong = -float(lane.side) * across;
+        return wrong > 0.0f ? wrong * lane.perUnit : 0.0f;
+    }
+    // The same as cells (0.5.554: so the caller can check its links).
+    std::vector<int32_t> PathCells(int32_t start, int32_t goal, size_t maxExpand = 8000, bool withStart = true, const Lane* lane = nullptr) const {
+        std::vector<int32_t> out;
+        if (start < 0 || size_t(start) >= nodes.size() || goal < 0 || size_t(goal) >= nodes.size()) return out;
+        if (withStart && start != goal) out.push_back(start);
+        if (start == goal) { out.push_back(goal); return out; }
         const Point target = nodes[size_t(goal)].at;
         std::unordered_map<int32_t, float> cost;
         std::unordered_map<int32_t, int32_t> came;
@@ -245,16 +315,20 @@ struct MapKnowledge {
             const float here = cost[cur];
             for (int32_t next : nodes[size_t(cur)].links) {
                 const Node& n = nodes[size_t(next)];
-                const float step = Distance(nodes[size_t(cur)].at, n.at) + std::min<float>(n.deaths, 10) * 200.0f;
+                const float step = Distance(nodes[size_t(cur)].at, n.at) + std::min<float>(n.deaths, 10) * 200.0f +
+                                   (IsBadLink(cur, next) ? BadLinkCost : 0.0f) +   // 0.5.554
+                                   (lane ? LaneCost(*lane, n.at) : 0.0f);           // 0.5.564
                 auto found = cost.find(next);
                 if (found != cost.end() && found->second <= here + step) continue;
                 cost[next] = here + step; came[next] = cur;
                 open.push({ here + step + Distance(n.at, target), next });
             }
         }
-        if (!came.count(goal)) return out;
-        for (int32_t at = goal; at != start; at = came[at]) out.push_back(nodes[size_t(at)].at);
-        std::reverse(out.begin(), out.end());
+        if (!came.count(goal)) return {};
+        std::vector<int32_t> way;
+        for (int32_t at = goal; at != start; at = came[at]) way.push_back(at);
+        std::reverse(way.begin(), way.end());
+        out.insert(out.end(), way.begin(), way.end());
         return out;
     }
 

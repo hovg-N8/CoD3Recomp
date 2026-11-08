@@ -10,6 +10,8 @@
 
 #include "render_commands.h"
 #include "render_internal.h"
+#include "render.h"   // 0.5.714: Render::ProbeVertexBuffer
+#include <string>
 #include "tuning.h"
 #include "verify.h"
 #include "render_pipeline.h"
@@ -28,6 +30,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <mutex>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -41,6 +45,10 @@ using RenderState::ResolveCommand;
 
 namespace
 {
+    // 0.5.837: Seelow Night's light on the arms (Render::SetNightLight)
+    std::atomic<bool> g_nightLight{ false };
+    float g_nightScale[3] = { 1.0f, 1.0f, 1.0f };
+
     // --- what a draw was not made for ---------------------------------------------------------------
 
     enum SkipReason { SkipBackendOff, SkipPrimitive, SkipProgram, SkipProgramBuilding, SkipProgramOnRequest, SkipPitch, SkipTarget, SkipScissor, SkipBuffer, SkipAimBlur, SkipCount };
@@ -54,6 +62,10 @@ namespace
     // sharp. The two before it still run, so the surface they make is
     // there for anything else that reads it.
     bool g_aimBlur = true;
+    uint32_t g_surfaceLight = 0;   // the world's solid surfaces brightened by this much (0 .. 127; xenos_hlsl.cpp)
+    bool g_depthReversed = false;    // the solid world's depth test is greater (render_post.cpp's occlusion)
+    float g_fillSqueeze = 0.0f;      // the HUD's squeeze when filling the screen (SetFill), 0 none
+    bool g_worldThisFrame = false, g_worldLastFrame = false;   // the scene's whole depth resolved: a level's world drawn
     bool g_hdrScene = false;    // the HDR mode: the frame tone mapped at the bloom's composite
     bool g_steadyDecals = true; // the layers over a surface put a little nearer
     float g_bloom = 1.0f;       // the bloom's strength, the game's at one
@@ -80,6 +92,7 @@ namespace
     // glimpse. While the player is down nothing is in his hands, so the
     // ghost outline the setting is there for cannot happen: drawn then.
     std::atomic<bool> g_playerDown{ false };
+    std::atomic<bool> g_spectatorSeat{ false };   // 0.5.616: the team choice's blur left out
     // 0.5.248: the binoculars at the eyes (the host's player). Justin: the
     // sides of the binocular view are black at times, not at others, with
     // the HD textures off too. While they are up the depth of field pass is
@@ -300,6 +313,7 @@ namespace
         // leaves the other target registers pointing at the same tiles, and
         // the host refuses one surface bound twice.
         const bool depthOnly = DepthOnlyMode(state);
+        out.samples = 1;
         for (uint32_t i = 0; i < 4 && !depthOnly; i++)
         {
             if (((ps->colourTargets >> i) & 1) == 0) continue;
@@ -313,6 +327,7 @@ namespace
             out.targetResources[i] = target->resource;
             if (target->upgraded) out.upgradedTargets |= 1u << i;
             if (i == 0) out.colorTexture = target->texture;
+            out.samples = target->samples;
             out.targetCount = i + 1;
         }
         if ((state.depthControl & 3) != 0)
@@ -322,6 +337,7 @@ namespace
                 out.depthView = depth->view;
                 out.depthResource = depth->resource;
                 out.depthTexture = depth->texture;
+                out.samples = depth->samples;
             }
         }
         if (out.targetCount == 0 && out.depthView == nullptr)
@@ -409,6 +425,7 @@ namespace
 
     // The textures and samplers the programs sample: the pixel program's,
     // and the vertex program's (the terrain's height map).
+    uint32_t g_drawTexture0 = 0;   // 0.5.821: this draw's first pixel texture (diagnostic)
     void Textures(const RenderShaders::Program* vs, const RenderShaders::Program* ps, DrawCommand& out, RenderState::DrawConstants& constants)
     {
         for (int stage = 0; stage < 2; stage++)
@@ -419,6 +436,7 @@ namespace
                 if (out.textureCount == DrawCommand::MaxTextures) return;
                 uint32_t words[6];
                 RenderState::ReadTextureFetch(fetch.slot, words);
+                if (stage == 0 && out.textureCount == 0) g_drawTexture0 = words[1] & 0xFFFFF000u;   // 0.5.821
                 uint32_t width = 1, height = 1;
                 bool resolved = false;
                 const Handle texture = RenderResources::TextureFor(words, width, height, resolved);
@@ -428,7 +446,45 @@ namespace
                 binding.samplerSlot = uint8_t(fetch.sampler);
                 if (resolved) binding.view = RenderResources::ResolvedView(words[1] & 0xFFFFF000u, width, height);
                 else binding.view = RenderResources::TextureView(texture, fetch.dimension);
+                // 0.5.478: the button icons drawn as keys (render_prompts.cpp).
+                if (ID3D11ShaderResourceView* keys = RenderInternal::PromptTexture(words[1] & 0xFFFFF000u, width, height)) binding.view = keys;
                 CheckView(binding.view, words, resolved, texture, fetch.slot, stage);
+                // 0.5.698: DIAGNOSTIC (Carentan's interiors): the programs that
+                // sample a 512x512 8888 texture (our converted lightmaps; Rouen's
+                // are DXT5), once a program pair, with every texture they fetch
+                if (stage == 0 && (words[1] & 0x3F) == 6 && (words[2] & 0x1FFF) == 511 && ((words[2] >> 13) & 0x1FFF) == 511)
+                {
+                    static std::mutex saidLock;
+                    static std::set<uint64_t> said;
+                    std::lock_guard<std::mutex> lock(saidLock);
+                    if (said.size() < 24 && said.insert(ps->hash ^ ((vs ? vs->hash : 0) * 31)).second)
+                    {
+                        printf("render: lightmap-like texture (8888 512x512) in pixel slot %u: ps %016llx vs %016llx; fetches:", fetch.slot,
+                            (unsigned long long)ps->hash, (unsigned long long)(vs ? vs->hash : 0));
+                        for (const XenosHlsl::TextureFetch& other : ps->textureFetches)
+                        {
+                            uint32_t w[6];
+                            RenderState::ReadTextureFetch(other.slot, w);
+                            printf(" t%u=fmt%u %ux%u@%08X", other.slot, w[1] & 0x3F, (w[2] & 0x1FFF) + 1, ((w[2] >> 13) & 0x1FFF) + 1, w[1] & 0xFFFFF000u);
+                        }
+                        // 0.5.699: the program's c[i] is the file's constant map[i] (packed)
+                        printf("\nrender: its pixel constants (packed c = file c: values):");
+                        const size_t count = ps->constantMap.empty() ? 16 : std::min<size_t>(ps->constantMap.size(), 24);
+                        for (size_t r = 0; r < count; r++)
+                        {
+                            const uint32_t file = ps->constantMap.empty() ? uint32_t(r) : ps->constantMap[r];
+                            printf(" | c%zu=f%u:", r, file);
+                            for (uint32_t k = 0; k < 4; k++)
+                            {
+                                const uint32_t bits = RenderState::Register(RenderState::PixelConstants + file * 4 + k);
+                                float value; memcpy(&value, &bits, 4);
+                                printf(" %g", value);
+                            }
+                        }
+                        printf("\n");
+                        fflush(stdout);
+                    }
+                }
                 // A shadow map: a depth surface the program filters itself,
                 // four taps at a texel's corners blended by getWeights. Those
                 // go by the size given here, and with the title's size they
@@ -491,6 +547,22 @@ namespace
                 constants.textureAdjustment[fetch.slot][1] = (words[0] >> 2) & 0xFF;
             }
         }
+        // 0.5.616: the spectator's seat (spectator.cpp) without the team
+        // choice's blur (user, 613: "it stay blurry in the background").
+        // 615's frames: behind the team choice, and in the seat taken from
+        // it, the game's last full screen pass is 2a90db64, which mixes the
+        // frame (texture 0, 1040x624) with a quarter size blurred copy
+        // (texture 1, 260x156); in play the same pass is 09fa43c5, the frame
+        // alone. The game keeps the blurred one while it has the team choice
+        // up, so in the seat the frame goes in for the blurred copy too.
+        if (g_spectatorSeat.load(std::memory_order_relaxed) && ps->hash == 0x2a90db64a855e6baull)
+        {
+            ID3D11ShaderResourceView* frame = nullptr;
+            for (uint32_t i = 0; i < out.textureCount; i++) if (out.textures[i].stage == 0 && out.textures[i].slot == 0) frame = out.textures[i].view;
+            for (uint32_t i = 0; frame && i < out.textureCount; i++) if (out.textures[i].stage == 0 && out.textures[i].slot == 1) out.textures[i].view = frame;
+            static int told = 0;
+            if (told < 3) { told++; printf("render: the spectator's seat: the blur behind the team choice taken out (%s)\n", frame ? "its frame for the blurred copy" : "no frame found"); fflush(stdout); }
+        }
     }
 
     // The draw's buffers that want the part it reads looked at again
@@ -502,6 +574,106 @@ namespace
 
     // The vertex buffers the vertex program fetches. False when one could
     // not be had.
+    // 0.5.714: Render::ProbeVertexBuffer's buffer and folder
+    std::atomic<uint32_t> g_probeBuffer{ 0 };
+    std::string g_probeDir;
+
+    // 0.5.717: Render::TrackMeshPoint's buffer (its GPU address), point and result
+    std::atomic<uint32_t> g_trackBuffer{ 0 };
+    float g_trackPoint[3] = {};
+    std::mutex g_trackLock;
+    float g_trackScreen[2] = {};
+    uint64_t g_trackAt = 0;
+    float g_trackBone[12] = {}, g_trackViewProjection[16] = {};   // 0.5.718
+
+    // 0.5.809: Render::SetMirrorBuffers' (GPU addresses), and this draw's
+    // match and what PrepareMirror needs of it
+    std::mutex g_mirrorLock;
+    std::vector<uint32_t> g_mirrorBuffers;
+    std::atomic<bool> g_mirrorOn{ false };
+    bool g_mirrorThisDraw = false;
+    uint32_t g_mirrorVb = 0;   // 0.5.811: the matched buffer
+    const RenderShaders::Program* g_mirrorVs = nullptr;
+    uint32_t g_mirrorScMode = 0;
+    float g_mirrorOffset[4] = {};
+    bool g_mirrorBehind = false, g_mirrorForward = false;
+    // 0.5.821: Render::LogDrawsFor's window, and this draw's first pixel texture
+    std::atomic<uint64_t> g_logDrawsUntil{ 0 }, g_logDraws2From{ 0 }, g_logDraws2Until{ 0 };   // 0.5.826: and a second window 400 ms later (no shot), to compare
+    // 0.5.822: the view model's clip x and w rows this frame (c12, c15 of a
+    // mirrored draw), and this draw's first vertex buffer and stride
+    float g_frameX[4] = {}, g_frameW[4] = {};
+    std::atomic<uint64_t> g_flashUntil{ 0 };   // 0.5.824: Render::DualFlashFor
+    uint32_t g_drawBlend = 0;                  // 0.5.824: this draw's blend control
+    uint32_t g_drawFirstVertex = 0;            // 0.5.825: its lowest vertex's place (physical), 0: none
+    uint64_t g_frameXFrame = ~0ull;            // the frame g_frameX/W are of
+    uint32_t g_drawVb0 = 0, g_drawStride0 = 0;
+    // (g_drawTexture0: declared before Textures)
+    void MirrorCheck(uint32_t vertexBuffer)
+    {
+        if (!g_mirrorOn.load(std::memory_order_relaxed) || g_mirrorThisDraw) return;
+        std::lock_guard<std::mutex> hold(g_mirrorLock);
+        for (uint32_t b : g_mirrorBuffers) if (b == vertexBuffer)
+        {
+            g_mirrorThisDraw = true; g_mirrorVb = b;
+            g_frameXFrame = RenderInternal::Swaps();
+            for (int k = 0; k < 4; k++)
+            {
+                const uint32_t a = RenderState::Register(RenderState::VertexConstants + 48 + k), w = RenderState::Register(RenderState::VertexConstants + 60 + k);
+                memcpy(&g_frameX[k], &a, 4); memcpy(&g_frameW[k], &w, 4);
+            }
+            return;
+        }
+    }
+
+    uint32_t GpuAddress(uint32_t a)   // (render_prompts.cpp's MeshTexKey)
+    {
+        a &= ~3u;
+        if (a >= 0x48000000u && a < 0x6F000000u) a -= 0x28000000u;
+        return a;
+    }
+
+    void TrackPoint(uint32_t vertexBuffer)
+    {
+        const uint32_t want = g_trackBuffer.load();
+        if (!want || (vertexBuffer & ~3u) != want) return;
+        float c[24];
+        for (int i = 0; i < 24; i++) { const uint32_t w = RenderState::Register(RenderState::VertexConstants + 48 + i); memcpy(&c[i], &w, 4); }   // c12..c17
+        float b[12];
+        for (int i = 0; i < 12; i++) { const uint32_t w = RenderState::Register(RenderState::VertexConstants + 64 + i); memcpy(&b[i], &w, 4); }    // c16..c18: the bone
+        float p[3], world[3], clip[4];
+        { std::lock_guard<std::mutex> hold(g_trackLock); for (int k = 0; k < 3; k++) p[k] = g_trackPoint[k]; }
+        for (int r = 0; r < 3; r++) world[r] = b[4 * r] * p[0] + b[4 * r + 1] * p[1] + b[4 * r + 2] * p[2] + b[4 * r + 3];
+        for (int r = 0; r < 4; r++) clip[r] = c[4 * r] * world[0] + c[4 * r + 1] * world[1] + c[4 * r + 2] * world[2] + c[4 * r + 3];
+        if (!(clip[3] > 0.01f) || !std::isfinite(clip[0]) || !std::isfinite(clip[1])) return;
+        std::lock_guard<std::mutex> hold(g_trackLock);
+        memcpy(g_trackBone, b, sizeof g_trackBone);
+        memcpy(g_trackViewProjection, c, sizeof g_trackViewProjection);
+        g_trackScreen[0] = 0.5f + 0.5f * clip[0] / clip[3];
+        g_trackScreen[1] = 0.5f - 0.5f * clip[1] / clip[3];
+        g_trackAt = GetTickCount64();
+    }
+
+    void ProbeConstants(uint32_t vertexBuffer)
+    {
+        // (the draw reads it 0x28000000 lower in the extended window, as
+        // render_prompts.cpp's MeshTexKey: 46190000 for 6E190000)
+        uint32_t want = g_probeBuffer.load() & ~3u;
+        if (want >= 0x48000000u && want < 0x6F000000u) want -= 0x28000000u;
+        if (!vertexBuffer || !want || (vertexBuffer & ~3u) != want) return;
+        static int written = 0;
+        static uint64_t lastAt = 0;
+        const uint64_t now = GetTickCount64();
+        if (written >= 3 || now - lastAt < 8000) return;
+        lastAt = now;
+        written++;
+        uint32_t words[1024];
+        for (uint32_t i = 0; i < 1024; i++) words[i] = RenderState::Register(RenderState::VertexConstants + i);
+        const std::string path = g_probeDir + "vsconst_" + std::to_string(written) + ".bin";
+        if (FILE* f = fopen(path.c_str(), "wb")) { fwrite(words, 4, 1024, f); fclose(f); }
+        printf("render: the probed mesh's vertex constants written to %s (%llu ms)\n", path.c_str(), (unsigned long long)now);
+        fflush(stdout);
+    }
+
     bool Buffers(const RenderShaders::Program* vs, DrawCommand& out)
     {
         g_rangeLooks.clear();
@@ -527,6 +699,53 @@ namespace
             binding.view = view;
             if (RenderResources::NeedsRangeLook(buffer)) g_rangeLooks.push_back(RangeLook{ buffer, word0 & ~3u, fetch.stride, RenderResources::MidFrameRangeLook(buffer) });
             if (verify) g_verifyBuffers.push_back(RangeLook{ buffer, word0 & ~3u, fetch.stride });
+            // 0.5.653: a mesh with a texture of its own (Render::SetMeshTexture):
+            // the pixel program's texture in COD3_MESHTEX_SLOT (0) is it
+            int meshSlot = -1;
+            ProbeConstants(word0 & ~3u);   // 0.5.714
+            TrackPoint(word0 & ~3u);       // 0.5.717
+            MirrorCheck(word0 & ~3u);      // 0.5.809
+            if (!g_drawVb0) { g_drawVb0 = word0 & ~3u; g_drawStride0 = fetch.stride; }   // 0.5.822
+            if (ID3D11ShaderResourceView* own = RenderInternal::MeshTexture(word0 & ~3u, meshSlot))
+            {
+                static const int defaultSlot = [] { const char* t = getenv("COD3_MESHTEX_SLOT"); return t ? atoi(t) : 5; }();   // 0.5.657: 5, the colour map (656's screenshots)
+                // 0.5.661: the mesh's own slot; -2: the draw's lowest
+                int wantedSlot = meshSlot >= 0 ? meshSlot : defaultSlot;
+                if (meshSlot == -2)
+                {
+                    wantedSlot = 1 << 30;
+                    for (uint32_t i = 0; i < out.textureCount; i++) if (out.textures[i].stage == 0) wantedSlot = std::min(wantedSlot, int(out.textures[i].slot));
+                }
+                static std::map<uint32_t, int> toldFor;   // 0.5.666: the first two draws of each mesh
+                int& told = toldFor[word0 & ~3u];
+                bool put = false;
+                for (uint32_t i = 0; i < out.textureCount; i++)
+                {
+                    DrawCommand::Texture& t = out.textures[i];
+                    if (told < 2)
+                    {
+                        // 0.5.664: what each slot holds (its format and size: a normal
+                        // map, a specular map, a cube), to know what to give it
+                        D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
+                        D3D11_TEXTURE2D_DESC td{};
+                        if (t.view)
+                        {
+                            t.view->GetDesc(&vd);
+                            ID3D11Resource* res = nullptr;
+                            t.view->GetResource(&res);
+                            ID3D11Texture2D* tex = nullptr;
+                            if (res && SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex)))) { tex->GetDesc(&td); tex->Release(); }
+                            if (res) res->Release();
+                        }
+                        printf("render: mesh texture draw: texture %u stage %u slot %u sampler %u: format %u, dimension %u, %ux%u\n", i, t.stage, t.slot, t.samplerSlot,
+                               unsigned(vd.Format), unsigned(vd.ViewDimension), td.Width, td.Height);
+                    }
+                    if (t.stage == 0 && int(t.slot) == wantedSlot && !put) { t.view = own; put = true; }
+                    else if (t.stage == 0)
+                        if (ID3D11ShaderResourceView* extra = RenderInternal::MeshSlotTexture(word0 & ~3u, int(t.slot))) t.view = extra;
+                }
+                if (told < 2) { told++; printf("render: mesh texture draw (vertex buffer %08X): %u textures, put in slot %d: %s\n", word0 & ~3u, out.textureCount, wantedSlot, put ? "yes" : "no"); fflush(stdout); }
+            }
         }
         return true;
     }
@@ -830,6 +1049,23 @@ namespace
                         memcpy(words + i * 4, from + map[i] * 4u, run * 16);
                         if (keepSent) memcpy(g_sentFile[stage] + map[i] * 4u, from + map[i] * 4u, run * 16);
                         i += run;
+                    }
+                }
+                // 0.5.837: Seelow Night: the arms' and gun's light (pixel program
+                // 9a14f83313a256a4, 9 rgb terms c18-c26 from the zone's light grid,
+                // Rouen's afternoon: ~0.20 at night where Longyard has ~0.03 bluish)
+                // scaled to moonlight (Render::SetNightLight)
+                if (stage == 1 && g_nightLight.load(std::memory_order_relaxed) && programs[1]->hash == 0x9a14f83313a256a4ull)
+                {
+                    const size_t count = map.empty() ? 256 : map.size();
+                    for (size_t i = 0; i < count; i++)
+                    {
+                        const uint32_t c = map.empty() ? uint32_t(i) : uint32_t(map[i]);
+                        if (c < 18 || c > 26) continue;
+                        float v[4];
+                        memcpy(v, from + c * 4u, 16);
+                        for (int k = 0; k < 3; k++) v[k] *= g_nightScale[k];
+                        memcpy(words + i * 4, v, 16);
                     }
                 }
                 // COD3_DUMPCONST=hash: what a program's constants hold,
@@ -1211,15 +1447,21 @@ namespace
             (unsigned long long)streams, unsigned(vs->vertexFetches.size()));
         if (n > 0) lines.append(line, size_t(n));
         // COD3_DRAWLOG_PSDUMP=hash: the first draw of a frame with that pixel
-        // program adds its 256 pixel constants, every word, to the log.
+        // program adds its 256 pixel constants, every word, to the log, and
+        // (0.5.732) the same draw's 256 vertex constants as a VSDUMP line
+        // (Seelow Night's haze: no fog colour among the pixel constants).
         static const uint64_t psDump = []() { const char* t = getenv("COD3_DRAWLOG_PSDUMP"); return t ? uint64_t(strtoull(t, nullptr, 16)) : 0ull; }();
         static uint64_t dumpedSwap = ~0ull;
         if (psDump != 0 && ps->hash == psDump && dumpedSwap != swap)
         {
             dumpedSwap = swap;
-            char word[16];
+            char word[24];
             lines += "PSDUMP " + std::to_string(swap);
             for (uint32_t i = 0; i < 1024; i++) { snprintf(word, sizeof(word), " %08X", registers[0x4400 + i].load(std::memory_order_relaxed)); lines += word; }
+            lines += "\n";
+            snprintf(word, sizeof(word), " %016llx", (unsigned long long)vs->hash);
+            lines += "VSDUMP " + std::to_string(swap) + word;
+            for (uint32_t i = 0; i < 1024; i++) { snprintf(word, sizeof(word), " %08X", registers[0x4000 + i].load(std::memory_order_relaxed)); lines += word; }
             lines += "\n";
         }
     }
@@ -1264,8 +1506,14 @@ bool RenderCommands::PrepareDraw(uint32_t initiator, uint32_t indexBase, DrawCom
     return drawn;
 }
 
+namespace { bool FlashRows(const RenderShaders::Program* vs, int32_t& packedX, int32_t& packedW, float x[4], float w[4]); }   // 0.5.827 (below)
 bool RenderCommands::PrepareDrawInner(uint32_t initiator, uint32_t indexBase, DrawCommand& out)
 {
+    g_mirrorThisDraw = false; g_mirrorVs = nullptr;   // 0.5.809
+    g_drawTexture0 = 0;   // 0.5.821
+    g_drawVb0 = 0; g_drawStride0 = 0;   // 0.5.822
+    g_drawBlend = 0;   // 0.5.824
+    g_drawFirstVertex = 0;   // 0.5.825
     SkipFrameCheck();
     RenderStats::Enter(RenderStats::SectionState);
     RenderState::Snapshot state;
@@ -1371,6 +1619,11 @@ bool RenderCommands::PrepareDrawInner(uint32_t initiator, uint32_t indexBase, Dr
                          ((state.depthControl >> 1) & 1) != 0 && ((state.depthControl >> 2) & 1) == 0 && depthFunction == 6 &&
                          state.blendControl[0] != 0x00010001;
     out.rasterizer = RenderPipeline::Rasterizer(state.suScModeControl, true, out.rectangles, oldOffset ? state.polyOffset : slopeOnly, behind, forward);
+    g_drawBlend = state.blendControl[0];   // 0.5.824
+    // 0.5.809: for a mirrored copy (PrepareMirror): the same, without culling
+    g_mirrorScMode = state.suScModeControl;
+    memcpy(g_mirrorOffset, oldOffset ? state.polyOffset : slopeOnly, sizeof g_mirrorOffset);
+    g_mirrorBehind = behind; g_mirrorForward = forward;
     // Verify mode: every such layer (whether or not it is nudged) counted on
     // the GPU, how many of its samples passed (render_d3d11.cpp).
     out.layerQuery = Verify::On(Verify::Buffers) && out.depthView != nullptr && !DepthOnlyMode(state) &&
@@ -1428,6 +1681,32 @@ bool RenderCommands::PrepareDrawInner(uint32_t initiator, uint32_t indexBase, Dr
     // the host's centres, to compare.
     static const bool noHalfPixel = getenv("COD3_NOHALFPIXEL") != nullptr;
     constants.flags[0] = state.vteControl | (((state.vertexControl & 1) != 0 || noHalfPixel) ? 0x10000u : 0u);
+    // Surface light (render_post.cpp, xenos_hlsl.cpp): its strength in bits
+    // 24 to 30, on the world's solid surfaces only: a depth tested and
+    // written, no blending, colour written. The sky, smoke, flashes, decals
+    // and the HUD fail one of those and are left as they are.
+    const bool solid = out.opaque && out.depthView != nullptr && (state.depthControl & 6u) == 6u && (state.colorMask & 7u) == 7u;
+    if (g_surfaceLight != 0 && solid)
+        constants.flags[0] |= (g_surfaceLight & 0x7Fu) << 24;
+    // The solid world's depth test (bits 4 to 6): greater or greater or
+    // equal is a depth that is 1 near, for the ambient occlusion.
+    if (solid)
+    {
+        const uint32_t test = (state.depthControl >> 4) & 7;
+        if (test != 7 && test != 0) g_depthReversed = test == 4 || test == 6;
+    }
+    // (Team Friend's alpha coverage bits 20-21 left out on merging: this
+    // tree has its own alpha to coverage, constants.coverage[0] above.)
+    // Filling the screen: a frame sized target's flat draws (the HUD, a
+    // menu) squeezed into the 16:9 middle (xenos_hlsl.cpp), full screen
+    // ones too (bit 22) when the last frame drew no world: a film, a
+    // loading picture, the menus' backgrounds.
+    constants.viewportScale[3] = 0.0f;
+    if (g_fillSqueeze != 0.0f && state.pitch >= 640)
+    {
+        constants.viewportScale[3] = g_fillSqueeze;
+        if (!g_worldLastFrame) constants.flags[0] |= 0x400000u;
+    }
     constants.flags[1] = ((state.colorControl >> 3) & 1) ? (state.colorControl & 7) : 7;   // the alpha test, or always
     constants.flags[2] = state.alphaReference;
     constants.flags[3] = uint32_t(ps->hash);
@@ -1514,6 +1793,7 @@ bool RenderCommands::PrepareDrawInner(uint32_t initiator, uint32_t indexBase, Dr
 
     RenderStats::Enter(RenderStats::SectionConstants);
     if (!Constants(vs, ps, out, constants)) return false;
+    g_mirrorVs = vs;   // 0.5.809
 
     RenderStats::Enter(RenderStats::SectionIndices);
     if (!Indices(state, convertQuads, convertFan, out)) return false;
@@ -1575,6 +1855,128 @@ bool RenderCommands::PrepareDrawInner(uint32_t initiator, uint32_t indexBase, Dr
         Log(state, vs, ps, out);
     }
     DrawLog(state, vs, ps, out);
+    // 0.5.825: in the dual Colts' flash window, a blended draw's own lowest
+    // vertex (the particles share one big buffer: its start is another's)
+    if (GetTickCount64() < g_flashUntil.load() && g_drawVb0 && g_drawStride0 && state.blendControl[0] != 0x00010001u)
+    {
+        uint32_t lowest = 0, highest = 0;
+        if (DrawVertexRange(state, out, lowest, highest))
+        {
+            const int64_t vertex = int64_t(lowest) + state.indexOffset;
+            if (vertex >= 0 && vertex < 0x100000) g_drawFirstVertex = g_drawVb0 + uint32_t(vertex) * g_drawStride0 * 4u;
+        }
+    }
+    // 0.5.821: DIAGNOSTIC (Render::LogDrawsFor)
+    // 0.5.827: the blended draws only, each with its own lowest vertex's distance
+    // from the eye and side (by its program's clip rows), both windows
+    if (const uint64_t now = GetTickCount64(); state.blendControl[0] != 0x00010001u &&
+        (now < g_logDrawsUntil.load() || (now >= g_logDraws2From.load() && now < g_logDraws2Until.load())))
+    {
+        static int told2 = 0;
+        if (told2 < 4000)
+        {
+            told2++;
+            int32_t px = -1, pw = -1;
+            float x[4] = {}, w[4] = {};
+            const bool rows = FlashRows(vs, px, pw, x, w);
+            float p[3] = {}, cw = 0.0f, cx = 0.0f;
+            uint32_t lowest = 0, highest = 0;
+            if (rows && g_drawVb0 && g_drawStride0 && DrawVertexRange(state, out, lowest, highest))
+            {
+                const int64_t vertex = int64_t(lowest) + state.indexOffset;
+                if (vertex >= 0 && vertex < 0x100000)
+                {
+                    const uint8_t* at = Guest::Base + Guest::PhysicalAlias(g_drawVb0 + uint32_t(vertex) * g_drawStride0 * 4u);
+                    for (int k = 0; k < 3; k++) { const uint32_t v = _byteswap_ulong(reinterpret_cast<const uint32_t*>(at)[k]); memcpy(&p[k], &v, 4); }
+                    cw = w[0] * p[0] + w[1] * p[1] + w[2] * p[2] + w[3];
+                    cx = x[0] * p[0] + x[1] * p[1] + x[2] * p[2] + x[3];
+                }
+            }
+            // 0.5.831: the particle program's draws: where all their vertices land on the screen (c0, c1, c3)
+            float bx0 = 9, bx1 = -9, by0 = 9, by1 = -9, ew0 = 1e9f, ew1 = -1e9f;
+            if (vs->hash == 0x1c2487958f971104ull && g_drawVb0 && g_drawStride0 && DrawVertexRange(state, out, lowest, highest) && highest - lowest < 4096)
+            {
+                float r[3][4];
+                const int rowOf[3] = { 0, 1, 3 };
+                for (int j = 0; j < 3; j++) for (int k = 0; k < 4; k++) { const uint32_t v = RenderState::Register(RenderState::VertexConstants + 4 * rowOf[j] + k); memcpy(&r[j][k], &v, 4); }
+                for (uint32_t i = lowest; i <= highest; i++)
+                {
+                    const int64_t vertex = int64_t(i) + state.indexOffset;
+                    if (vertex < 0 || vertex >= 0x100000) break;
+                    const uint8_t* at = Guest::Base + Guest::PhysicalAlias(g_drawVb0 + uint32_t(vertex) * g_drawStride0 * 4u);
+                    float q[3];
+                    for (int k = 0; k < 3; k++) { const uint32_t v = _byteswap_ulong(reinterpret_cast<const uint32_t*>(at)[k]); memcpy(&q[k], &v, 4); }
+                    const float qx = r[0][0] * q[0] + r[0][1] * q[1] + r[0][2] * q[2] + r[0][3];
+                    const float qy = r[1][0] * q[0] + r[1][1] * q[1] + r[1][2] * q[2] + r[1][3];
+                    const float qw = r[2][0] * q[0] + r[2][1] * q[1] + r[2][2] * q[2] + r[2][3];
+                    if (qw <= 0.01f) continue;
+                    bx0 = (std::min)(bx0, qx / qw); bx1 = (std::max)(bx1, qx / qw); by0 = (std::min)(by0, qy / qw); by1 = (std::max)(by1, qy / qw);
+                    ew0 = (std::min)(ew0, qw); ew1 = (std::max)(ew1, qw);
+                }
+            }
+            printf("blend: %llu %s vs %016llx ps %016llx tex0 %08X blend %08X n %u rows %d/%d vertex %.0f %.0f %.0f eye %.0f side %.2f screen x %.2f..%.2f y %.2f..%.2f w %.0f..%.0f\n",
+                   (unsigned long long)RenderInternal::Swaps(), now < g_logDrawsUntil.load() ? "SHOT" : "quiet", (unsigned long long)vs->hash,
+                   ps ? (unsigned long long)ps->hash : 0ull, g_drawTexture0, state.blendControl[0], state.indexCount, px, pw, p[0], p[1], p[2], cw, cw != 0.0f ? cx / cw : 0.0f,
+                   bx0, bx1, by0, by1, ew0, ew1);
+        }
+    }
+    if (false)
+    {
+        static int told = 0;
+        if (told < 1500)
+        {
+            told++;
+            float c12[4], c15[4];
+            for (int k = 0; k < 4; k++)
+            {
+                const uint32_t a = RenderState::Register(RenderState::VertexConstants + 48 + k), b = RenderState::Register(RenderState::VertexConstants + 60 + k);
+                memcpy(&c12[k], &a, 4); memcpy(&c15[k], &b, 4);
+            }
+            printf("draws: %llu vs %016llx ps %016llx tex0 %08X blend %08X depth %08X n %u%s c12 %.3f %.3f %.3f %.1f c15 %.3f %.3f %.3f %.1f\n",
+                   (unsigned long long)RenderInternal::Swaps(), (unsigned long long)vs->hash, ps ? (unsigned long long)ps->hash : 0ull, g_drawTexture0,
+                   state.blendControl[0], state.depthControl, state.indexCount, g_mirrorThisDraw ? " MIRRORED" : "",
+                   c12[0], c12[1], c12[2], c12[3], c15[0], c15[1], c15[2], c15[3]);
+            // 0.5.822: a blended draw: which constants hold the view's x and w rows,
+            // and its first vertex's words
+            if (state.blendControl[0] != 0x00010001u)
+            {
+                std::string rows;
+                for (int c = 0; c < 64; c++)
+                {
+                    float v[4];
+                    for (int k = 0; k < 4; k++) { const uint32_t w = RenderState::Register(RenderState::VertexConstants + 4 * c + k); memcpy(&v[k], &w, 4); }
+                    bool x = true, w = true;
+                    for (int k = 0; k < 4; k++) { x = x && fabsf(v[k] - g_frameX[k]) < 1e-3f; w = w && fabsf(v[k] - g_frameW[k]) < 1e-3f; }
+                    if (x) rows += " x=c" + std::to_string(c);
+                    if (w) rows += " w=c" + std::to_string(c);
+                }
+                std::string vtx;
+                if (g_drawVb0)
+                {
+                    const uint8_t* at = Guest::Base + Guest::PhysicalAlias(g_drawFirstVertex);
+                    char t[16];
+                    for (int k = 0; k < 8; k++) { uint32_t w = _byteswap_ulong(reinterpret_cast<const uint32_t*>(at)[k]); float f; memcpy(&f, &w, 4); snprintf(t, sizeof t, " %.2f", f); vtx += t; }
+                }
+                printf("draws:   rows%s; vb %08X stride %u, first words%s\n", rows.empty() ? " none" : rows.c_str(), g_drawVb0, g_drawStride0, vtx.c_str());
+                // 0.5.823: the particle program's constants c0..c19, beside the view's rows
+                static int dumped = 0;
+                if (vs->hash == 0x1c2487958f971104ull && dumped < 2)
+                {
+                    dumped++;
+                    printf("draws:   view x %.4f %.4f %.4f %.2f w %.4f %.4f %.4f %.2f\n", g_frameX[0], g_frameX[1], g_frameX[2], g_frameX[3], g_frameW[0], g_frameW[1], g_frameW[2], g_frameW[3]);
+                    for (int c = 0; c < 20; c++)
+                    {
+                        float v[4];
+                        for (int k = 0; k < 4; k++) { const uint32_t w = RenderState::Register(RenderState::VertexConstants + 4 * c + k); memcpy(&v[k], &w, 4); }
+                        printf("draws:   c%d %.4f %.4f %.4f %.2f\n", c, v[0], v[1], v[2], v[3]);
+                    }
+                    std::string map;
+                    for (size_t i = 0; i < vs->constantMap.size() && i < 40; i++) map += " " + std::to_string(vs->constantMap[i]);
+                    printf("draws:   the program reads c:%s\n", map.c_str());
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -1635,7 +2037,11 @@ bool RenderCommands::PrepareResolve(ResolveCommand& out)
     if (command != 3 && state.destBase != 0)
     {
         const bool fromDepth = sourceSelect == 4;
-        if (fromDepth && DebugProbe::DepthWriteback() != 0 && (state.destPitch & 0x3FFF) != 0)
+        // 0.5.477: and, always, the one resolve the title reads on the CPU
+        // (the coronas' depth test, cpu_depth.cpp)
+        const uint32_t cpuDepthAt = RenderInternal::CpuDepthAt();
+        const bool cpuReads = cpuDepthAt != 0 && (state.destBase & 0x1FFFF000u) == cpuDepthAt;
+        if (fromDepth && (DebugProbe::DepthWriteback() != 0 || cpuReads) && (state.destPitch & 0x3FFF) != 0)
         {
             out.writeBack = true;
             out.guestBase = state.destBase;
@@ -1655,6 +2061,19 @@ bool RenderCommands::PrepareResolve(ResolveCommand& out)
             out.sourceHeight = depth->height;
             out.sourceSamples = depth->samples;
             format = DXGI_FORMAT_R32_FLOAT;
+            // The scene's whole depth (the width of its surface, wider than
+            // tall, not a square shadow map), which the title resolves once
+            // a frame for its soft smoke after the solid world: the ambient
+            // occlusion goes into the colour beside it then.
+            if (width * 10 >= state.pitch * 9 && width > height + height / 4 && height >= 400) g_worldThisFrame = true;
+            if (width * 10 >= state.pitch * 9 && width > height + height / 4 && height >= 400)
+                if (const RenderResources::ColorTarget* color = RenderResources::ColorTargetOf(RenderResources::ColorTargetFor(state.colorInfo[0], state.pitch)))
+                    if (color->samples == depth->samples && color->width == depth->width)
+                    {
+                        out.occlusion = true;
+                        out.occlusionTarget = color->view;
+                        out.depthReversed = g_depthReversed;
+                    }
         }
         else
         {
@@ -1713,6 +2132,7 @@ bool RenderCommands::PrepareResolve(ResolveCommand& out)
 }
 
 void RenderCommands::SetAimBlur(bool drawn) { g_aimBlur = drawn; }
+void RenderCommands::SetSurfaceLight(uint32_t level) { g_surfaceLight = std::min(level, 127u); }
 void RenderCommands::SetSteadyDecals(bool on) { g_steadyDecals = on; }
 
 void RenderCommands::CheckLateWrites()
@@ -1741,6 +2161,8 @@ void RenderCommands::SetRendering(bool sharpShadows, bool fastShadowMaps, bool f
     g_fastShadowMaps = fastShadowMaps;
     g_foliageCoverage = foliageCoverage;
 }
+
+void RenderCommands::SetSpectatorSeat(bool seated) { g_spectatorSeat.store(seated, std::memory_order_relaxed); }
 
 void RenderCommands::SetPlayerDown(bool down)
 {
@@ -1777,4 +2199,299 @@ void RenderCommands::ReportSkips()
     printf("        skipped:");
     for (int i = 0; i < SkipCount; i++) if (g_skips[i] != 0) printf(" %s x%llu;", SkipNames[i], (unsigned long long)g_skips[i]);
     printf("\n");
+}
+
+void RenderCommands::SetFill(float squeeze)
+{
+    g_fillSqueeze = squeeze;
+    g_worldLastFrame = g_worldThisFrame;
+    g_worldThisFrame = false;
+}
+
+// 0.5.714: DIAGNOSTIC (render.h)
+void Render::ProbeVertexBuffer(uint32_t vertexBuffer, const char* dir)
+{
+    g_probeDir = dir ? dir : "";
+    g_probeBuffer.store(vertexBuffer);
+}
+
+// 0.5.717 (render.h)
+void Render::TrackMeshPoint(uint32_t vertexBuffer, float x, float y, float z)
+{
+    {
+        std::lock_guard<std::mutex> hold(g_trackLock);
+        g_trackPoint[0] = x; g_trackPoint[1] = y; g_trackPoint[2] = z;
+    }
+    g_trackBuffer.store(vertexBuffer ? GpuAddress(vertexBuffer) : 0);
+}
+
+bool Render::TrackedPoint(float& x, float& y)
+{
+    std::lock_guard<std::mutex> hold(g_trackLock);
+    if (!g_trackAt || GetTickCount64() - g_trackAt > 150) return false;
+    x = g_trackScreen[0]; y = g_trackScreen[1];
+    return true;
+}
+
+bool Render::TrackedTransform(float bone[12], float viewProjection[16])
+{
+    std::lock_guard<std::mutex> hold(g_trackLock);
+    if (!g_trackAt || GetTickCount64() - g_trackAt > 150) return false;
+    memcpy(bone, g_trackBone, sizeof g_trackBone);
+    memcpy(viewProjection, g_trackViewProjection, sizeof g_trackViewProjection);
+    return true;
+}
+
+// 0.5.809: the dual pistols' left gun and arm (render_commands.h)
+// 0.5.811: both guns set apart (the original moved right, its mirror left, by
+// g_dualSpread of the screen's half width: the user, "they are really close
+// together almost touching"), and the reload one pistol at a time: for
+// g_reloadMs from Render::SetMirrorReload the left gun and arm are not drawn
+// (the left hand, free, reloads the right Colt: the Colt's own reload) and the
+// right arm's draws are recorded each frame; for the same time after it the
+// right gun and arm are not drawn and the left plays that recording, mirrored
+// (the right hand reloads the left Colt).
+namespace
+{
+    struct DualRecord { uint32_t vb, n; uint64_t hash; std::vector<uint32_t> words; };
+    struct DualFrame { uint64_t t; std::vector<DualRecord> draws; };
+    std::vector<DualFrame> g_dualFrames;
+    std::atomic<uint64_t> g_reloadStart{ 0 };
+    std::atomic<uint32_t> g_reloadMs{ 0 };
+    std::atomic<float> g_dualSpread{ 0.10f };
+    uint64_t g_reloadSeen = 0;
+    uint64_t g_mirrorFrame = ~0ull;
+    std::map<uint32_t, uint32_t> g_mirrorCounts;
+
+    // The vertex program's constants as it reads them (packed by its map).
+    uint32_t PackVs(const RenderShaders::Program* vs, std::vector<uint32_t>& words, int32_t& row12, int32_t& row15)
+    {
+        const std::vector<uint16_t>& map = vs->constantMap;
+        const uint32_t count = map.empty() ? 256u : uint32_t(map.size());
+        const uint32_t need = std::min(256u, std::max(16u, (count + 15) & ~15u));
+        words.assign(size_t(need) * 4, 0u);
+        const uint32_t* from = RenderState::Registers() + 0x4000;
+        row12 = row15 = -1;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t constant = map.empty() ? i : uint32_t(map[i]);
+            memcpy(&words[size_t(i) * 4], from + constant * 4, 16);
+            if (constant == 12) row12 = int32_t(i);
+            if (constant == 15) row15 = int32_t(i);
+        }
+        return need;
+    }
+    // c12 (the clip's x) made sign * c12 + shift * c15 (w): mirrored and/or moved
+    void PatchX(std::vector<uint32_t>& words, int32_t row12, int32_t row15, float sign, float shift)
+    {
+        float x[4], w[4];
+        memcpy(x, &words[size_t(row12) * 4], 16);
+        memcpy(w, &words[size_t(row15) * 4], 16);
+        for (int k = 0; k < 4; k++) x[k] = sign * x[k] + shift * w[k];
+        memcpy(&words[size_t(row12) * 4], x, 16);
+    }
+    // Into the ring; false on a wrap (as Constants: what was remembered is gone)
+    bool UploadVs(const std::vector<uint32_t>& words, uint32_t need, uint32_t& at)
+    {
+        if (RenderResources::ConstantReserve(need * 16)) { g_uploaded = Uploaded(); return false; }
+        uint32_t base;
+        uint8_t* to = RenderResources::ConstantMap(need * 16, base);
+        if (to == nullptr) return false;
+        memcpy(to, words.data(), size_t(need) * 16);
+        RenderResources::ConstantUnmap();
+        RenderStats::Frame().streamBytes += need * 16;
+        at = base;
+        return true;
+    }
+}
+
+// 0.5.824: the dual Colts' muzzle flash: a blended draw in the moments after
+// their shot whose first vertex is near the eye on the right (the Colt's own
+// view flash, at its real muzzle): its clip x row (found by value: the row
+// three before the one equal to the view model's w row this frame, as c12/c15
+// for the arms and guns, c0/c3 for the particles) moved as the right gun is,
+// and drawn again mirrored as the left gun is.
+namespace
+{
+    bool FlashRows(const RenderShaders::Program* vs, int32_t& packedX, int32_t& packedW, float x[4], float w[4])
+    {
+        const std::vector<uint16_t>& map = vs->constantMap;
+        const uint32_t count = map.empty() ? 256u : uint32_t(map.size());
+        auto packedOf = [&](uint32_t constant) -> int32_t {
+            if (map.empty()) return constant < 256 ? int32_t(constant) : -1;
+            for (uint32_t i = 0; i < count; i++) if (map[i] == constant) return int32_t(i);
+            return -1;
+        };
+        for (uint32_t c = 3; c < 64; c++)
+        {
+            float v[4];
+            for (int k = 0; k < 4; k++) { const uint32_t r = RenderState::Register(RenderState::VertexConstants + 4 * c + k); memcpy(&v[k], &r, 4); }
+            bool same = true;
+            for (int k = 0; k < 4; k++) same = same && fabsf(v[k] - g_frameW[k]) < 1e-3f;
+            if (!same) continue;
+            const int32_t pw = packedOf(c), px = packedOf(c - 3);
+            if (pw < 0 || px < 0) continue;
+            for (int k = 0; k < 4; k++) { const uint32_t r = RenderState::Register(RenderState::VertexConstants + 4 * (c - 3) + k); memcpy(&x[k], &r, 4); w[k] = v[k]; }
+            bool isW = true;   // (c6 and c3 are both the w row in the particles': the lowest whose x is not w)
+            for (int k = 0; k < 4; k++) isW = isW && fabsf(x[k] - w[k]) < 1e-3f;
+            if (isW) continue;
+            packedX = px; packedW = pw;
+            return true;
+        }
+        // 0.5.828: the flash's additive core (tex 271E2000) is drawn when no row
+        // equals the view's w row (another frame's): the particles' own c0/c3
+        // (the caller's near-eye test keeps far effects out)
+        if (vs->hash == 0x1c2487958f971104ull)
+        {
+            const int32_t pw = packedOf(3), px = packedOf(0);
+            if (pw < 0 || px < 0) return false;
+            for (int k = 0; k < 4; k++)
+            {
+                const uint32_t a = RenderState::Register(RenderState::VertexConstants + k), b = RenderState::Register(RenderState::VertexConstants + 12 + k);
+                memcpy(&x[k], &a, 4); memcpy(&w[k], &b, 4);
+            }
+            packedX = px; packedW = pw;
+            return true;
+        }
+        return false;
+    }
+}
+
+bool RenderCommands::PrepareMirror(DrawCommand& in, DrawCommand& out, bool& skipOriginal)
+{
+    skipOriginal = false;
+    // 0.5.824: the muzzle flash
+    if (!g_mirrorThisDraw && g_mirrorVs != nullptr && in.ring && g_drawBlend != 0x00010001u && g_drawBlend != 0 &&
+        GetTickCount64() < g_flashUntil.load() && RenderInternal::Swaps() - g_frameXFrame <= 2 && g_drawFirstVertex)
+    {
+        int32_t px, pw;
+        float x[4], w[4];
+        if (!FlashRows(g_mirrorVs, px, pw, x, w)) return false;
+        const uint8_t* at = Guest::Base + Guest::PhysicalAlias(g_drawFirstVertex);   // 0.5.828: this draw's own (was the shared buffer's start)
+        float p[3];
+        for (int k = 0; k < 3; k++) { const uint32_t v = _byteswap_ulong(reinterpret_cast<const uint32_t*>(at)[k]); memcpy(&p[k], &v, 4); }
+        const float cw = w[0] * p[0] + w[1] * p[1] + w[2] * p[2] + w[3];
+        const float cx = x[0] * p[0] + x[1] * p[1] + x[2] * p[2] + x[3];
+        static int told = 0;
+        // (0.5.830-832's screen-place "core" test is gone: the far glow was the bullet's impact spark,
+        // 3200 from the eye; the flash's own smoke and core are both ~10 from it and pass below)
+        if (!(cw > 1.0f && cw < 150.0f && cx / cw > -0.3f)) return false;   // not near the eye on the right: another effect
+        const uint64_t start = g_reloadStart.load(), length = g_reloadMs.load(), now = GetTickCount64();
+        if (start && now >= start && now < start + 2 * length) return false;   // (no shots in a reload)
+        std::vector<uint32_t> current;
+        int32_t r12, r15;
+        const uint32_t need = PackVs(g_mirrorVs, current, r12, r15);
+        const float spread = g_dualSpread.load();
+        std::vector<uint32_t> moved = current;
+        PatchX(moved, px, pw, 1.0f, spread);
+        uint32_t movedAt;
+        if (UploadVs(moved, need, movedAt)) { in.floatAt[0] = movedAt; in.floatCount[0] = need; }
+        std::vector<uint32_t> mirrored = current;
+        PatchX(mirrored, px, pw, -1.0f, -spread);
+        uint32_t mirrorAt;
+        if (!UploadVs(mirrored, need, mirrorAt)) return false;
+        out = in;
+        out.floatAt[0] = mirrorAt;
+        out.floatCount[0] = need;
+        out.rasterizer = RenderPipeline::Rasterizer(g_mirrorScMode, true, true, g_mirrorOffset, g_mirrorBehind, g_mirrorForward);
+        out.logged = false;
+        out.layerQuery = false;
+        if (told < 4) { told++; printf("render: dual flash: program %016llx tex0 %08X blend %08X (x row %d, w row %d), %.0f from the eye: moved right and mirrored left\n", (unsigned long long)g_mirrorVs->hash, g_drawTexture0, g_drawBlend, px, pw, cw); fflush(stdout); }
+        return true;
+    }
+    if (!g_mirrorThisDraw || g_mirrorVs == nullptr || !in.ring) return false;
+    g_mirrorThisDraw = false;
+    std::vector<uint32_t> current;
+    int32_t row12, row15;
+    const uint32_t need = PackVs(g_mirrorVs, current, row12, row15);
+    static int told = 0;
+    if (row12 < 0 || row15 < 0)
+    {
+        if (told < 8) { told++; printf("render: mirror: vertex program %016llx reads no c12/c15: not mirrored\n", (unsigned long long)g_mirrorVs->hash); fflush(stdout); }
+        return false;
+    }
+    // the reload's two parts
+    const uint64_t now = GetTickCount64();
+    const uint64_t start = g_reloadStart.load();
+    const uint64_t length = g_reloadMs.load();
+    if (start != g_reloadSeen) { g_reloadSeen = start; g_dualFrames.clear(); g_mirrorFrame = ~0ull; }
+    const bool partA = start && now >= start && now < start + length;
+    const bool partB = start && now >= start + length && now < start + 2 * length;
+    const uint64_t frame = RenderInternal::Swaps();
+    if (frame != g_mirrorFrame)
+    {
+        g_mirrorFrame = frame;
+        g_mirrorCounts.clear();
+        if (partA && g_dualFrames.size() < 2000) g_dualFrames.push_back(DualFrame{ now - start, {} });
+    }
+    const uint32_t n = g_mirrorCounts[g_mirrorVb]++;
+    if (partA && !g_dualFrames.empty() && g_dualFrames.back().draws.size() < 64)
+        g_dualFrames.back().draws.push_back(DualRecord{ g_mirrorVb, n, g_mirrorVs->hash, current });
+    const float spread = g_dualSpread.load();
+    // the right gun moved right (not in part B: not drawn)
+    if (partB) skipOriginal = true;
+    else if (spread != 0.0f)
+    {
+        std::vector<uint32_t> moved = current;
+        PatchX(moved, row12, row15, 1.0f, spread);
+        uint32_t at;
+        if (UploadVs(moved, need, at)) { in.floatAt[0] = at; in.floatCount[0] = need; }
+    }
+    if (partA) return false;   // the left gun and arm down while the right is reloaded
+    std::vector<uint32_t> words;
+    if (partB)
+    {
+        // the recorded right arm at the same time into its reload, mirrored
+        const uint64_t into = now - (start + length);
+        const DualFrame* use = nullptr;
+        for (const DualFrame& f : g_dualFrames) { if (f.t <= into) use = &f; else break; }
+        if (!use && !g_dualFrames.empty()) use = &g_dualFrames.front();
+        if (use)
+            for (const DualRecord& r : use->draws)
+                if (r.vb == g_mirrorVb && r.n == n && r.hash == g_mirrorVs->hash && r.words.size() == current.size()) { words = r.words; break; }
+        if (words.empty()) return false;
+    }
+    else words = current;
+    PatchX(words, row12, row15, -1.0f, -spread);
+    uint32_t at;
+    if (!UploadVs(words, need, at)) return false;
+    out = in;
+    out.floatAt[0] = at;
+    out.floatCount[0] = need;
+    out.rasterizer = RenderPipeline::Rasterizer(g_mirrorScMode, true, true, g_mirrorOffset, g_mirrorBehind, g_mirrorForward);
+    out.logged = false;
+    out.layerQuery = false;
+    if (told < 8)
+    {
+        told++;
+        printf("render: mirror: vertex program %016llx mirrored (c12 packed %d of %u, spread %.2f)%s\n", (unsigned long long)g_mirrorVs->hash, row12, need, spread,
+               partB ? " from the recorded reload" : "");
+        fflush(stdout);
+    }
+    return true;
+}
+
+void Render::SetMirrorReload(uint32_t milliseconds)
+{
+    g_reloadMs.store(milliseconds);
+    g_reloadStart.store(milliseconds ? GetTickCount64() : 0);
+}
+
+void Render::SetMirrorSpread(float spread) { g_dualSpread.store(spread); }
+
+void Render::LogDrawsFor(uint32_t milliseconds) { const uint64_t now = GetTickCount64(); g_logDrawsUntil.store(now + milliseconds); g_logDraws2From.store(now + 400); g_logDraws2Until.store(now + 400 + milliseconds); }
+
+void Render::DualFlashFor(uint32_t milliseconds) { g_flashUntil.store(GetTickCount64() + milliseconds); }
+void Render::SetNightLight(bool on, const float scale[3])
+{
+    for (int k = 0; k < 3; k++) g_nightScale[k] = scale[k];
+    g_nightLight.store(on);
+}
+
+void Render::SetMirrorBuffers(const uint32_t* buffers, int count)
+{
+    std::lock_guard<std::mutex> hold(g_mirrorLock);
+    g_mirrorBuffers.clear();
+    for (int i = 0; buffers && i < count; i++) if (buffers[i]) g_mirrorBuffers.push_back(GpuAddress(buffers[i]));
+    g_mirrorOn.store(!g_mirrorBuffers.empty());
 }

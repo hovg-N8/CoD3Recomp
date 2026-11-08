@@ -20,6 +20,8 @@ namespace Window
     // middle. Handed out as a void pointer so nothing else has to include
     // Windows.h to ask.
     void* Handle();
+    // (co-op v46) shown and put in front: a copy that started hidden (COD3_COOP_HIDDEN, the checkpoint reload)
+    void Reveal();
 
     // Whether to draw a pointer over the window. It is hidden while the mouse
     // is steering, because a cursor pinned to the middle of the screen is only

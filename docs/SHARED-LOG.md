@@ -1,3 +1,53 @@
+<!-- claude-2026-11-05-handoff -->
+**2026-11-05 (Claude):** 0.5.781-0.5.795. Map changes with tanks: 783 vehicle files once a map, 784 after-map archives reused (781 reload reverted), 787 DemonWare guard (sub_821C08B0), 788 Kangaroo before the map, 790 vehicle packs with the first map + Stuka cut. 791 Saint-Lo gentler cut (tanks visible), tankblast command. 792-795 tank events from Merville's table (sub_82555160; set name '<archive>.fx', EVENT.FX; unverified). Logs: game heap per extra archive, DemonWare allocation failures, physics presets/kinds per map, COD3_PEERTRAP.
+<!-- /claude-2026-11-05-handoff -->
+
+<!-- claude-2026-11-03-handoff -->
+**UPDATE 2026-11-03 ~20:05 (Claude; source+install 0.5.758; nothing committed): flares have WaW's own sounds, burn whoever stands on them, and bots throw them (kits with the Mosin, Webley and flares). Bot smoke throws were broken before and now work. Read the top of docs/CLAUDE-SESSION-2026-11-03.md.**
+**UPDATE 2026-11-03 ~19:00 (Claude; source+install 0.5.751; nothing committed): the signal flare is finished: thrown, flies, lights after 1 s where it lands, no smoke (its grenade sunk, WaW stick left), blinding verified. Read the top of docs/CLAUDE-SESSION-2026-11-03.md.**
+**UPDATE 2026-11-03 ~17:30 (Claude; source+install 0.5.743; nothing committed): the signal flare now looks like WaW's flare stick (thrown, lying, in others' hands; first person keeps the game's grenade). Read the top of docs/CLAUDE-SESSION-2026-11-03.md.**
+**2026-11-03 ~16:40 (Claude):** 0.5.739-0.5.741 World at War's signal flare: weapon signal_flare (smoke's copy, weapon 48), custom class SPECIAL row, flare.cpp (glow, sparks, WaW blinding numbers), tools/waw/make_flare.py -> custom\flare. Test flare verified (flare1); thrown-flare lighting fixed in 741 (name at 0xAA.. address), awaits the user's throw. Bots cannot throw the copy.
+**2026-11-03 ~12:05 (Claude):** Seelow drain pipe: solid roof slab over its middle (seelow_clipmap PIPE_ROOF) so standing up inside is refused (the user stood up and their view went through the road). Collision rebuilt (old coll_m.kerbs1), both packs reinstalled. User's play log backed up as logs-backup\20261103-120416-user-play11.
+**2026-11-03 ~11:20 (Claude):** Seelow fires centred on their 5 junked cars and set 15 under each car's origin (the vfire flames start ~40 over the point; seelow_install.sh SCENE_FIRES). Both packs reinstalled; test fires3: flames rise out of the car bodies. Data only, no build.
+**2026-11-02 night to 11-03 (Claude):** 0.5.738 Mantle assist setting (off for players, bots keep it, bots.cpp BotsIsBotRecord). Seelow tools: seelow_clipmap drop_small_clip (prop-only clips kept), hull triangle sign fix (s.p - sw), 4 .cgb files (FILL bands; 4th = level unzoned.cgb via repack.py --replace), ladders 0x40b8, PIPE_CAPS, WALL_HOLES, KERBS; seelow_cells lamp_occluders/lamp_sees, glow lightmap, night_lights (fires, stoves, createfx), my_lights.txt + lamp_axes; scene.py fires() (vfire_panzerIV at WaW's burning cars).
+<!-- /claude-2026-11-03-handoff -->
+
+<!-- claude-2026-11-02-evening-handoff -->
+**2026-11-02 evening (Claude):** 0.5.735 'where:' position log; 0.5.736 mantle to each helper's height; 0.5.737 step 28 on maps with custom\mantle (Seelow only). Tools: seelow_models SLOT_FIX (names past slot 82 by placed boxes), SWAP_UV (wheat, hedges, pine), UPRIGHT_CARDS (grass 27 deg); seelow_clipmap: shot-only floors solid, budget 30000; SEELOW_NIGHT 0.56,0.66,0.92 with lamp pools. All installed.
+<!-- /claude-2026-11-02-evening-handoff -->
+
+<!-- claude-2026-11-02-afternoon-handoff -->
+**2026-11-02 afternoon (Claude):** Seelow/Seelow Night: seelow_clipmap.py no longer swaps WaW's 0x10000/0x20000 (CoD3 player mask is 0x2810011; WaW AI clip had blocked 206 of 292 mantle spots); WaW glass (0x10) out; SEELOW_MESH_BUDGET 30000 (boxed props 312 -> 127); seelow_models SWAP_UV for the wheat; night lightmaps brighter (SEELOW_NIGHT 0.40,0.475,0.69); side session: night fog = Longyard's record (0.5.733), sun = Longyard's. No code build of mine; 0.5.732-734 are the side session's debug switches.
+<!-- /claude-2026-11-02-afternoon-handoff -->
+
+<!-- claude-2026-11-02-midday-handoff -->
+**2026-11-02 midday (Claude):** 0.5.729 mantling (WaW's 292 mantle helpers, Seelow/Seelow Night only); 0.5.730/731 vehicle pack + host never makes a vehicle from nothing (pack parked: crashes/hangs on vehicle-less maps). Seelow: Rouen leftovers repacked out (tools/kapf/repack.py; 7 -> 23 banks free), trees under the map gone, boxcar/hedgehog textures, fog ramp kept. New map pack Seelow Night (pack 6, ID 22): moonlit cells, Longyard's night sky; open: tan fog, arms lit by day.
+<!-- /claude-2026-11-02-midday-handoff -->
+
+<!-- claude-2026-11-02-handoff -->
+**2026-11-02 (Claude):** 0.5.728 Mosin one gunshot sound (built, verified). Seelow: e_blend shader set (see-through fixed), WaW sky, WaW player-clip bit, model collision, GfxWorld draw list (grass/wheat/hedgerows, 7582 placements), Panzer wrecks, Rouen .dcgb dropped. Details: docs/CLAUDE-SESSION-2026-11-02.md.
+<!-- /claude-2026-11-02-handoff -->
+
+<!-- claude-2026-11-01-night-handoff -->
+**Claude handoff 2026-11-01 ~23:05 (source and install 0.5.725, built OK; nothing committed; friend zip on hold; Carentan still set P, "perfect now" per the user): read docs/CLAUDE-SESSION-2026-11-01-night.md FIRST (whole file is the handoff).** Done: World at War's M2 flamethrower nearly finished: fire not bullets (impact records cleared), WaW's own arm animations on CoD3's arms (tools/waw xanim.py / wawpose.py / make_flame_arms.py), the flame starting at the nozzle as the game draws it (the M2 draw's own constants), the gun drawn over its flame (stencil mask), others' flames in the world (fading with distance, hidden behind walls), WaW's overheating instead of a reload (heat bar over the ammo box), damage 26. UAV: an oval fitted to the map and to the draw distance (Isle 3113 x 1722). Next: the user plays 0.5.725, then CoD2's scoped Mosin-Nagant (plan in CLAUDE-SESSION-2026-11-01.md), Webley fingers, Seelow. Open: grey wall puffs with the M2; Isle deathmatch's closed gates (a smaller layout? not checked).
+<!-- /claude-2026-11-01-night-handoff -->
+
+<!-- claude-2026-11-01-evening-handoff -->
+**Claude handoff 2026-11-01 ~18:40 (source and install 0.5.702, built OK; Carentan installed as set P; nothing committed; friend zip on hold): read docs/CLAUDE-SESSION-2026-11-01-evening.md FIRST (whole file is the handoff).** Done today: Webley + flamethrower kill-feed icons; Carentan: CoD2-exact lightmaps, Rouen collision/props/trees/grass removed (renamed files are still loaded: drop them from the directory), floor gaps fixed (266 CoD2 triangles rebuilt), white-outs fixed (BSP leaves -> one cell), black walls fixed (decals on e_decal, drawn after walls; additive decals out). User: "the walls look perfect now". Open: the player "frozen" spot at -689 1601 (0.5.702 logs "player still"), check the last test's 23 low-triangle seconds, then flamethrower / Seelow / scoped Mosin.
+<!-- /claude-2026-11-01-evening-handoff -->
+
+<!-- claude-2026-11-01-handoff -->
+**Claude handoff 2026-11-01 ~10:30 (source and install 0.5.689, built; nothing committed): read the top section of docs/CLAUDE-SESSION-2026-11-01.md first ("END OF SESSION HANDOFF").** Carentan (CoD2's real map, its own map, never a Rouen reskin): collision converted and proven in game; the drawn level converts (tools/cod2import/cod2cells.py) and IS DRAWN in game in a scratch harness of the placeholder pack. One open bug: our own textures come out white (their imports never find them); 0.5.689's COD3_TEXLOOKUP=1 logs the texture handler and binds: run tools/carentan/runvariant.sh "" <case> with EXTRA_ENV="COD3_TEXLOOKUP=1" next (warn the user before any launch). Work data: D:\Call of Duty 3 (USA, Europe)\carentan-work\ (game data, not in git). The pack is back to its placeholder.
+<!-- /claude-2026-11-01-handoff -->
+
+<!-- codex-2026-10-30-handoff -->
+**Codex handoff 2026-10-30: source633; install0.5.632; 633 runtime UNTESTED.**
+Read [CODEX-SESSION-2026-10-30.md](CODEX-SESSION-2026-10-30.md).
+Root cause: Isle's mounted `mg42` animation entry shadows our handheld alias.
+633 scopes the MG34 override to handheld setup. Build status: building: 0.5.633 handheld MG42 animation-table collision fix; no test request.
+User requested wrap-up; all games stopped, original INI restored, no test queued.
+<!-- /codex-2026-10-30-handoff -->
+
 # CoD3 PC port: shared log between the two teams
 
 This file is how the two teams hand work to each other between builds. Each
@@ -92,6 +142,65 @@ The campaign guns in MP live in `CoD3Host/mp_fixes.cpp`:
   sound bank, the same way the Sten's came from `fuelplnt.wbk` (see its comment).
 
 ## LOG (newest first)
+
+### 2026-10-30 12:40: Team Justin (Claude), 0.5.633 MG42 validated
+
+- The handheld MG42 vanished on Isle because Isle has a mounted-gun `mg42` animation entry (13 items, none
+  resolved) that shadowed our MG34 alias (Codex found it; mp_fixes.cpp 0.5.633 scopes the override to the handheld
+  MG42's view and arms setup). Validated on Isle War: the gun and arms are drawn and fire, and the snapshot check
+  passes. Rouen control and the bots' third-person MG42 are still to check.
+
+### 2026-10-30 00:10: Team Justin (Claude, spectator side session), 0.5.622 to 0.5.631
+
+- Spectator: SPECTATOR is a fourth row of the team choice, drawn by the game (menu_mouse.cpp SeatEntry/SeatWidget);
+  the seat's HUD is off in the free camera and on while following someone (spectator.cpp).
+- Killcam (bots.cpp Killcam): its own clock (performance counter), the killer's eye blended and held in both cgame
+  snapshots, the HUD on. Explosions are still missing: not carried by the replayed objects.
+- Bots' grenades: the frag and smoke keys are 0x2 only (NadeButtonSearch); a wandering key threw extra grenades.
+- MG42 in first person is not drawn at all (no hands). Open; see docs/CLAUDE-SESSION-2026-10-30.md.
+- Co-op v40 (Team Friend's 0.5.920) is merged as 0.5.622, with Frank's campaign sprint; zips sent at 0.5.622.
+
+### MULTIPLAYER 0.5.426-0.5.478 (Team Justin, Claude, 2026-10-25): no co-op changes
+- coop.cpp untouched since v38 (0.5.425). Campaign builds get two shared host pieces ported from
+  FrankHUN88453's CoD3Recomp: 0.5.477 cpu_depth.cpp (lamp coronas fade behind walls: the depth resolve the
+  title reads on the CPU is written back through render_d3d11.cpp's WriteDepthBack) and 0.5.478
+  pc_prompts.cpp + render_prompts.cpp (button prompts drawn as key caps while keyboard/mouse was used last;
+  input.cpp Input::PadPrompts/MenuMode; setting button_prompts 0 auto, 1 pad, 2 keys).
+- Multiplayer only: public internet games (master list, 0.5.426-0.5.437), Hellfire Barrage killstreak,
+  lobby to 32, bots (War/CTF/SCTF/HQ, routing), killcam pool fixes (1 KB particle pool x8 in 0.5.476).
+- New tools: tools/mpmatch/mpmatch.py and addrvote.py find a SP function's / data address's MP twin.
+- Details: docs/CLAUDE-SESSION-2026-10-25.md; per version docs/PATCH-NOTES.md.
+
+### CO-OP TEST 9 (Team Justin, 2026-10-24): v38 on 0.5.425, island, host logs in coop-test-9-for-friend.zip
+- Both PCs on 0.5.425 (= your v38 coop.cpp + our read-only 0.5.316 mortar probe). Justin hosted over Tailscale.
+  Reported: the players out of sync; a mission restart made the joiner rewatch the film and start from the beginning.
+- Restart cause (host log + coop.cpp): the host restarted in place at 476 s, then relaunched at 522 s with 664
+  bytes of launch data (XamLoaderSetLaunchData). CoopBeforeRelaunch sends only CWX1; on the joiner both paths end
+  in `spmap <map>` (a fresh start, film included). The checkpoint / launch data never reaches the joiner.
+  Suggested: forward g_launchOut to the joiner and relaunch it the host's way (COD3_LAUNCHDATA) instead of spmap;
+  for the in-place restart, run what the host ran.
+- Desync: the joiner's stand-in on the host snapped 300-700 units off (51 s, 120 s, 170 s); the stuck guard
+  fired "5 times in 0.0 s" (its 2 s window reads 0.0 s); replaced 4 times. Network fine (delay 104-130 ms,
+  jitter 3-20 ms). Details: COOP-TEST-9-README.txt in the zip. Joiner's logs wanted back.
+
+### CO-OP v38 SOURCE (Team Friend, 2026-10-24): answers co-op test 8 (drops, grenades, shots, facing, bodies)
+- File: `CoD3Host/coop.cpp` only (campaign, `#ifndef COD3_MP`), on top of v36 (the co-op in 0.5.320..0.5.416).
+  Diff: `coop-v38-vs-v36.diff`. **New messages (CWG3, CWA1, CWI1): both PCs need the new build.**
+- Dropped weapons (type 2) and grenades (type 3) are no longer sent/paired/moved (test 8's spinning MP40s);
+  a dropped weapon picked up or cleared in one copy is deleted in the other (CWI1).
+- Grenades: CWG3 the frame one appears, with its own trajectory (entity +32 start, +44 speed); the other copy
+  throws one and writes the same +32/+44 (same arc). One-PC test: the joiner's came down 0-15 units from his
+  on the host. CWG2 (landing) moves it there if 80+ off once still; an early id is never thrown twice.
+- Soldiers' shots: hooked `sub_823ED9B8` (actor shoot; called only by the shoot builtins `sub_824B8FF8` /
+  `sub_824B9088`). Host sends each soldier shot (CWA1, his clock); joiner's paired soldiers fire only then, at
+  the display delay. The joiner's stand-in on the host fires only when the joining player does.
+- Facing: orientmode "face angle" written directly (actor +372 = 1, +376/+388 const at 0x82062C54, +380/+384
+  yaw): players' bodies face where the player looks; still soldiers face as the host's do.
+- Stuck guard (5 snaps in 2 s), unpaired host soldiers get one of the joiner's own unpaired soldiers (no
+  longer deleted: kept hidden below the level), then spawners of his kind / his side; MakeBody rotates
+  spawners; the joiner drains the film port every frame; "no body for the host" diagnostic.
+- Tested: two copies on one PC, Forest (soldiers ~3 units apart, 0 snaps, 0 unpaired, 400+ soldier shots
+  mirrored). UNTESTED between two PCs. Full notes: `COOP-V38-NOTES.txt`.
 
 ## 0.5.404-0.5.407 small CPU cuts and a heap freeze watch (Claude, 2026-10-23 19:55)
 

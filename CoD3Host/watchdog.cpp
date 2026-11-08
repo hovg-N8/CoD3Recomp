@@ -28,6 +28,10 @@
 #include <dbghelp.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+
+#ifdef COD3_MP
+void MpFixesHeapDump(uint8_t* base);   // mp_fixes.cpp, 0.5.556: the game heaps at a stall
+#endif
 #include <winternl.h>
 
 #pragma comment(lib, "dbghelp.lib")
@@ -202,6 +206,9 @@ namespace
                 Sampler::SampleNow();
                 DumpAllThreads();
                 Timeline::Report();
+#ifdef COD3_MP
+                ::MpFixesHeapDump(Guest::Base);   // 0.5.556
+#endif
                 fflush(stdout);
             }
 

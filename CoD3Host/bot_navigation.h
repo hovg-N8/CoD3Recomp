@@ -26,12 +26,14 @@ template<class Query> bool Flat(Point from, Point candidate, Query&& query, Poin
 // (normal 0.65 up or more), so cliffs and walls still stop it. And (0.5.206)
 // the height it gains or loses must match the tilt of the ground it lands
 // on: a flat-topped crate is a ledge, not a hill.
+// 0.5.578: `step` the piece length (48 as before, or 16: one stair at a
+// time, up to 12 pieces, the same 192 reach).
 template<class Query>
-bool Climb(Point from, Point candidate, Query&& query, Point& landing) {
+bool Climb(Point from, Point candidate, Query&& query, Point& landing, float step = 48.0f, int most = 4) {
     const float length = Distance(from, candidate);
     if (!(length > 1)) return false;
-    const int pieces = int(std::ceil(length / 48.0f));
-    if (pieces < 1 || pieces > 4) return false;
+    const int pieces = int(std::ceil(length / step));
+    if (pieces < 1 || pieces > most) return false;
     Point at = from;
     for (int i = 1; i <= pieces; ++i) {
         const float t = float(i) / float(pieces), piece = length / float(pieces);
@@ -39,13 +41,26 @@ bool Climb(Point from, Point candidate, Query&& query, Point& landing) {
         const float rise = 18.0f + piece * 1.0f, fall = 30.0f + piece * 1.0f;
         // Up first (the headroom), then across at that height, then down
         // onto the ground at the piece's end.
-        Point start{at.x, at.y, at.z + 1}, top{at.x, at.y, at.z + rise};
-        Hit up = query(start, top, true);
-        if (!up.valid || up.solid) return false;
-        top.z = start.z + (top.z - start.z) * up.fraction - 1;
-        if (top.z < start.z + 18.0f) return false;   // not even a stair of room
-        Hit across = query(top, {to.x, to.y, top.z}, true);
-        if (!across.valid || across.solid || across.fraction < 0.999f) return false;
+        // 0.5.700: lifted one stair (18, a player's step) first, the whole
+        // rise only if that is blocked: under a ceiling that follows a stair
+        // down (Carentan's cellar stairs at 400-552 1816, 6 up per 8 under the
+        // ground floor), the body raised 34 met the floor above, so the stairs
+        // were no way at all and bots stood on them for minutes.
+        const Point start{at.x, at.y, at.z + 1};
+        Point top = start;
+        bool passed = false;
+        for (const float lift : {18.0f, rise}) {
+            top = {at.x, at.y, start.z + lift};
+            const Hit up = query(start, top, true);
+            if (!up.valid || up.solid) return false;
+            top.z = start.z + lift * up.fraction - 1;
+            if (top.z < start.z + 16.0f) return false;   // not even a stair of room
+            const Hit across = query(top, {to.x, to.y, top.z}, true);
+            if (!across.valid || across.solid) return false;
+            if (across.fraction >= 0.999f) { passed = true; break; }
+            if (up.fraction < 0.999f) break;   // no more room above: the whole rise is no higher
+        }
+        if (!passed) return false;
         Hit floor = query({to.x, to.y, top.z}, {to.x, to.y, at.z - fall}, true);
         if (!floor.valid || floor.solid || floor.fraction >= 1 || !Finite(floor.end) ||
             !Finite(floor.normal) || floor.normal.z < 0.65f) return false;
@@ -71,7 +86,18 @@ template<class Query>
 bool Reachable(Point from, Point candidate, Query&& query, Point& landing) {
     if (!Finite(from) || !Finite(candidate)) return false;
     if (Flat(from, candidate, query, landing)) return true;
-    return Climb(from, candidate, query, landing);
+    // 0.5.591: up to 8 pieces (384; was 4, 192): route spots are looked for up
+    // to 350-400 off, and on a hill none that far was ever "walkable" (590's
+    // carriers on Rouen's middle, 100-600 x 400-1000: their feet traces met
+    // ground 0.90-0.99 up, the route "lost" every few seconds, 1511 times)
+    if (Climb(from, candidate, query, landing, 48.0f, 8)) return true;
+    // 0.5.578: stairs, a step at a time: a 48 piece over a flight of 8-16
+    // high steps rises 24-48 onto a flat tread, more than its 18 for a flat
+    // landing, so stairs were "not walkable". 577's tests: side 2's attackers
+    // held at the flag building at -1792 -91, whose floor (z 42) is about 35
+    // above the street (z 6-8), the step's hull meeting the risers (normal
+    // up 0). A crate higher than a stair still fails on the one piece.
+    return Climb(from, candidate, query, landing, 16.0f, 12);
 }
 
 template<class Query>

@@ -79,8 +79,14 @@ uint32_t MpSessionPlayerAddress(uint8_t* base, uint32_t source, uint32_t offset)
 #include "render_commands.h"   // 0.5.234: the death view's blur while down
 #include "input.h"    // 0.5.231: the photo tour presses A
 #include "sampler.h"  // 0.5.345: the killcam study names functions
+#include "spectator.h"   // 0.5.490: the spectator's calls in the killcam's hooks
+#include "imgui.h"       // 0.5.641: the pre-match count
+#include "flamethrower.h"   // 0.5.703: the view for flames drawn in the world
+#include "flare.h"          // 0.5.739: and for the signal flare's glow
+#include <cfloat>
 
 #include <windows.h>
+#include <dbghelp.h>   // 0.5.493: FlagTrap names the recompiled functions
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -100,6 +106,7 @@ void LobbyRulesTick(PPCContext& ctx, uint8_t* base);   // lobby_rules.cpp
 void MpFixesFrame(uint8_t* base);                      // mp_fixes.cpp
 void MpFixesAbilities(PPCContext& ctx, uint8_t* base);  // mp_fixes.cpp
 void MpFixesLauncher(PPCContext& ctx, uint8_t* base);   // mp_fixes.cpp
+void MpFixesKillcamFx(PPCContext& ctx, uint8_t* base, const float* at, const float* angles, const char* weapon, uint32_t event);   // mp_fixes.cpp (0.5.634)
 extern "C" PPC_FUNC(__imp__sub_825320D0);   // SV_SendClientSnapshot(client)
 extern "C" PPC_FUNC(__imp__sub_824D0AF0);
 extern "C" PPC_FUNC(__imp__sub_82487718);
@@ -107,6 +114,7 @@ extern "C" PPC_FUNC(__imp__sub_82483190);
 extern "C" PPC_FUNC(__imp__sub_824B4270);   // Pmove(pm)
 extern "C" PPC_FUNC(__imp__sub_8256B8E0);   // a player's muzzle point (entity, out)   // is an entity where it may move   // the move's scale (a command)   // spawn a player (handle, origin, angles, side)
 
+int MpFixesOwnSide();   // 0.5.540: (mp_fixes.cpp) the host's side from his kit, 0 unknown
 namespace
 {
     constexpr uint32_t Svs = 0x82B3FDE0;
@@ -143,7 +151,61 @@ namespace
     uint32_t g_thinkSlot = MaxClients;   // 0.5.143: the bot whose think runs
     // 0.5.151: War's flag in play (WatchWar), the bots' objective there.
     struct WarGoal { bool valid = false; float at[3] = {}; uint32_t index = 0, when = 0; };
-    WarGoal g_war;   // Respawn running: places left as it sets them
+    WarGoal g_war;
+    // 0.5.463: the other objective modes' objectives (WatchObjectives): every
+    // entity whose class name says flag, ctf, hq or radio, where it is now
+    // 0.5.476: out/live: a flag off its base (its prop 100 or more from where
+    // it stood: carried or dropped) and where it is now
+    struct ObjectiveGoals { bool valid = false; uint32_t when = 0; int count = 0; float at[8][3] = {}; char name[8][32] = {}; std::string mode; bool out[8] = {}; float live[8][3] = {}; };
+    ObjectiveGoals g_obj;   // Respawn running: places left as it sets them
+    // 0.5.475: CTF, each side's own flag (an index into g_obj; -1 not known),
+    // set once a map by CtfSpawnSides: the flag a side's game spawns are by is
+    // the enemy's (Justin: "the enemies spawn on our flag and we spawn on the
+    // enemies flag"), its own the other
+    int g_ctfOwn[3] = { -1, -1, -1 };
+    // 0.5.482: each CTF flag's real state, from FlagEntityWatch: carried (its
+    // model hidden under the map, z -9970; the carrier the nearest player when
+    // it went), dropped (its model shown away from its base) or home
+    int g_flagCarrier[2] = { -1, -1 };
+    bool g_flagDropped[2] = {};
+    float g_flagDropAt[2][3] = {};
+    // 0.5.582: ways out of each flag's base as players walked them (a spot a
+    // half second, from within 200 of the flag till 650 out; the last 16 a
+    // flag), for attackers to walk in by backwards (MapKnowledgeTick records,
+    // the route takes one within 700 of the enemy flag)
+    std::vector<BotNavigation::Point> g_flagTrails[2][16];
+    int g_flagTrailNext[2] = {};
+    // 0.5.585: kept for the next games on the map (583-584: side 2's base had
+    // 0-3 by the time its flag was taken); read in as g_trailsLoaded, put to
+    // their flag (the one within 350 of their start) once the flags are known
+    std::vector<std::vector<BotNavigation::Point>> g_trailsLoaded;
+    bool g_trailsChanged = false;
+    std::vector<BotNavigation::Point> g_trail[MaxClients];   // 0.5.522 (BotTrail; moved up 0.5.589)
+    // 0.5.483: the point Think steers a bot to (after the route), for a
+    // flag carrier's legs (CarrierHome)
+    float g_steer[MaxClients][3] = {};
+    uint8_t g_flagUseMode[MaxClients] = {};   // 0.5.484: 1 X alone, 2 X with activate (BotFlagUse)
+    uint32_t g_portMovedAt[MaxClients] = {};  // 0.5.484: when CtfSpawnSides last teleported him
+    // 0.5.487: a take's proof for ctf-flags.txt (FlagEntityWatch sets, CtfSpawnSides saves)
+    uint32_t g_ctfProvenSide = 0; int g_ctfProvenFlag = -1; bool g_ctfSweepDue = false;
+    bool g_ctfPadAssist = false;
+    int g_captureTry = -1;   // 0.5.523: which capture request a bot made last (BotFlagClaim)
+    bool g_ctfAttacker[MaxClients] = {};
+    bool g_ctfOwnLegs[MaxClients] = {};   // 0.5.541: Think's CTF squad, escort or cover hold steers him (AttackerRoute stays out)
+    bool g_ctfHold[MaxClients] = {};      // 0.5.541: a defender at his place, watching (Think)
+    float g_ctfWatchYaw[MaxClients] = {}; // 0.5.541: the way he watches (degrees)
+    const char* g_why[MaxClients] = {};       // 0.5.546: which of Think's ways out he took (the ctftrace line)
+    const char* g_ctfDoing[MaxClients] = {};  // 0.5.546: his CTF role's errand this frame (ctftrace)
+    char g_pickInfo[MaxClients][96] = {};     // 0.5.551: the learnt route's spot he steers to (ctftrace)
+    const char* g_routeStart[MaxClients] = {}; // 0.5.553: how his route's start was chosen (ctftrace)
+    const char* g_routeRedo[MaxClients] = {};  // 0.5.562: why his route was last worked out (ctftrace)
+    int g_ctfLane[MaxClients] = {};            // 0.5.564: a CTF attacker's lane: -1 left, 0 middle, +1 right of the way between the flags
+    uint32_t g_revivedAt[MaxClients] = {};   // 0.5.544: when a medic last stood him up (CtfSpawnSides leaves him there)
+    bool g_dropPending[MaxClients] = {};   // 0.5.538: a dead carrier's flag to drop (FlagEntityWatch -> CarrierUnstick)   // 0.5.536: his CTF role is to take the enemy flag (Think)
+    int g_ctfTrialBot = -1; uint32_t g_ctfTrialUntil = 0;   // 0.5.497: CtfTakeProbe's bot trial (FeedBots freezes him)
+    std::vector<uint32_t> g_flagModels;
+    std::vector<uint32_t> g_flagTriggers;   // 0.5.512: the flags' trigger_multiples (FlagEntityWatch), for FlagTrap   // 0.5.493: the flags' script_models (FlagEntityWatch), for FlagTrap   // 0.5.492: the unattended test tapping the local pad's X for a bot
+    bool g_steerValid[MaxClients] = {};
     uint32_t ReservePlace(uint32_t slot)
     {
         if (g_placeIndex[slot] != 0) return g_placeIndex[slot];
@@ -170,12 +232,17 @@ namespace
     }
     bool g_firing[MaxClients] = {};   // the bot wants his weapon to fire this frame
     float g_wantYaw[MaxClients] = {}, g_wantPitch[MaxClients] = {};   // where his brain wants to look
+    uint32_t g_engagedAt[MaxClients] = {};   // 0.5.456: when he first saw the one he shoots at (his aim settles from then)
+    bool g_adsNow[MaxClients] = {};          // 0.5.456: his sights are up
     uint32_t g_reviveTarget[MaxClients] = {};
     float g_deadAt[MaxClients][3] = {};   // 0.5.224: where each player fell (BotRevive)   // 0.5.216: a medic's body to revive (slot + 1; 0 none)
     // 0.5.216: a medic bot on his way to this slot's body (dead players wait for him).
     bool MedicComing(uint32_t slot) { for (uint32_t s = 0; s < ActiveSlots(); s++) if (g_reviveTarget[s] == slot + 1) return true; return false; }
     int g_age[MaxClients] = {};   // frames since the bot was added
     float g_yaw[MaxClients] = {};
+    uint32_t g_lookVehicleUntil[MaxClients] = {};   // 0.5.843: LookAtVehicle has his facing until then
+    float g_vehicleGoal[MaxClients][3] = {};        // 0.5.849: the tank he walks to (its rear corner),
+    uint32_t g_vehicleGoalAt[MaxClients] = {};      // set each frame by the vehicle code (real-time ms)
     int g_bots = 0;
     // 0.5.168: Justin wants a mix of bots. Each bot is given a role when
     // added: Objective (plays War's / Domination's flag), Rusher (runs at
@@ -531,7 +598,31 @@ namespace
     uint32_t Side(uint8_t* base, uint32_t entity)
     {
         const uint32_t team = entity ? Guest::Read32(base, entity + 520) : 0;
-        return team ? Guest::Read32(base, team + 4) : 0;
+        const uint32_t read = team ? Guest::Read32(base, team + 4) : 0;
+        // 0.5.542: the host's side is his entity's team once it has held 2 s
+        // (539: it read 2 at his CTF spawns while he was on 1). 540's kit
+        // (American = 1) was wrong on Rouen (541: team 1, kit 2: his own bots
+        // shot him, he was put by the enemy flag)
+        const uint32_t list = entity ? Guest::Read32(base, EntityList) : 0;
+        // 0.5.544: a bot's side is the one he was given: his team read is the
+        // other one at the moment he spawns (542/543: 46 of 71 spawns), and the
+        // UAV check had it equal to the given one the rest of the time
+        for (uint32_t o = 1; list && o < MaxClients; o++)
+            if (g_bot[o] && (g_botSide[o] == 1 || g_botSide[o] == 2) && Guest::Read32(base, list + 4 * (o + 1)) == entity) return g_botSide[o];
+        if (list && entity == Guest::Read32(base, list + 4) && (read == 1 || read == 2))
+        {
+            static uint32_t stable = 0, pending = 0, pendingSince = 0;
+            const uint32_t now = GetTickCount();
+            if (read == stable) pending = 0;
+            else if (read != pending) { pending = read; pendingSince = now; }
+            else if (now - pendingSince >= 2000)
+            {
+                printf("bots: the host's side: %u (was %u; held 2 s)\n", read, stable); fflush(stdout);
+                stable = read; pending = 0;
+            }
+            return stable ? stable : read;
+        }
+        return read;
     }
 
     // Each bot owns a stable side. New bots join the smaller team,
@@ -949,6 +1040,26 @@ namespace
             const uint32_t sessionPlayer=SessionPlayer(base,BotSlot(base,entity));
             if (team) Guest::Write32(base,team+4,side);
             if (sessionPlayer) Guest::Write16(base,sessionPlayer+604,uint16_t(side));
+            // 0.5.506: COD3_BOT_SIDE_CALLBACK=1: the game's side callback too
+            // (Callbacks +3320, as the menu path below), so the SCRIPT knows his
+            // team (its join-team logic). Skipped, a bot has no script team, and
+            // CTF's script refuses him the flag (488-505: bots touch the right
+            // flag, its trigger records them, never given it; the host is).
+            static const bool scriptSide = [] { const char* e = getenv("COD3_BOT_SIDE_CALLBACK"); return e && e[0] == '1'; }();
+            if (scriptSide)
+            {
+                const uint32_t scratch = (ctx.r1.u32 - 0x200) & ~0xFu;
+                Guest::Write32(base, scratch, Guest::Read32(base, entity + 484));
+                const uint32_t object = Guest::Read32(base, Callbacks);
+                const uint32_t callback = object ? Guest::Read32(base, object + 3320) : 0;
+                printf("bots: server-only side %u, entity %08X, session %08X; the script's side callback %08X called (COD3_BOT_SIDE_CALLBACK)\n", side, entity, sessionPlayer, callback);
+                fflush(stdout);
+                // 0.5.508: (handle, 1, 1) as the game's own menu (sub_8239FB10)
+                // calls it; 507's (.., 1, 0) took the callback's other branch
+                // and changed nothing either
+                if (callback != 0) Call(ctx, base, callback, scratch, 1, 1);
+                return;
+            }
             printf("bots: server-only side %u, entity %08X, session %08X; menu callback skipped\n",side,entity,sessionPlayer);
             fflush(stdout);
             return;
@@ -1056,6 +1167,80 @@ namespace
         LogWhere(base, "before", 0, entity);
         Call(ctx, base, SpawnAtPoint, scratch, scratch + 8);
         LogWhere(base, "after", 0, entity);
+        // 0.5.464: not into the enemy's sights (Justin: "the enemy bots all kept
+        // seeming to spawn in one area ... they just beamed me everytime";
+        // 0.5.463's CTF on Rouen had most bots of both sides spawn in the map's
+        // middle, around 0..750, the CTF bases far from it): with a living enemy
+        // within 1200 of where the game put him, he is moved (the game's own
+        // teleport, sub_8255E118, as the return point's) to his side's spawn
+        // point (a spawn entity named for allies or axis; any spawn when the map
+        // has none) farthest from every living enemy.
+        if (const uint32_t record = Guest::Read32(base, entity + 512))
+        {
+            auto writeF = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+            const uint32_t entities = Guest::Read32(base, EntityList);
+            const uint32_t mySide = Side(base, entity);
+            std::vector<std::array<float, 3>> enemies;
+            for (uint32_t o = 0; entities && o < ActiveSlots(); o++)
+            {
+                const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+                const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+                if (!r || e == entity || int32_t(Guest::Read32(base, r + 304)) <= 0) continue;
+                const uint32_t s = Side(base, e);
+                if (s == mySide && s != 0) continue;
+                enemies.push_back({ ReadFloat(base, r), ReadFloat(base, r + 4), ReadFloat(base, r + 8) });
+            }
+            auto nearestEnemy = [&](float x, float y) {
+                float best = 1e30f;
+                for (const auto& p : enemies) best = std::min(best, hypotf(p[0] - x, p[1] - y));
+                return best;
+            };
+            const float x = ReadFloat(base, record), y = ReadFloat(base, record + 4);
+            // 0.5.558: not in CTF, where CtfSpawnSides puts every spawn by his
+            // own flag. 557's self-test: every bot's first life (24 of 24) ended
+            // at the ENEMY flag's end, later lives 55 of 55 at his own: at the
+            // start each side stands at the other's end (the port spawns bots by
+            // the wrong one, 0.5.545), so every bot was "near an enemy" and this
+            // moved him to "his side's spawn" by the allies/axis names, the wrong
+            // end again, undoing the CTF move (user: "they are all grouped on
+            // our flag").
+            const bool ctfNow = g_obj.valid && GetTickCount() - g_obj.when < 10000 && g_obj.mode.find("ctf") != std::string::npos && g_ctfOwn[1] >= 0;
+            if (!ctfNow && !enemies.empty() && std::isfinite(x) && nearestEnemy(x, y) < 1200.0f)
+            {
+                const char* const sideWord = allies ? "allies" : "axis";
+                float best[3] = {}, bestD = -1.0f, anyBest[3] = {}, anyD = -1.0f;
+                for (uint32_t i = 0; i < 4096; i++)
+                {
+                    const uint32_t e = Guest::Read32(base, 0x82BD1FC0 + 8 * i);
+                    if (e < 0x40000000u || e >= 0xA0000000u) continue;
+                    const uint32_t cls = Guest::Read32(base, e + 548);
+                    if (cls < 0x40000000u || cls >= 0xA0000000u) continue;
+                    char name[40] = {};
+                    for (int c = 0; c < 39; c++) { const char ch = char(Guest::Read8(base, cls + 12 + c)); if (!ch) break; name[c] = char(tolower(static_cast<unsigned char>(ch))); }
+                    if (!strstr(name, "spawn") || strstr(name, "intermission")) continue;
+                    const float p[3] = { ReadFloat(base, e + 336), ReadFloat(base, e + 340), ReadFloat(base, e + 344) };
+                    if (!std::isfinite(p[0]) || fabsf(p[0]) > 60000.0f) continue;
+                    const float d = nearestEnemy(p[0], p[1]);
+                    if (d > anyD) { anyD = d; memcpy(anyBest, p, sizeof(p)); }
+                    if (strstr(name, sideWord) && d > bestD) { bestD = d; memcpy(best, p, sizeof(p)); }
+                }
+                const float* to = bestD >= 0.0f ? best : anyD >= 0.0f ? anyBest : nullptr;
+                const float toD = bestD >= 0.0f ? bestD : anyD;
+                if (to && toD > nearestEnemy(x, y) + 300.0f)
+                {
+                    static uint32_t position = 0;
+                    if (!position) position = Guest::AllocatePhysical(0x20);
+                    writeF(position, to[0]); writeF(position + 4, to[1]); writeF(position + 8, to[2] + 1.0f);
+                    PPCContext place = ctx;
+                    place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+                    place.r3.u64 = entity; place.r4.u64 = position; place.lr = 0;
+                    Guest::Lookup(0x8255E118)(place, base);
+                    for (int k = 0; k < 3; k++) writeF(record + 16 + 4 * k, 0.0f);
+                    static int told = 0;
+                    if (told++ < 60) { printf("bots: slot %u spawned %.0f from an enemy: moved to his side's spawn at %.0f %.0f (%.0f from one)\n", botSlot, nearestEnemy(x, y), to[0], to[1], toD); fflush(stdout); }
+                }
+            }
+        }
         if (botSlot < MaxClients) g_botLife[botSlot]++;   // 0.5.207
         // 0.5.168: back in play (the 4 he was given dead is not undone by
         // the spawn itself, in case).
@@ -1132,6 +1317,7 @@ namespace
 // the game's frame): ClientThink (sub_82593518) on the bot's entity handle,
 // with the game's current client number (0x82BCBE9C, which SV_GetUsercmd
 // reads) the bot's while it runs.
+static uint32_t OwnedFlagWeapon(uint8_t* base, uint32_t record);   // 0.5.530: (below) for the bots' firing
 namespace
 {
     constexpr uint32_t ClientThink = 0x82593518;
@@ -1263,7 +1449,11 @@ namespace
             // 125 ms, that is called for him with the gate open just for it.
             static uint32_t lastShot[MaxClients] = {};
             const uint32_t nowMs = GetTickCount();
-            if (g_firing[slot] && nowMs - lastShot[slot] >= 125 && !(DebugProbe::BotButtons() & 0x0100))
+            // 0.5.530: never with a flag (firing it DROPS it: 529's carriers by
+            // their own flag dropped it from sub_82590C30, the server's fire)
+            const uint32_t fireRecord = Guest::Read32(base, entity + 512);
+            const bool holdsFlag = fireRecord && OwnedFlagWeapon(base, fireRecord) != 0;
+            if (g_firing[slot] && !holdsFlag && nowMs - lastShot[slot] >= 125 && !(DebugProbe::BotButtons() & 0x0100))
             {
                 lastShot[slot] = nowMs;
                 const uint32_t clients = Clients(base);
@@ -1282,7 +1472,12 @@ namespace
                 if (record)
                 {
                     saved[0] = ReadFloat(base, record + 204); saved[1] = ReadFloat(base, record + 208);
-                    const float spread = 2.5f;
+                    // 0.5.456: loose at first, settling over 1.2 s (6 to 2 degrees),
+                    // 1.5 more from the hip (Justin: "they seem to just lock on
+                    // and beam me without me standing a chance"; was 2.5 always)
+                    const uint32_t since = GetTickCount() - g_engagedAt[slot];
+                    const float settle = since >= 1200u ? 0.0f : 1.0f - float(since) / 1200.0f;
+                    const float spread = 2.0f + 4.0f * settle + (g_adsNow[slot] ? 0.0f : 1.5f);
                     const float pitch = g_wantPitch[slot] + (float(rand() % 2001) / 1000.0f - 1.0f) * spread;
                     const float yaw = g_wantYaw[slot] + (float(rand() % 2001) / 1000.0f - 1.0f) * spread;
                     uint32_t bits;
@@ -1388,7 +1583,8 @@ static const NadeKind& NadeKindOf(uint8_t* base, uint32_t w, uint32_t text)
     memcpy(kind.name, raw, sizeof(raw));
     char name[40] = {};
     for (int c = 0; c < 39 && raw[c]; c++) name[c] = char(tolower(raw[c]));
-    kind.smoke = strstr(name, "smoke") != nullptr;
+    // 0.5.739: World at War's signal flare is thrown as the smoke is (its copy, in its place)
+    kind.smoke = strstr(name, "smoke") != nullptr || strstr(name, "flare") != nullptr;
     kind.nade = kind.smoke || strstr(name, "grenade") || strstr(name, "nade") || strstr(name, "mills") || strstr(name, "frag") ||
         strstr(name, "stiel") || strstr(name, "sticky") || strstr(name, "mk2") || strstr(name, "m24");
     kind.rg = strstr(name, "_rg") != nullptr;
@@ -1405,7 +1601,7 @@ static uint32_t BotNadeAmmo(uint8_t* base, uint32_t record, bool smoke)
         const uint32_t def = Guest::Read32(base, list + 4 * w);
         if (def < 0x40000000u || def >= 0xA0000000u) continue;
         const uint32_t text = Guest::Read32(base, def + 8);
-        if (text < 0x40000000u || text >= 0xA0000000u) continue;
+        if (text < 0x40000000u || text >= 0xC0000000u) continue;   // (0.5.757: copies' names lie at 0xAA..)
         const NadeKind& kind = NadeKindOf(base, w, text);
         if (!kind.nade || kind.smoke != smoke) continue;
         const uint32_t clip = Guest::Read32(base, def + 1468), spare = Guest::Read32(base, def + 1460);
@@ -1420,29 +1616,40 @@ struct NadeButtonSearch
     const char* what;
     uint32_t candidates[4];
     int tried = 0;           // index of the candidate now on trial
+    int misses = 0;          // 0.5.629: its misses in a row
     uint32_t found = 0;      // the bit that spent one (0: still looking)
     uint32_t checkAt[32] = {}, before[32] = {}, bit[32] = {};
     uint32_t Next(uint32_t slot, uint32_t now, uint32_t ammo, uint32_t avoid)
     {
         uint32_t b = found;
         if (!b) { for (int n = 0; n < 4 && ((candidates[tried % 4] & avoid) || !candidates[tried % 4]); n++) tried++; b = candidates[tried % 4]; }
-        if (slot < 32) { checkAt[slot] = now + 1500; before[slot] = ammo; bit[slot] = b; }
+        if (slot < 32) { checkAt[slot] = now + 3000; before[slot] = ammo; bit[slot] = b; }
         return b;
     }
     void Check(uint32_t slot, uint32_t now, uint32_t ammo)
     {
         if (slot >= 32 || !checkAt[slot] || now < checkAt[slot]) return;
-        const bool late = now > checkAt[slot] + 1000;   // he was dead or away in between: not a fair trial
+        const bool late = now > checkAt[slot] + 1500;   // he was dead or away in between: not a fair trial
         checkAt[slot] = 0;
         if (late || ammo > before[slot]) return;
         static int told = 0;
         if (ammo < before[slot])
         {
+            misses = 0;
             if (!found) { found = bit[slot]; printf("bots: %s button found: %08X (slot %u, ammo %u -> %u)\n", what, found, slot, before[slot], ammo); fflush(stdout); }
         }
         else if (!found && bit[slot] == candidates[tried % 4])
         {
-            if ((told < 40 && told++ < 40)) { printf("bots: %s button %08X spent nothing (slot %u, ammo %u); trying the next\n", what, bit[slot], slot, ammo); fflush(stdout); }
+            // 0.5.629 (the user: bots "throwing more then one grenade at a time,
+            // including smokes"). 628's play: slot 5's sticky (0x2) went
+            // off 1.3 s after its press (the game's throw events), after the
+            // 1.5 s check: "spent nothing", and every bot's frags went to 0x80;
+            // slot 8's smoke the same. A press then threw the other kind or
+            // one more. The check is at 3 s now, and a key is given up only
+            // after two misses in a row (any spend between: kept).
+            if (++misses < 2) { if ((told < 40 && told++ < 40)) { printf("bots: %s button %08X spent nothing (slot %u, ammo %u); once more before the next\n", what, bit[slot], slot, ammo); fflush(stdout); } return; }
+            misses = 0;
+            if ((told < 40 && told++ < 40)) { printf("bots: %s button %08X spent nothing twice (slot %u, ammo %u); trying the next\n", what, bit[slot], slot, ammo); fflush(stdout); }
             tried++;
         }
         else if (found && told++ < 40) { printf("bots: %s with %08X spent nothing (slot %u, ammo %u)\n", what, bit[slot], slot, ammo); fflush(stdout); }
@@ -1454,8 +1661,39 @@ struct NadeButtonSearch
 // sent 0x2 with their gun's number (and sprint) and spent nothing. So 0x2
 // comes first for both, and the first two commands of a bot's throw carry
 // the grenade's number (g_throwWeapon, set from his kit).
-static NadeButtonSearch g_fragSearch{ "frag", { 0x2u, 0x80u, 0x4000u, 0x8000u } };
-static NadeButtonSearch g_smokeSearch{ "smoke", { 0x2u, 0x8000u, 0x4000u, 0x80u } };
+// 0.5.454: only the two grenade keys (0x2, 0x80) are tried: 0.5.453's test had
+// the smoke search gone on to 0x8000 after a sticky (not counted as a smoke)
+// went with 0x2, and every bot then pressed that.
+// 0.5.631: every log kept (play and tests, 10-23 to 10-30): the frag key found was
+// 0x2 nearly always, the smoke key 0x2 too (and the host's own smoke); the few
+// 0x80 / 0x4000 / 0x8000 "found" came while the search wandered (spends of other
+// throws, "4 -> 0"), and a wandering key threw a second grenade (the user: "more
+// then one grenade at a time, including smokes"). Both are 0x2 only; the weapon
+// named in the throw's first command picks frag or smoke.
+static NadeButtonSearch g_fragSearch{ "frag", { 0x2u, 0u, 0u, 0u } };
+static NadeButtonSearch g_smokeSearch{ "smoke", { 0x2u, 0u, 0u, 0u } };
+// 0.5.454: a bot's last throw of any grenade (Justin: "when bots throw smokes
+// or sticky grenades its like they throw multiple at a time"): none again
+// for 2.5 s, and each press is 200 ms (was 350)
+static uint32_t g_lastThrowAt[32] = {};
+constexpr uint32_t ThrowGapMs = 2500, ThrowPressMs = 200;
+// 0.5.608: and one throw a side every 3 s within 900 of its last (the user:
+// "when bots throw smokes or grenades like stickys they throw multiple";
+// 0.5.454's gap was each bot's own: 607's 8-bot test had a side's whole wave,
+// slots 4, 6, 8 and 10, throw smoke in the same instant as it went in)
+constexpr uint32_t SideThrowGapMs = 3000;
+static uint32_t g_sideThrowAt[3] = {};
+static float g_sideThrowPos[3][2] = {};
+static bool SideThrowFree(uint32_t side, float x, float y, uint32_t now)
+{
+    if (side < 1 || side > 2 || g_sideThrowAt[side] == 0) return true;
+    return now - g_sideThrowAt[side] >= SideThrowGapMs || hypotf(x - g_sideThrowPos[side][0], y - g_sideThrowPos[side][1]) > 900.0f;
+}
+static void SideThrew(uint32_t side, float x, float y, uint32_t now)
+{
+    if (side < 1 || side > 2) return;
+    g_sideThrowAt[side] = now; g_sideThrowPos[side][0] = x; g_sideThrowPos[side][1] = y;
+}
 // 0.5.220: 0.5.219's traces: the bot's throw started (record +168 went to 2,
 // as the host's does) and was cancelled two commands later: the bot pressed
 // the stance key (0x2000) with it and sprint (0x4) right after, where the
@@ -1476,13 +1714,21 @@ static uint32_t BotNadeWeapon(uint8_t* base, uint32_t record, bool smoke)
         const uint32_t def = Guest::Read32(base, list + 4 * w);
         if (def < 0x40000000u || def >= 0xA0000000u) continue;
         const uint32_t text = Guest::Read32(base, def + 8);
-        if (text < 0x40000000u || text >= 0xA0000000u) continue;
+        if (text < 0x40000000u || text >= 0xC0000000u) continue;   // (0.5.757: copies' names lie at 0xAA..)
         const NadeKind& kind = NadeKindOf(base, w, text);
         if (!kind.nade || kind.smoke != smoke || kind.rg) continue;
+        // 0.5.740: only one he owns (his 64-bit weapons mask, +1056): the signal
+        // flare shares the smoke's rounds, and 0.5.739's bots named the smoke
+        // they no longer had (the lower number) and threw smoke
+        if (w < 64 && !((Guest::Read32(base, record + 1056 + 4 * (w >> 5)) >> (w & 31)) & 1)) continue;
         const uint32_t clip = Guest::Read32(base, def + 1468), spare = Guest::Read32(base, def + 1460);
         if (clip > 128 || spare > 128) continue;
         uint32_t ammo = Guest::Read32(base, record + 4 * (172 + clip));
         if (spare != clip) ammo += Guest::Read32(base, record + 4 * (80 + spare));
+        // 0.5.756: the signal flare first when he has it (its rounds are the
+        // smoke's pool: 755's flare-bots named another smoke-kind of the same
+        // pool, and nothing went)
+        if (smoke && ammo > 0 && Guest::Read8(base, text) == 's' && Guest::Read8(base, text + 1) == 'i') return w;
         if (ammo > bestAmmo) { bestAmmo = ammo; best = w; }
     }
     return best;
@@ -1673,6 +1919,8 @@ struct BotTacticalState {
     uint32_t navChecked=0,nextJump=0,jumpUntil=0,jumpPulse=0,ladderUntil=0,ladderProgress=0,ladderCooldown=0;
     float ladderHeight=0;
     bool climbing=false,jumpPending=false;
+    const char* stepWhy="none";   // 0.5.548: how the step was chosen (ctftrace)
+    char blockWhy[120]="";        // 0.5.549: why the direct step was not reachable, the last time (ctftrace)
 };
 static BotTacticalState g_tactical[MaxClients];
 // 0.5.195: where each bot failed to get past something, kept across his
@@ -1739,6 +1987,77 @@ static bool SpawnCentre(uint32_t side, BotNavigation::Point& out)
     out = { float(x / n), float(y / n), float(z / n) };
     return true;
 }
+// 0.5.501: who really carries a flag: the game gives the carrier a flag
+// weapon (mp_flag, mp_flag_axis, mp_flag_allies, by name in the weapon list);
+// the owner's bit in +1056 says who. 498's "a bot took it" was credited by
+// distance (the nearest), with the idle host 39 away taking flags himself.
+// 0.5.526: the flag weapon (mp_flag, mp_flag_axis, mp_flag_allies) a player
+// owns, 0 for none
+static uint32_t OwnedFlagWeapon(uint8_t* base, uint32_t record)
+{
+    static int ids[3] = { -1, -1, -1 };
+    if (ids[0] < 0)
+    {
+        const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+        const uint32_t wlist = Guest::Read32(base, 0x82BCBF9C);
+        int n = 0;
+        for (int32_t k = 1; wlist && k <= count && k < 128 && n < 3; k++)
+        {
+            const uint32_t def = Guest::Read32(base, wlist + 4 * uint32_t(k));
+            if (!def) continue;
+            const uint32_t text = Guest::Read32(base, def + 8);
+            char name[24] = {};
+            for (int c = 0; c < 23 && text; c++) { name[c] = char(Guest::Read8(base, text + c)); if (!name[c]) break; }
+            if (strncmp(name, "mp_flag", 7) == 0) ids[n++] = k;
+        }
+        if (n == 0) return 0;
+    }
+    for (int i = 0; i < 3; i++)
+        if (ids[i] > 0 && (Guest::Read32(base, record + 1056 + 4 * (uint32_t(ids[i]) >> 5)) & (1u << (ids[i] & 31)))) return uint32_t(ids[i]);
+    return 0;
+}
+// 0.5.520: the holder of ONE flag's weapon (by name): 519 took the first
+// holder of any flag weapon, so one flag's take went to the other's carrier,
+// and the "sides corrected by a take" then swapped the sides. Taking side
+// 2's flag gives mp_flag_allies (34; 516-519), so side 1's is mp_flag_axis.
+static int FlagWeaponHolder(uint8_t* base, const char* want, uint32_t* weaponOut = nullptr)
+{
+    const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+    const uint32_t wlist = Guest::Read32(base, 0x82BCBF9C);
+    int id = -1;
+    for (int32_t k = 1; wlist && k <= count && k < 128 && id < 0; k++)
+    {
+        const uint32_t def = Guest::Read32(base, wlist + 4 * uint32_t(k));
+        if (!def) continue;
+        const uint32_t text = Guest::Read32(base, def + 8);
+        char name[24] = {};
+        for (int c = 0; c < 23 && text; c++) { name[c] = char(Guest::Read8(base, text + c)); if (!name[c]) break; }
+        if (strcmp(name, want) == 0) id = k;
+    }
+    if (id < 0) return -1;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    for (uint32_t o = 0; list && o < ActiveSlots() && o < MaxClients; o++)
+    {
+        const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+        const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+        if (r && int32_t(Guest::Read32(base, r + 304)) > 0 && (Guest::Read32(base, r + 1056 + 4 * (uint32_t(id) >> 5)) & (1u << (id & 31))))
+        { if (weaponOut) *weaponOut = uint32_t(id); return int(o); }
+    }
+    return -1;
+}
+// 0.5.482: where flag k is when it is not home (its carrier, or where it lies)
+static bool FlagAway(uint8_t* base, int k, float out[3])
+{
+    if (k < 0 || k > 1) return false;
+    if (g_flagDropped[k]) { memcpy(out, g_flagDropAt[k], 12); return true; }
+    if (g_flagCarrier[k] < 0) return false;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t e = list ? Guest::Read32(base, list + 4 * (uint32_t(g_flagCarrier[k]) + 1)) : 0;
+    const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+    if (!r) return false;
+    out[0] = ReadFloat(base, r); out[1] = ReadFloat(base, r + 4); out[2] = ReadFloat(base, r + 8);
+    return true;
+}
 bool BotsScopedWeapon(uint8_t* base, uint32_t def);
 static uint32_t HeldDef(uint8_t* base, uint32_t record)
 {
@@ -1788,6 +2107,18 @@ static bool g_lookoutsChanged = false;
 bool KillcamModelOk(uint8_t* base, uint32_t model);   // 0.5.365, defined by the vehicle probe
 namespace Killcam
 {
+    // 0.5.628 (user: "the killcams ... still are a little bouncy", "solid camera
+    // pisitionings instead of the jumping back and forth"): the killcam's clock
+    // was GetTickCount64, which steps every 15.6 ms: samples (a server frame,
+    // 15 ms, apart) shared a time or skipped one, and the replay's moment held
+    // for frames then jumped. Its own clock now: the performance counter, in ms.
+    uint64_t Ms()
+    {
+        static const double perMs = []() { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return double(f.QuadPart) / 1000.0; }();
+        static const LONGLONG origin = []() { LARGE_INTEGER c; QueryPerformanceCounter(&c); return c.QuadPart; }();
+        LARGE_INTEGER c; QueryPerformanceCounter(&c);
+        return uint64_t(double(c.QuadPart - origin) / perMs) + 100000u;
+    }
     struct Eye { float x, y, z, pitch, yaw; bool on; };
     struct Sample { uint64_t t; Eye eye[32]; };
     constexpr int Samples = 400;          // 0.5.346: 4.8 s at a sample a server frame (15 ms); 256 was 3.8 s, short of the 4 s played; 0.5.360: 400 (6 s): 4 s before + 1.5 s after the death
@@ -2116,7 +2447,7 @@ namespace Killcam
         const int v = ClientOfEntity(base, victim), a = ClientOfEntity(base, attacker);
         if (v != 0 || a <= 0) return;   // only this machine's player, killed by another player
         g_killer = a;
-        g_deathAt = GetTickCount64();
+        g_deathAt = Ms();
         g_armed = true;
         g_playing = false;
         printf("killcam: this player killed by client %d: the killcam is ready\n", a);
@@ -2139,12 +2470,16 @@ namespace Killcam
     bool Replaying() { return On() && ReplayOn() && g_playing && g_killer > 0 && g_killer < 32; }
     bool ListSwapOn() { static const bool on = []() { const char* t = getenv("COD3_KILLCAM_AS_KILLER"); return !(t && t[0] == '0'); }(); return on; }
     constexpr uint32_t Cg = 0x82C7D490u, CgSize = 6368u, LocalClient = 0x82BCBE9Cu;
+    bool EyeBlendOn();   // 0.5.628 (below)
+    bool BlendPs(int who, uint64_t t, uint8_t* out, bool eye);
     // a snapshot cgame has just read (82451ED0's result): the killer's ps in it
     void PatchSnapshot(uint8_t* base, uint32_t snap)
     {
         if (!Replaying() || snap < 0x40000000u || snap >= 0xA0000000u) return;
-        const uint64_t into = GetTickCount64() - g_playStart;
+        const uint64_t into = Ms() - g_playStart;
         const uint8_t* ps = PsAt(g_killer, g_deathAt - PreMs() + into);
+        static uint8_t blended[RecSize];
+        if (EyeBlendOn() && BlendPs(g_killer, g_deathAt - PreMs() + into, blended, true)) ps = blended;   // 0.5.628
         if (!ps) return;
         memcpy(base + snap + 16, ps, PsSize);
         const uint32_t flags = snap + 16 + 44;
@@ -2178,6 +2513,24 @@ namespace Killcam
         PatchSnapshot(base, a);
         if (b != a) PatchSnapshot(base, b);
     }
+    // 0.5.628: each frame of the replay, the eye of now (blended) in both
+    // snapshots cgame holds: it interpolates the followed ps between them,
+    // which were given the killer's state at the moments they were read (a
+    // server frame apart, not the frame's moment): the view went past and
+    // back. The same eye in both is exactly the eye of now. Only the place,
+    // speed and view: his events stay where they were put.
+    void HoldEye(uint8_t* base)
+    {
+        if (!Replaying() || !EyeBlendOn()) return;
+        static uint8_t eye[RecSize];
+        if (!BlendPs(g_killer, g_deathAt - PreMs() + (Ms() - g_playStart), eye, true)) return;
+        const uint32_t cg = Cg + CgSize * Guest::Read32(base, LocalClient);
+        for (const uint32_t held : { Guest::Read32(base, cg + 32), Guest::Read32(base, cg + 36) })
+        {
+            if (held < 0x40000000u || held >= 0xA0000000u) continue;
+            for (uint32_t k : { 0u, 4u, 8u, 16u, 20u, 24u, 204u, 208u, 212u }) memcpy(base + held + 16 + k, eye + k, 4);
+        }
+    }
     // after cgame's player state is made (82464D38): the view weapon it took
     // from this machine's own player on the server (cg+4732) from the killer's
     void PatchWeapon(uint8_t* base)
@@ -2199,7 +2552,7 @@ namespace Killcam
     // not where they were): the two samples around the replay's moment and
     // how far between them, so places and aims are blended smoothly (a
     // sample a server frame) instead of jumping from one to the next.
-    bool Around(int who, uint64_t t, int& a, int& b, float& f)
+    bool Around(int who, uint64_t t, int& a, int& b, float& f, bool force = false)
     {
         a = b = -1; f = 0.0f;
         for (int k = 0; k < g_count; k++)
@@ -2211,7 +2564,7 @@ namespace Killcam
         }
         if (a < 0 && b < 0) return false;
         if (a < 0) { a = b; return true; }
-        if (!BlendOn()) { b = a; f = 0.0f; return true; }   // 0.5.346: exactly the sample (no blending; COD3_KILLCAM_BLEND=1: 329's)
+        if (!BlendOn() && !force) { b = a; f = 0.0f; return true; }   // 0.5.346: exactly the sample (no blending; COD3_KILLCAM_BLEND=1: 329's)
         if (b < 0 || g_ring[b].t == g_ring[a].t) { b = a; return true; }
         f = std::clamp(float(double(t - g_ring[a].t) / double(g_ring[b].t - g_ring[a].t)), 0.0f, 1.0f);
         return true;
@@ -2246,12 +2599,22 @@ namespace Killcam
         fflush(stdout);
     }
     // the blended ps / entity of client c at the replay's moment, into out
-    bool BlendPs(int who, uint64_t t, uint8_t* out)
+    // 0.5.628: eye: the killer's eye (his place, speed and view) blended
+    // between the two samples around t whatever COD3_KILLCAM_BLEND says, the
+    // rest of his state exactly the earlier sample's (his shots on their
+    // frame); not across a jump (a respawn). COD3_KILLCAM_EYEBLEND=0: as before.
+    bool EyeBlendOn() { static const bool on = []() { const char* t = getenv("COD3_KILLCAM_EYEBLEND"); return !(t && t[0] == '0'); }(); return on; }
+    bool BlendPs(int who, uint64_t t, uint8_t* out, bool eye = false)
     {
         int a, b; float f;
-        if (!Around(who, t, a, b, f)) return false;
+        if (!Around(who, t, a, b, f, eye)) return false;
         const uint8_t* A = g_ps[a][who]; const uint8_t* B = g_ps[b][who];
-        memcpy(out, (f < 0.5f ? A : B), RecSize);   // whole state: the nearer sample
+        if (eye)
+        {
+            const float dx = GetBE(B, 0) - GetBE(A, 0), dy = GetBE(B, 4) - GetBE(A, 4), dz = GetBE(B, 8) - GetBE(A, 8);
+            if (dx * dx + dy * dy + dz * dz > 128.0f * 128.0f) { B = A; f = 0.0f; }
+        }
+        memcpy(out, eye ? A : (f < 0.5f ? A : B), RecSize);   // whole state: the nearer sample (the eye's: the earlier)
         for (uint32_t k : { 0u, 4u, 8u, 16u, 20u, 24u }) PutBE(out, k, GetBE(A, k) + (GetBE(B, k) - GetBE(A, k)) * f);
         for (uint32_t k : { 204u, 208u, 212u }) PutBE(out, k, LerpAngle(GetBE(A, k), GetBE(B, k), f));
         return true;
@@ -2349,7 +2712,44 @@ namespace Killcam
     static bool g_objSwapped = false;
     static uint8_t g_objLive[ObjMax][ObjSize];
     static uint32_t g_objLiveAt[ObjMax], g_objLiveN = 0, g_objMarkAt[ObjMax], g_objMark[ObjMax];
-    static std::map<uint32_t, uint32_t> g_objDone;   // object -> events played (cgame's +1000) in the replay
+    // object -> events played (cgame's +1000) in the replay. 0.5.628 (user: "i
+    // dont see explosions in the bots killcams"): cgame's 8246C208 plays an
+    // event object (type, +0, past 18: an explosion, an impact) once, when its
+    // +1000 is 0, then sets it 1; others by their sequence (+184). The replay
+    // kept one +1000 an object's place for the whole replay: event objects come
+    // and go in the same places, so after the first in a place every later one
+    // was "played" already. An object's place now starts again (0 for an event
+    // object, its sequence for others) when it was not there the frame before,
+    // its type changed, or (an event object) it is somewhere else.
+    // 0.5.629: 628's play (2 killcams): 0 event objects in either: CoD3's
+    // explosions are not event objects of their own; a grenade that goes off
+    // keeps its place, may change its type and adds the explosion to its own
+    // sequence. 628 started such an object again at its sequence, the
+    // explosion counted played. Now: an object there the frame before keeps
+    // what it has played, whatever its type (an event object new or moved:
+    // 0); one that comes into the list after the first frame starts one
+    // short of its sequence (its newest event plays: a new grenade's throw,
+    // an explosion of its own); on the first frame, at its sequence (nothing
+    // from before the replay again). Logged at the end: the objects' events
+    // the replay had and cgame played, and their types.
+    // 0.5.634: 629-631's killcams: still no explosion in any object, as event
+    // objects or in objects' own sequences. A live one is the server's call of
+    // its weapon's event 56 (sub_82556180 from 825836A4, the projectile's
+    // explosion), played once. Each such call is kept (time, place, angles,
+    // weapon) and played again in the replay (PlayBlasts, MpFixesKillcamFx).
+    // COD3_KILLCAM_BLASTS=0 off.
+    struct Blast { uint64_t t; float at[3], angles[3]; char weapon[40]; uint32_t event; };
+    constexpr int Blasts = 64;
+    static Blast g_blast[Blasts];
+    static int g_blastHead = 0, g_blastCount = 0;
+    static uint64_t g_blastDone = 0;   // the replay's moment played up to
+    static uint32_t g_blastsPlayed = 0;
+    bool BlastOn() { static const bool on = []() { const char* t = getenv("COD3_KILLCAM_BLASTS"); return !(t && t[0] == '0'); }(); return on; }
+    struct ObjMemo { uint32_t done = 0, seen = 0, sig = 0; uint8_t type = 0; };
+    static uint32_t g_objSeqEvents = 0, g_objSeqPlayed = 0;
+    static uint32_t g_objTypes[64];
+    static std::map<uint32_t, ObjMemo> g_objDone;
+    static uint32_t g_objEvents = 0, g_objEventsShown = 0;
     static uint32_t g_objPut = 0, g_objFrames = 0, g_objRigChanged = 0;
     int SampleAt(uint64_t t)
     {
@@ -2401,9 +2801,24 @@ namespace Killcam
                 if (thenRig != Guest::Read32(base, e + 492)) g_objRigChanged++;
             }
             // events: what the replay has played (from the first frame's sequence)
-            auto it = g_objDone.find(e);
-            if (it == g_objDone.end()) it = g_objDone.emplace(e, Guest::Read32(base, e + 184)).first;
-            Guest::Write32(base, e + 1000, it->second);
+            {
+                const uint8_t type = rec[0];
+                const bool event = type > 18;
+                uint32_t sig = type;
+                if (event && g_originFound && !g_originAt.empty() && g_originAt.front() + 12 <= ObjSize)
+                    for (uint32_t j = 0; j < 12; j++) sig = (sig * 16777619u) ^ rec[g_originAt.front() + j];
+                auto it = g_objDone.find(e);
+                const bool there = it != g_objDone.end() && it->second.seen == g_objFrames;
+                const uint32_t seq = Guest::Read32(base, e + 184);
+                if (it == g_objDone.end()) it = g_objDone.emplace(e, ObjMemo{}).first;
+                ObjMemo& m = it->second;
+                if (event && (!there || m.sig != sig || m.type != type)) { m.done = 0; g_objEvents++; }
+                else if (!there) m.done = g_objFrames == 0 ? seq : (seq ? seq - 1 : 0);
+                if (!event && m.done > seq) m.done = seq;   // the place's object is another: none of the past
+                if (!there) g_objTypes[type & 63]++;
+                m.seen = g_objFrames + 1; m.sig = sig; m.type = type;
+                Guest::Write32(base, e + 1000, m.done);
+            }
             // in this frame's snapshot (its cgame entity +532 -> +256)
             const uint32_t sv = Guest::Read32(base, e + 532);
             g_objMarkAt[g_objLiveN] = 0;
@@ -2417,7 +2832,7 @@ namespace Killcam
         g_objPut += g_objLiveN; g_objFrames++;
         g_objSwapped = true;
         static int told = 0;
-        if (told < 3) { told++; printf("killcam: objects of then: sample %d ms before now, %u listed (live %u), %u objects put\n", int(GetTickCount64() - g_ring[k].t), g_listN[k], g_liveListN, g_objLiveN); fflush(stdout); }
+        if (told < 3) { told++; printf("killcam: objects of then: sample %d ms before now, %u listed (live %u), %u objects put\n", int(Ms() - g_ring[k].t), g_listN[k], g_liveListN, g_objLiveN); fflush(stdout); }
     }
     void SwapOutObjects(uint8_t* base)
     {
@@ -2427,7 +2842,18 @@ namespace Killcam
         {
             const uint32_t e = g_objLiveAt[j];
             auto it = g_objDone.find(e);
-            if (it != g_objDone.end()) it->second = Guest::Read32(base, e + 1000);   // what cgame played
+            if (it != g_objDone.end())
+            {
+                const uint32_t played = Guest::Read32(base, e + 1000);   // what cgame played
+                const uint32_t seq = Guest::Read32(base, e + 184);
+                if (Guest::Read8(base, e) > 18) { if (it->second.done == 0 && played != 0) g_objEventsShown++; }
+                else
+                {
+                    if (seq > it->second.done) g_objSeqEvents += seq - it->second.done;
+                    if (played > it->second.done && played <= seq) g_objSeqPlayed += played - it->second.done;
+                }
+                it->second.done = played;
+            }
             if (g_objMarkAt[j]) Guest::Write32(base, g_objMarkAt[j], g_objMark[j]);
             memcpy(base + e, g_objLive[j], ObjSize);
         }
@@ -2461,7 +2887,7 @@ namespace Killcam
         const uint32_t gv = Guest::Read32(base, 0x82C37070u + 4 * lc);
         const uint32_t glob = Guest::Read32(base, 0x82BCBECCu);
         static uint64_t toldAt = 0; static int toldN = 0;
-        const uint64_t ms = GetTickCount64();
+        const uint64_t ms = Ms();
         if (toldN < 40 && ms - toldAt >= 250)
         {
             toldAt = ms; toldN++;
@@ -2487,7 +2913,7 @@ namespace Killcam
         if (!Replaying()) return;
         const uint32_t entities = Guest::Read32(base, EntityList);
         if (!entities) return;
-        const uint64_t t = g_deathAt - PreMs() + (GetTickCount64() - g_playStart);
+        const uint64_t t = g_deathAt - PreMs() + (Ms() - g_playStart);
         static uint8_t ent[EntSize], theirs[RecSize];
         const bool others = OthersOn() && g_originFound;
         bool killerDone = false;
@@ -2500,7 +2926,7 @@ namespace Killcam
             if (r < 0x40000000u || r >= 0xA0000000u) continue;
             if (!others && c != g_killer) continue;
             uint32_t at = 0;
-            if (!BlendPs(c, t, theirs)) continue;
+            if (!BlendPs(c, t, theirs, c == g_killer && EyeBlendOn())) continue;
             const bool entOk = g_originFound && BlendEnt(c, t, ent, at) && at == e;
             memcpy(sv.ps, base + r, RecSize); sv.rec = r;
             memcpy(base + r, theirs, RecSize);
@@ -2622,7 +3048,7 @@ namespace Killcam
                 if ((flags & 0x80u) && alive) Guest::Write32(base, me + 16, flags & ~0x80u);
                 const uint32_t kr = Guest::Read32(base, Guest::Read32(base, entities + 4 * uint32_t(g_killer + 1)) + 512);
                 static uint64_t toldAt = 0;
-                const uint64_t ms = GetTickCount64();
+                const uint64_t ms = Ms();
                 if (kr && ms - toldAt >= 500)
                 {
                     toldAt = ms;
@@ -2674,7 +3100,7 @@ namespace Killcam
         // above 0xA0000000: 348's log "your recorded pose put 0 times": this
         // test turned them away and the evaluation below froze you instead.
         if (buf < 0x40000000u || size <= 48 || size > PoseMax) return false;
-        const uint64_t t = g_deathAt - PreMs() + (GetTickCount64() - g_playStart);
+        const uint64_t t = g_deathAt - PreMs() + (Ms() - g_playStart);
         static uint8_t pose[PoseMax];
         uint32_t n = size;
         if (!BlendPose(0, t, Guest::Read16(base, rig + 168), size, pose))
@@ -2778,12 +3204,12 @@ namespace Killcam
         if (rec < 0x40000000u || rec >= 0xC0000000u) return;
         const uint32_t entities = Guest::Read32(base, EntityList);
         for (int c = 0; entities && c < 32; c++)
-            if (Guest::Read32(base, entities + 4 * uint32_t(c + 1)) == entity) { g_drawnAt[c].store(GetTickCount64()); return; }
+            if (Guest::Read32(base, entities + 4 * uint32_t(c + 1)) == entity) { g_drawnAt[c].store(Ms()); return; }
     }
     void BodyWatch(uint8_t* base)
     {
         static uint64_t lastAt = 0; static uint64_t toldAt[32] = {}; static uint32_t sum[32] = {}; static float at[32][3] = {}; static uint64_t sameSince[32] = {};
-        const uint64_t ms = GetTickCount64();
+        const uint64_t ms = Ms();
         if (ms - lastAt < 2000) return;
         lastAt = ms;
         const uint32_t entities = Guest::Read32(base, EntityList);
@@ -2818,11 +3244,30 @@ namespace Killcam
             fflush(stdout);
         }
     }
+    // 0.5.634: the explosions of then (MpFixesKillcamFx), each at its moment
+    // of the replay, oldest first
+    void PlayBlasts(PPCContext& ctx, uint8_t* base)
+    {
+        if (!BlastOn() || !ReplayOn()) return;
+        const uint64_t t = g_deathAt - PreMs() + (Ms() - g_playStart);
+        if (t <= g_blastDone) return;
+        for (int k = g_blastCount; k > 0; k--)
+        {
+            const Blast& b = g_blast[(g_blastHead - k + Blasts) % Blasts];
+            if (b.t <= g_blastDone || b.t > t) continue;
+            MpFixesKillcamFx(ctx, base, b.at, b.angles, b.weapon, b.event);
+            g_blastsPlayed++;
+            static int told = 0;
+            if (told < 30) { told++; printf("killcam: explosion of then played: %s event %u at %.0f %.0f %.0f, %lld ms from the death\n", b.weapon, b.event, b.at[0], b.at[1], b.at[2], (long long)b.t - (long long)g_deathAt); fflush(stdout); }
+        }
+        g_blastDone = t;
+    }
     void ServerFrame(PPCContext& ctx, uint8_t* base)
     {
         if (On() && !g_playing) BodyWatch(base);   // 0.5.367
+        if (On() && g_playing) PlayBlasts(ctx, base);   // 0.5.634
         if (!On() || g_playing) return;
-        Record(ctx, base, GetTickCount64());
+        Record(ctx, base, Ms());
         FindOrigins();
     }
     // the camera hook, after the game's own view: the recorder
@@ -2834,7 +3279,7 @@ namespace Killcam
         if (g_playing)
         {
             static uint64_t toldAt = 0;
-            const uint64_t ms = GetTickCount64();
+            const uint64_t ms = Ms();
             if (ms - toldAt >= 500)
             {
                 toldAt = ms;
@@ -2856,7 +3301,7 @@ namespace Killcam
     void Apply(uint8_t* base, uint32_t camera, uint32_t mode)
     {
         if (!On()) return;
-        const uint64_t now = GetTickCount64();
+        const uint64_t now = Ms();
         if (g_armed && !g_playing && mode == 19)
         {
             if (now - g_deathAt < uint64_t(DelayMs())) return;   // 0.5.360: your death first
@@ -2864,7 +3309,8 @@ namespace Killcam
             g_playing = true;
             g_playStart = now;
             for (bool& b : g_evInit) b = false;   // 0.5.341
-            g_objDone.clear(); g_objPut = g_objFrames = g_objRigChanged = 0;   // 0.5.346
+            g_objDone.clear(); g_objPut = g_objFrames = g_objRigChanged = 0; g_objEvents = g_objEventsShown = 0; g_objSeqEvents = g_objSeqPlayed = 0; memset(g_objTypes, 0, sizeof g_objTypes);   // 0.5.346
+            g_blastDone = g_deathAt - PreMs(); g_blastsPlayed = 0;   // 0.5.634
             g_evPlayed = g_evFire = g_posesPut = g_posesMissed = 0; g_ownPoseSkipped = 0; g_ownPut = g_ownNoRecord = 0; g_poseNoRecord = 0; g_rigsRevived = 0; g_gunGateCleared = 0; g_gunsPut = 0; g_rigsRebuilt = 0;
             // 0.5.326: the killer's name; the HUD off while it plays (the
             // "critically wounded" text and the rest), on again after
@@ -2874,12 +3320,17 @@ namespace Killcam
                 if (n > 0) snprintf(title, sizeof title, "KILLCAM  -  Bot %d", n); else snprintf(title, sizeof title, "KILLCAM  -  Player");
                 Overlay::Notice(title, PreMs() + PostMs() + 200);
             }
-            Kernel::QueueConsoleCommand("cg_draw2D 0");
+            // 0.5.628 (user: "the person who killed you's true vision, hud,
+            // explosions"): the HUD stays on (cgame draws it from the killer's
+            // ps: his ammo, his compass); COD3_KILLCAM_HUD=0: off as before
+            static const bool hudOff = []() { const char* t = getenv("COD3_KILLCAM_HUD"); return t && t[0] == '0'; }();
+            if (hudOff) Kernel::QueueConsoleCommand("cg_draw2D 0");
             if (ReplayOn()) { printf("killcam: replay through client %d's own playerstate\n", g_killer); fflush(stdout); PatchHeld(base); }
             printf("killcam: playing client %d's last 4 s\n", g_killer);
             fflush(stdout);
         }
         if (!g_playing) return;
+        HoldEye(base);   // 0.5.628
         const uint64_t into = now - g_playStart;
         // 0.5.327: in the replay the view mode follows the killer's ps (alive),
         // so it ends on time, or when this player is alive again
@@ -2909,6 +3360,19 @@ namespace Killcam
             g_lastReplayEnd = now;   // 0.5.367
             printf("killcam: over (%s): %u events played (%u of them shots), poses put %u times, %u bodies without one, your own pose left to cgame %u times; your recorded pose put before drawing %u times (%u with no recorded pose); objects of then put %u times over %u frames (%zu objects, model instance changed since %u times); bodies with no recorded pose %u; fallen bodies stood up %u times; gun gates opened %u times; guns put back in hands %u times; rigs rebuilt by the game mid-frame %u\n", into <= uint64_t(PreMs() + PostMs()) ? "respawned" : "played out",
                    g_evPlayed, g_evFire, g_posesPut, g_posesMissed, g_ownPoseSkipped, g_ownPut, g_ownNoRecord, g_objPut, g_objFrames, g_objDone.size(), g_objRigChanged, g_poseNoRecord, g_rigsRevived, g_gunGateCleared, g_gunsPut, g_rigsRebuilt);
+            printf("killcam: event objects (explosions, impacts): %u in the replay, %u of them played by cgame (0.5.628); objects' own events: %u new, %u played (0.5.629); types:",
+                   g_objEvents, g_objEventsShown, g_objSeqEvents, g_objSeqPlayed);
+            for (int ty = 0; ty < 64; ty++) if (g_objTypes[ty]) printf(" %d x%u", ty, g_objTypes[ty]);
+            printf("\n");
+            {
+                uint32_t then = 0;   // 0.5.634: explosions kept from the replay's 4 s and after
+                for (int k = 0; k < g_blastCount; k++)
+                {
+                    const Blast& b = g_blast[(g_blastHead - 1 - k + Blasts) % Blasts];
+                    if (b.t > g_deathAt - PreMs() && b.t <= g_deathAt + PostMs()) then++;
+                }
+                printf("killcam: explosions of then (0.5.634): %u kept in the replay's time, %u played again\n", then, g_blastsPlayed);
+            }
             fflush(stdout);
             return;
         }
@@ -2928,6 +3392,26 @@ namespace Killcam
         static int told = 0;
         if ((told < 3 && told++ < 3)) { printf("killcam: view put at %.1f %.1f %.1f, pitch %.1f yaw %.1f\n", e.x, e.y, e.z, e.pitch, e.yaw); fflush(stdout); }
     }
+}
+
+// 0.5.634: a weapon's explosion (event 56) as the server plays it: kept for
+// the killcam (from mp_fixes.cpp's sub_82556180 wrapper)
+void BotsKillcamNoteEvent(uint8_t* base, uint32_t entity, uint32_t weapon, uint32_t event)
+{
+    using namespace Killcam;
+    if (!On() || !BlastOn()) return;
+    if (entity < 0x40000000u || entity >= 0xA0000000u || weapon < 0x40000000u || weapon >= 0xA0000000u) return;
+    Blast& b = g_blast[g_blastHead];
+    b.t = Ms(); b.event = event;
+    for (int i = 0; i < 3; i++) { b.at[i] = ReadFloat(base, entity + 336 + 4 * i); b.angles[i] = ReadFloat(base, entity + 352 + 4 * i); }
+    size_t n = 0;
+    for (; n + 1 < sizeof b.weapon; n++) { const char c = char(Guest::Read8(base, weapon + uint32_t(n))); if (!c) break; b.weapon[n] = c; }
+    b.weapon[n] = 0;
+    if (!n) return;
+    g_blastHead = (g_blastHead + 1) % Blasts;
+    if (g_blastCount < Blasts) g_blastCount++;
+    static int told = 0;
+    if (told < 40) { told++; printf("killcam: explosion kept: %s event %u at %.0f %.0f %.0f angles %.0f %.0f %.0f\n", b.weapon, event, b.at[0], b.at[1], b.at[2], b.angles[0], b.angles[1], b.angles[2]); fflush(stdout); }
 }
 
 void BotsLearnKill(uint8_t* base, uint32_t attacker, uint32_t victim)
@@ -3183,6 +3667,10 @@ static bool ExploreStep(uint8_t* base, uint32_t self, uint32_t slot, uint32_t no
         g_mapKnow.Reached(ex.dest);
         const uint32_t jitter = (slot * 977u + now) % 20000u;
         ex.holdUntil = BotIsRusher2(slot) ? now + 2500 + jitter % 2500 : now + (style == S::Outskirts ? 2000 + jitter / 5 : 15000 + jitter);   // 0.5.329: Rusher 2 keeps moving
+        // 0.5.469: on, after 5 to 10 s, all but the campers (Justin: "clear houses,
+        // and rooms and keep moving on unless needing to stay to defend or attack
+        // objectives"; was 15 to 35 s at each spot reached)
+        if (!BotIsRusher2(slot) && style != S::Outskirts && g_role[slot] != RoleCamper) ex.holdUntil = now + 5000 + jitter / 4;
         // 0.5.202: by purpose: out of spawn, straight on; a push or the flag,
         // a short wait in ambush; a sniper, 35-60 s watching the busiest ways.
         if (ex.purpose == BotExplore::Exit) ex.holdUntil = now + 500;
@@ -3401,7 +3889,12 @@ static void TacticalMove(PPCContext& ctx,uint8_t* base,uint32_t self,uint32_t th
     // 300-500 units off in a new direction for 5 s.
     {
         const bool holding=shelter && Distance(feet,state.cover)<35;
-        if(state.progress.Track(feet,now,!holding && (orders.forward!=0 || orders.right!=0 || state.haveStep))) {
+        if(state.progress.Track(feet,now,!holding && (orders.forward!=0 || orders.right!=0 || state.haveStep),!shelter && Distance(feet,goal)>300.0f)) {
+            {   // 0.5.597: how many were the back-and-forth test's, once in 25
+                static unsigned toldRegion=0; unsigned all=0;
+                for (const auto& t : g_tactical) all+=t.progress.regionStrikes;
+                if (all/25!=toldRegion) {toldRegion=all/25;printf("bots: navigation: %u strikes so far for going back and forth (8 s within 200)\n",all);fflush(stdout);}
+            }
             const unsigned strikes=state.progress.strikes;
             const Point aim=state.haveStep?state.step:goal;
             failed.Remember(feet,aim,now);
@@ -3411,21 +3904,55 @@ static void TacticalMove(PPCContext& ctx,uint8_t* base,uint32_t self,uint32_t th
             if(strikes>=2 && JumpOver(feet,goal,query,landing) && !failed.Blocks(feet,landing,now)) {
                 state.step=landing;state.haveStep=true;state.jumpStart=feet;
                 state.jumpPulse=now+100;state.jumpUntil=now+700;state.nextJump=now+2500;state.jumpPending=true;
-                action="a jump";
+                action="a jump";state.stepWhy="stuck: jump";
             } else if((strikes>=2 || goalBelow) && DropDown(feet,goal,query,landing) && !failed.Blocks(feet,landing,now)) {
-                state.step=landing;state.haveStep=true;action="a drop down";
+                state.step=landing;state.haveStep=true;action="a drop down";state.stepWhy="stuck: drop";
             } else if(strikes>=2 && scanLadder(std::atan2(goal.y-feet.y,goal.x-feet.x))) {
                 printf("bots: navigation slot %u stuck %u times: tries the ladder\n",slot,strikes);fflush(stdout);
                 return;
+            } else if(strikes==2) {
+                // 0.5.485: a hop toward the goal when no planned jump is found
+                // (483: 1200 stuck lines, 332 wanders, not one jump: JumpOver
+                // never trusted a landing; user: "they need to learn to jump")
+                const float hx=goal.x-feet.x,hy=goal.y-feet.y,hl=std::max(1.0f,std::hypot(hx,hy));
+                state.step=Point{feet.x+hx/hl*96.0f,feet.y+hy/hl*96.0f,feet.z};state.haveStep=true;state.jumpStart=feet;
+                state.jumpPulse=now+100;state.jumpUntil=now+700;state.nextJump=now+2500;state.jumpPending=true;
+                action="a hop toward the goal";state.stepWhy="stuck: hop";
             } else if(strikes>=3) {
                 auto avoid=[&](Point p){ return failed.NearFailedTarget(p,now)?400.0f:0.0f; };
                 Point out;
                 if(Wander(feet,goal,slot+strikes,query,avoid,out)) {
-                    state.wanderTo=out;state.wanderUntil=now+5000;state.step=out;state.haveStep=false;action="a wander";
+                    state.wanderTo=out;state.wanderUntil=now+5000;state.step=out;state.haveStep=false;action="a wander";state.stepWhy="wander";
                 }
             }
             printf("bots: navigation slot %u stuck (no progress in 3.5 s, strike %u) at %.0f %.0f %.0f: tries %s\n",
                 slot,strikes,feet.x,feet.y,feet.z,action);fflush(stdout);
+            // 0.5.466: stuck six times running (some 20 s; 0.5.465's War on Rouen
+            // had bots at strike 9), with no enemy in sight within 1500: put
+            // three standing spots along his learnt route to the goal (the
+            // game's own teleport, sub_8255E118), or by his side's spawns when
+            // no route is known
+            // 0.5.518: the flag carrier whatever is in sight (517's carrier hit the
+            // same wall 11 times mid-map and never got home)
+            const bool carrierStuck=g_flagCarrier[0]==int(slot)||g_flagCarrier[1]==int(slot);
+            if(strikes>=4 && (g_seeDist[slot]>1500.0f || carrierStuck)) {   // 0.5.485: 4 (was 6, some 20 s)
+                Point to{};bool have=false;
+                const int32_t cell=g_mapKnow.Nearest(goal,400.0f);
+                if(cell>=0){const std::vector<Point> way=g_mapKnow.Path(feet,cell);if(!way.empty()){to=way[std::min<size_t>(3,way.size()-1)];have=true;}}
+                if(!have){Point spawn;if(SpawnCentre(BotSide(base,slot),spawn)){to=spawn;have=true;}}
+                const uint32_t record=Guest::Read32(base,self+512);
+                if(have && record && Distance(to,feet)>64) {
+                    static uint32_t position=0;
+                    if(!position)position=Guest::AllocatePhysical(0x20);
+                    auto put=[&](uint32_t at,float f){uint32_t w;memcpy(&w,&f,4);Guest::Write32(base,at,w);};
+                    put(position,to.x);put(position+4,to.y);put(position+8,to.z+1.0f);
+                    PPCContext place=ctx;place.r1.u32=(ctx.r1.u32-0x1000)&~0xFu;place.r3.u64=self;place.r4.u64=position;place.lr=0;
+                    Guest::Lookup(0x8255E118)(place,base);
+                    for(int k=0;k<3;k++)put(record+16+4*k,0.0f);
+                    state.progress.Reset();state.haveStep=false;state.wanderUntil=0;
+                    printf("bots: navigation slot %u unstuck: put at %.0f %.0f %.0f (%s)\n",slot,to.x,to.y,to.z,cell>=0?"along his route":"by his spawns");fflush(stdout);
+                }
+            }
         }
     }
     // Hold a chosen waypoint; only invalidate it if collision changed.
@@ -3440,26 +3967,65 @@ static void TacticalMove(PPCContext& ctx,uint8_t* base,uint32_t self,uint32_t th
             const float yaw=std::atan2(goal.y-feet.y,goal.x-feet.x);
             const float length=std::fmin(Distance(feet,goal),96.0f);
             Point direct{feet.x+std::cos(yaw)*length,feet.y+std::sin(yaw)*length,feet.z},landing;
-            const bool clear=Reachable(feet,direct,query,landing);
-            if(clear && now>=state.escapeUntil && !failed.Blocks(feet,landing,now)) {state.step=landing;state.haveStep=true;}
+            // 0.5.561: a goal within 192 (Climb's four pieces of 48) is tested
+            // the whole way, as the route picker tests it, so a spot it found
+            // walkable is walked: Climb lets a piece rise by its length, so a
+            // slope or steps that pass as one 170 walk can fail as one 96 step
+            // (560's self-test: side 2's attackers at 850 -930 refused the step
+            // to a walkable spot 140-220 north, the hull meeting raised ground,
+            // normal up 0.99, and turned off on a detour).
+            bool clear=false;
+            bool ledge=false;   // 0.5.608: what stops the step is a raised edge (its face up), not a wall
+            if(Distance(feet,goal)<=192.0f && Reachable(feet,goal,query,landing)) clear=true;   // the step: the goal's own ground
+            else clear=Reachable(feet,direct,query,landing);
+            // 0.5.549: why not, Flat's own tests again (548's trace: 285 of the
+            // 355 samples with the legs over 90 off the goal had a "blocked"
+            // direct step turned into a detour 90-180 off, though the goal had
+            // a clear line at knee and chest): what each test hit (its handle)
+            if(!clear) {
+                Point s{feet.x,feet.y,feet.z+1},e{direct.x,direct.y,feet.z+1};
+                const Hit low=query(s,e,true);
+                const Point r{feet.x,feet.y,feet.z+18};
+                const Hit up=query(s,r,true);
+                const Hit high=query(r,{direct.x,direct.y,feet.z+18},true);
+                const bool lowOk=low.valid&&!low.solid&&low.fraction>=0.999f, highOk=up.valid&&!up.solid&&up.fraction>=0.999f&&high.valid&&!high.solid&&high.fraction>=0.999f;
+                ledge=!lowOk && low.valid && !low.solid && low.normal.z>0.7f;
+                if(!lowOk && !highOk)
+                    snprintf(state.blockWhy,sizeof(state.blockWhy),"hull: feet %s at %.2f (handle %X, normal up %.2f), stair %s at %.2f (handle %X)",
+                             !low.valid?"no trace":low.solid?"starts solid":"hits",low.fraction,low.handle,low.normal.z,
+                             !up.valid||up.solid||up.fraction<0.999f?"no headroom":!high.valid?"no trace":high.solid?"starts solid":"hits",high.fraction,high.handle);
+                else {
+                    const Point end=lowOk?e:Point{direct.x,direct.y,feet.z+18};
+                    const Hit floor=query(end,{end.x,end.y,feet.z-32},true);
+                    snprintf(state.blockWhy,sizeof(state.blockWhy),"floor: %s (fraction %.2f, %.0f under his feet, normal up %.2f; hull clear %s)",
+                             !floor.valid?"no trace":floor.solid?"starts solid":floor.fraction>=1?"none within 32 down":floor.normal.z<0.65f?"too steep":floor.end.z<feet.z-30?"too far down":floor.end.z>feet.z+18?"too high":"fine (Climb failed)",
+                             floor.fraction,feet.z-floor.end.z,floor.normal.z,lowOk?"at the feet":"a stair up");
+                }
+            } else state.blockWhy[0]=0;
+            if(clear && now>=state.escapeUntil && !failed.Blocks(feet,landing,now)) {state.step=landing;state.haveStep=true;state.stepWhy="direct";}
             else {
                 // One supported low jump, then a long cooldown after failure.
                 if(goalBelow && DropDown(feet,goal,query,landing) && !failed.Blocks(feet,landing,now)) {
-                    state.step=landing;state.haveStep=true;
+                    state.step=landing;state.haveStep=true;state.stepWhy="drop";
                     static uint32_t toldDrop[MaxClients]={};
                     if(now-toldDrop[slot]>4000){toldDrop[slot]=now;printf("bots: navigation slot %u drops down toward a lower goal (%.0f below)\n",slot,feet.z-landing.z);fflush(stdout);}
                 } else
-                if(state.stalledSamples && now>=state.nextJump && JumpOver(feet,goal,query,landing) &&
+                // 0.5.608: also at once over a raised edge (a curb, a step of
+                // rubble higher than a stair): 607's carrier slot 4 at 900 700 had
+                // his route's next spot 68 off, the step "blocked" by ground 0.98
+                // up at his feet, and detoured 160 off and back for 10 s, never
+                // stalled long enough to try the jump
+                if((state.stalledSamples || ledge) && now>=state.nextJump && JumpOver(feet,goal,query,landing) &&
                    !failed.Blocks(feet,landing,now)) {
                     state.step=landing;state.haveStep=true;state.jumpStart=feet;
                     state.jumpPulse=now+100;state.jumpUntil=now+700;
-                    state.nextJump=now+2500;state.jumpPending=true;
+                    state.nextJump=now+2500;state.jumpPending=true;state.stepWhy="low jump";
                     printf("bots: navigation slot %u tries a cleared low jump\n",slot);fflush(stdout);
                 } else {
                     auto route=Detour(feet,goal,state.hand,now<state.escapeUntil,state.visits,query,&failed,now);
-                    state.haveStep=route.valid;if(route.valid)state.step=route.next;
+                    state.haveStep=route.valid;if(route.valid){state.step=route.next;state.stepWhy=now<state.escapeUntil?"detour (escaping)":clear?"detour (direct failed-before)":"detour (blocked)";}
                     else if(ShortEscape(feet,goal,state.hand,query,landing)) {
-                        state.step=landing;state.haveStep=true;
+                        state.step=landing;state.haveStep=true;state.stepWhy="short escape";
                     }
                 }
                 // Nearby ladders are identified by the native surface flag,
@@ -3633,7 +4199,7 @@ static uint32_t BotRifleGrenade(uint8_t* base, uint32_t record)
     {
         const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(n));
         const uint32_t text = (def >= 0x40000000u && def < 0xA0000000u) ? Guest::Read32(base, def + 8) : 0;
-        if (text < 0x40000000u || text >= 0xA0000000u) continue;
+        if (text < 0x40000000u || text >= 0xC0000000u) continue;   // (0.5.757: copies' names lie at 0xAA..)
         char name[32] = {};
         for (int c = 0; c < 31; c++) { const char ch = char(tolower(Guest::Read8(base, text + c))); if (!ch) break; name[c] = ch; }
         if (!strstr(name, "_rg")) continue;
@@ -3649,6 +4215,74 @@ static bool BotHoldsRifleGrenade(uint8_t* base, uint32_t record)
     char name[32] = {};
     for (int c = 0; c < 31; c++) { const char ch = char(tolower(Guest::Read8(base, text + c))); if (!ch) break; name[c] = ch; }
     return strstr(name, "_rg") != nullptr;
+}
+
+namespace { uint32_t WeaponNumber(uint8_t* base, const char* name); }   // (below)
+static bool BotSwitch(PPCContext& ctx, uint8_t* base, uint32_t self, const char* weapon);   // (below)
+bool BotsGroundZ(PPCContext& ctx, uint8_t* base, uint32_t ignore, float x, float y, float top, float& z);   // (below)
+bool BotsLineClear(PPCContext& ctx, uint8_t* base, uint32_t ignore, float ax, float ay, float az, float bx, float by, float bz);   // (below)
+// 0.5.457: a weapon he owns with rounds left (clip or spare): its number, else 0
+static uint32_t BotOwnsLoaded(uint8_t* base, uint32_t record, const char* name)
+{
+    const uint32_t w = WeaponNumber(base, name);
+    if (!w || w >= 128 || !((Guest::Read32(base, record + 1056 + 4 * (w >> 5)) >> (w & 31)) & 1u)) return 0;
+    const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+    const uint32_t def = list ? Guest::Read32(base, list + 4 * w) : 0;
+    if (def < 0x40000000u || def >= 0xA0000000u) return 0;
+    const uint32_t clip = Guest::Read32(base, def + 1468), spare = Guest::Read32(base, def + 1460);
+    const int32_t inClip = clip < 128 ? int32_t(Guest::Read32(base, record + 4 * (172 + clip))) : 0;
+    const int32_t inSpare = spare < 128 ? int32_t(Guest::Read32(base, record + 4 * (80 + spare))) : 0;
+    return inClip > 0 || inSpare > 0 ? w : 0;
+}
+// 0.5.541: cover round a side's own flag for its defenders (user: "defender
+// bots to take up cover in buildings or behind walls waiting and scanning the
+// horizon for enemies who may come near the flag"). Ground spots 220 to 700
+// from the flag, 16 a ring; a spot is cover with walls within 96 in 2 to 6 of
+// 8 directions (not open, not shut in), better seeing the flag and the way
+// the enemy comes (toward their flag), at least 200 apart. Once a map.
+static const std::vector<BotNavigation::Point>& CtfCoverSpots(PPCContext& ctx, uint8_t* base, uint32_t self, uint32_t side,
+                                                              const float* flag, const float* enemyFlag)
+{
+    static std::vector<BotNavigation::Point> spots[3];
+    static float madeFor[3][2] = {};
+    static bool made[3] = {};
+    if (side > 2) side = 0;
+    if (made[side] && hypotf(madeFor[side][0] - flag[0], madeFor[side][1] - flag[1]) < 1.0f) return spots[side];
+    made[side] = true; spots[side].clear(); madeFor[side][0] = flag[0]; madeFor[side][1] = flag[1];
+    struct Candidate { BotNavigation::Point p; int score; };
+    std::vector<Candidate> found;
+    const float wx = enemyFlag[0] - flag[0], wy = enemyFlag[1] - flag[1], wl = fmaxf(1.0f, hypotf(wx, wy));
+    const float ax = flag[0] + wx / wl * 600.0f, ay = flag[1] + wy / wl * 600.0f;   // the way they come
+    for (float radius : { 220.0f, 340.0f, 460.0f, 580.0f, 700.0f })
+        for (int k = 0; k < 16; k++)
+        {
+            const float a = float(k) * 0.3926991f + radius * 0.01f;
+            const float x = flag[0] + cosf(a) * radius, y = flag[1] + sinf(a) * radius;
+            float z;
+            if (!BotsGroundZ(ctx, base, self, x, y, flag[2] + 160.0f, z) || fabsf(z - flag[2]) > 160.0f) continue;
+            int walls = 0;
+            for (int d = 0; d < 8; d++)
+            {
+                const float da = float(d) * 0.7853982f;
+                if (!BotsLineClear(ctx, base, self, x, y, z + 40.0f, x + cosf(da) * 96.0f, y + sinf(da) * 96.0f, z + 40.0f)) walls++;
+            }
+            if (walls < 2 || walls > 6) continue;
+            const bool seesFlag = BotsLineClear(ctx, base, self, x, y, z + 60.0f, flag[0], flag[1], flag[2] + 40.0f);
+            const bool seesWay = BotsLineClear(ctx, base, self, x, y, z + 60.0f, ax, ay, flag[2] + 60.0f);
+            if (!seesFlag && !seesWay) continue;
+            found.push_back({ { x, y, z }, walls + (seesFlag ? 2 : 0) + (seesWay ? 3 : 0) + (g_mapKnow.Nearest({ x, y, z }, 200.0f) >= 0 ? 2 : 0) });
+        }
+    std::stable_sort(found.begin(), found.end(), [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+    for (const Candidate& c : found)
+    {
+        bool apart = true;
+        for (const auto& s : spots[side]) if (hypotf(s.x - c.p.x, s.y - c.p.y) < 200.0f) apart = false;
+        if (apart) spots[side].push_back(c.p);
+        if (spots[side].size() >= 12) break;
+    }
+    printf("bots: side %u's flag (%.0f %.0f): %zu cover spots for its defenders (of %zu candidates)\n", side, flag[0], flag[1], spots[side].size(), found.size());
+    fflush(stdout);
+    return spots[side];
 }
 
 static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t now)
@@ -3729,7 +4363,12 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         // (the head and shoulders), down to 6.
         float eye=ReadFloat(base,theirs+220);
         if (!std::isfinite(eye)||eye<4||eye>80) eye=58;
-        const float height=std::clamp(eye-2.0f,6.0f,72.0f);
+        // 0.5.456: the body, waist to upper chest (Justin: "aim more from the
+        // waist to the upper chest area with less being killed immediately by
+        // headshots"; was eye height less 2: the head): 45% to 75% of his
+        // eye height, drifting every 0.7 s, each bot on his own rhythm
+        const float sway=0.45f+0.30f*(0.5f+0.5f*sinf(float(now)*0.009f+float(slot)*1.7f+float(other)*0.9f));
+        const float height=std::clamp(eye*sway,4.0f,60.0f);
         const float at[3] = { ReadFloat(base, theirs), ReadFloat(base, theirs + 4), ReadFloat(base, theirs + 8) + height };
         const float dx = at[0] - me[0], dy = at[1] - me[1], dz = at[2] - me[2];
         const float distance = dx * dx + dy * dy + dz * dz;
@@ -3824,7 +4463,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         const float ladderGoal[3]={me[0],me[1],me[2]+128};
         orders.forward=127;
         TacticalMove(ctx,base,self,0,slot,now,health,viewYaw,ladderGoal,false,orders);
-        if(tactics.climbing)return orders;
+        if(tactics.climbing){g_why[slot] = "ladder"; return orders;}
     }
 
 
@@ -3858,13 +4497,13 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         for (uint8_t role : { uint8_t(RoleObjective), uint8_t(RoleRusher), uint8_t(RoleFlanker) })
             for (uint32_t b = FirstBotSlot(); b < ActiveSlots(); b++)
                 if (g_bot[b] && g_role[b] == role && BotSide(base, b) == side) { if (b == slot) rank = order; order++; }
-        int quota = (sideBots * 11 + 10) / 20;   // 0.5.277: 55% of the side (was 40%, at most 7)
+        int quota = (sideBots * 14 + 10) / 20;   // 0.5.471: 70% of the side (0.5.277: 55%; was 40%, at most 7)
         if (quota < 3) quota = 3;
-        if (quota > 11) quota = 11;
+        if (quota > 14) quota = 14;   // 0.5.471: 14 (was 11)
         if (rank >= 0 && rank < quota)
         {
             memcpy(goal, g_war.at, sizeof(goal));
-            warTaker = rank % 2 == 0;
+            warTaker = rank % 3 != 2;   // 0.5.471: two in three onto the flag (was one in two)
             BotNavigation::Point enemySpawn;
             const bool knowEnemy = SpawnCentre(side == 1 ? 2 : 1, enemySpawn);
             const float facing = knowEnemy ? atan2f(enemySpawn.y - goal[1], enemySpawn.x - goal[0]) : float(slot) * 2.39996323f;
@@ -3892,17 +4531,890 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             }
         }
     }
+    // 0.5.463: the other objective modes (WatchObjectives). With two flags or
+    // more (Capture the Flag): his side's is the one nearest his spawn, the
+    // enemy's the one nearest theirs; objective players and rushers go for the
+    // enemy's, and with it on them (it is within 90: carried) back to their
+    // own to bring it in; one flanker in three stays by his own flag (300 out,
+    // his own angle). With one (Single Capture the Flag, Headquarters' radio):
+    // every one but the campers goes to it, each to his own place by it.
+    g_ctfOwnLegs[slot] = false; g_ctfHold[slot] = false; g_ctfAttacker[slot] = false;   // 0.5.541: set again below while in CTF
+    g_ctfDoing[slot] = nullptr;
+    g_ctfLane[slot] = 0;
+    if (!hasGoal && g_obj.valid && GetTickCount() - g_obj.when < 10000 && (g_role[slot] != RoleCamper || g_obj.mode.find("ctf") != std::string::npos))
+    {
+        const uint32_t side = BotSide(base, slot);
+        BotNavigation::Point mine, theirs;
+        const bool spawns = SpawnCentre(side, mine) && SpawnCentre(side == 1 ? 2 : 1, theirs);
+        auto nearest = [&](const BotNavigation::Point& to) {
+            int best = 0; float bestD = 1e30f;
+            for (int k = 0; k < g_obj.count; k++) { const float d = hypotf(g_obj.at[k][0] - to.x, g_obj.at[k][1] - to.y); if (d < bestD) { bestD = d; best = k; } }
+            return best;
+        };
+        // 0.5.480: in CTF, only once the sides are known from real spawns
+        // (CtfSpawnSides); g_spawns' centres had the flags swapped
+        const bool ctfKnown = side >= 1 && side <= 2 && g_ctfOwn[side] >= 0 && g_ctfOwn[side] < g_obj.count && g_ctfOwn[3 - side] >= 0 && g_ctfOwn[3 - side] < g_obj.count;
+        const bool ctfWait = g_obj.mode.find("ctf") != std::string::npos && g_obj.count == 2 && !ctfKnown;
+        if (ctfWait) {}
+        else if (g_obj.count >= 2 && (spawns || ctfKnown))
+        {
+            int own = spawns ? nearest(mine) : 0, enemy = spawns ? nearest(theirs) : 1;
+            if (side <= 2 && g_ctfOwn[side] >= 0 && g_ctfOwn[side] < g_obj.count && g_ctfOwn[3 - side] >= 0 && g_ctfOwn[3 - side] < g_obj.count)
+            { own = g_ctfOwn[side]; enemy = g_ctfOwn[3 - side]; }   // 0.5.475
+            if (own != enemy)
+            {
+                // 0.5.473: carrying kept for the life once he has been on the
+                // enemy flag (within 60; the flag is taken by touch), till he
+                // is home (within 90 of his own) or dies: 463's test (within
+                // 90 of the enemy base) turned a carrier round as he left it
+                // 0.5.482: carrying from the game itself (FlagEntityWatch: the
+                // enemy flag hidden with him as its carrier); was guessed from
+                // standing near it
+                const bool carrying = own <= 1 && enemy <= 1 && g_flagCarrier[enemy] == int(slot);
+                float ownAway[3], enemyAway[3];
+                const bool ownOut = own <= 1 && FlagAway(base, own, ownAway);
+                const bool enemyOut = enemy <= 1 && FlagAway(base, enemy, enemyAway) && !carrying;
+                // 0.5.484: CTF roles by order within his team, whatever his
+                // kit or class (user: "half bots pushing forward half bots
+                // defending ... half stay back and push to the middle / stay
+                // near spawn defending the flag and others ... push the flag
+                // and focus on getting it home; others who notice our flag
+                // has been picked up need to escort the flag carrier home"):
+                // even ranks attack; odd ranks defend, every other one in the
+                // middle, the rest by his own flag
+                uint32_t rank = 0;
+                for (uint32_t o = 0; o < slot && o < MaxClients; o++) if (g_bot[o] && BotSide(base, o) == side) rank++;
+                const bool attacker = rank % 2 == 0, middle = !attacker && rank % 4 == 1;
+                g_ctfAttacker[slot] = attacker;   // 0.5.536: for AttackerRoute
+                const bool defender = !attacker;
+                const float spread = float(slot) * 2.39996323f;   // his own angle, so they do not bunch
+                memcpy(goal, (carrying || defender) ? g_obj.at[own] : g_obj.at[enemy], sizeof(goal));
+                const char* doing = carrying ? "brings the flag home" : attacker ? "goes for the enemy flag" : middle ? "holds the middle" : "guards his flag";
+                const int mate = enemy <= 1 ? g_flagCarrier[enemy] : -1;
+                // 0.5.541: a team mate's spot if he is alive and playing
+                auto aliveAt = [&](uint32_t o, float* at) -> bool {
+                    const uint32_t e = (entities && o < MaxClients) ? Guest::Read32(base, entities + 4 * (o + 1)) : 0;
+                    const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+                    if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0 || Guest::Read32(base, r + 1924) != 3) return false;
+                    at[0] = ReadFloat(base, r); at[1] = ReadFloat(base, r + 4); at[2] = ReadFloat(base, r + 8);
+                    return true;
+                };
+                const float axX = g_obj.at[enemy][0] - g_obj.at[own][0], axY = g_obj.at[enemy][1] - g_obj.at[own][1];
+                const float axL = fmaxf(1.0f, hypotf(axX, axY)), ux = axX / axL, uy = axY / axL;
+                // 0.5.541: (user: "friendly bots protecting the flag carrier on
+                // his journey home") every attacker, and a middle defender within
+                // 1500 of him, takes a place in a formation round the carrier
+                // (the host too), facing home: a point man 260 ahead, flanks 190
+                // out to either side, two behind. Not the long way round.
+                float carrierAt[3];
+                const bool mateAlive = mate >= 0 && mate != int(slot) && aliveAt(uint32_t(mate), carrierAt);
+                const bool escort = mateAlive && (attacker || (middle && hypotf(carrierAt[0] - me[0], carrierAt[1] - me[1]) < 1500.0f));
+                if (carrying) {}
+                // 0.5.485: to a DROPPED flag only some go (484: 98 + 101 runs
+                // to one lying flag, the user: "alot of bots still crowding"):
+                // the middle defenders to their own, half the attackers to the
+                // enemy's; a carried flag still has every defender after it
+                else if (defender && ownOut && (middle || !g_flagDropped[own]))
+                {
+                    // our flag taken or lying out: every defender after it
+                    memcpy(goal, ownAway, sizeof(goal));
+                    doing = g_flagDropped[own] ? "returns his dropped flag" : "hunts the enemy carrying his flag";
+                }
+                // 0.5.598: a standoff (our carrier home, within 600 of our flag,
+                // but our flag out): two attackers stay by him, the rest hunt the
+                // enemy carrying our flag (a capture needs it back). 597's
+                // self-test: both flags carried from 2 minutes in to the end,
+                // side 1's carrier slot 6 sat 7 minutes at his flag with every
+                // attacker of his round him and only the defenders after theirs.
+                else if (escort && attacker && ownOut && (rank / 2) % 6 >= 2 &&
+                         hypotf(carrierAt[0] - g_obj.at[own][0], carrierAt[1] - g_obj.at[own][1]) < 600.0f)
+                {
+                    memcpy(goal, ownAway, sizeof(goal));
+                    doing = g_flagDropped[own] ? "returns his dropped flag" : "hunts the enemy carrying his flag (standoff)";
+                }
+                else if (escort)
+                {
+                    float hx = g_obj.at[own][0] - carrierAt[0], hy = g_obj.at[own][1] - carrierAt[1];
+                    const float hl = fmaxf(1.0f, hypotf(hx, hy)); hx /= hl; hy /= hl;
+                    static const float turn[6] = { 0.0f, 1.25f, -1.25f, 2.5f, -2.5f, 3.14159f };
+                    static const float out[6] = { 260.0f, 190.0f, 190.0f, 210.0f, 210.0f, 230.0f };
+                    const uint32_t place = (attacker ? rank / 2 : rank / 4 + 3) % 6;
+                    const float a = atan2f(hy, hx) + turn[place];
+                    goal[0] = carrierAt[0] + cosf(a) * out[place]; goal[1] = carrierAt[1] + sinf(a) * out[place]; goal[2] = carrierAt[2];
+                    doing = place == 0 ? "escorts the flag carrier (point)" : place < 3 ? "escorts the flag carrier (flank)" : "escorts the flag carrier (rear)";
+                    g_ctfOwnLegs[slot] = true;
+                }
+                else if (attacker && enemyOut && rank % 4 == 0) { memcpy(goal, enemyAway, sizeof(goal)); doing = "goes for the dropped enemy flag"; }
+                else if (attacker)
+                {
+                    // 0.5.541: (user: "make the aggressive bots really push for
+                    // the flag as a unit") a loose line across the way (140
+                    // apart) until 700 from their flag; one more than 450 ahead
+                    // of his squad's average (along the way between the flags)
+                    // waits for them, at most 6 s in every 20.
+                    const float myProgress = (me[0] - g_obj.at[own][0]) * ux + (me[1] - g_obj.at[own][1]) * uy;
+                    const float toEnemy = hypotf(g_obj.at[enemy][0] - me[0], g_obj.at[enemy][1] - me[1]);
+                    const float lateral = (float((rank / 2) % 3) - 1.0f) * 140.0f;
+                    g_ctfLane[slot] = int((rank / 2) % 3) - 1;   // 0.5.564: his lane, for the route
+                    if (toEnemy > 700.0f) { goal[0] += -uy * lateral; goal[1] += ux * lateral; }
+                    float sum = 0.0f; int squad = 0;
+                    for (uint32_t o = 0; o < MaxClients; o++)
+                    {
+                        float at[3];
+                        if (o == slot || !g_bot[o] || !g_ctfAttacker[o] || BotSide(base, o) != side || !aliveAt(o, at)) continue;
+                        // 0.5.561: his squad is the attackers within 1200 of him,
+                        // not those still in base or just spawned there (560's
+                        // self-test: 82 of 554 mid-map samples were a leader
+                        // waiting, held back by team mates at home)
+                        if (hypotf(at[0] - me[0], at[1] - me[1]) > 1200.0f) continue;
+                        sum += (at[0] - g_obj.at[own][0]) * ux + (at[1] - g_obj.at[own][1]) * uy; squad++;
+                    }
+                    static uint32_t waitFrom[MaxClients] = {};
+                    if (squad >= 2 && toEnemy > 700.0f && myProgress > sum / float(squad) + 450.0f)
+                    {
+                        if (!waitFrom[slot] || now - waitFrom[slot] > 20000) waitFrom[slot] = now;
+                        if (now - waitFrom[slot] < 6000)
+                        {
+                            // 0.5.562: he holds where he is, crouched, watching
+                            // the way ahead (was: a goal 200 ahead of the squad's
+                            // average, behind him). 561's self-test: the moved goal
+                            // made his route be worked out again backwards, and
+                            // again forwards (often another way) when the wait
+                            // ended: slot 10 turned back from -603 -1409 to
+                            // -1232 -487 so. His goal and route stay as they are.
+                            atFlag = true;
+                            g_ctfHold[slot] = true;
+                            g_ctfWatchYaw[slot] = atan2f(g_obj.at[enemy][1] - me[1], g_obj.at[enemy][0] - me[0]) * 57.29578f;
+                            doing = "waits for his squad";
+                            g_ctfOwnLegs[slot] = true;
+                        }
+                    }
+                    // 0.5.567: the regroup before the assault. 565 and 566's
+                    // 10-minute self-tests: no attacker in 35-36 lives came within
+                    // 700 of the enemy flag; they reached it one or two at a time
+                    // and were killed 1000-1500 out by the many there (attackers
+                    // leaving base, middle holders), running on or not. Coming into
+                    // 1700-2300 of the enemy flag he holds (crouched, watching)
+                    // until three of his side's attackers are in the wave (1500-2600
+                    // out, wherever their lane), or 15 s have gone; then they go in.
+                    {
+                        static uint32_t stageFrom[MaxClients] = {};
+                        static bool pushing[MaxClients] = {};
+                        if (toEnemy > 2600.0f) { pushing[slot] = false; stageFrom[slot] = 0; }
+                        if (!pushing[slot] && toEnemy > 1700.0f && toEnemy < 2300.0f && !g_ctfHold[slot])
+                        {
+                            int wave = 1;
+                            for (uint32_t o = 0; o < MaxClients; o++)
+                            {
+                                float at[3];
+                                if (o == slot || !g_bot[o] || !g_ctfAttacker[o] || BotSide(base, o) != side || !aliveAt(o, at)) continue;
+                                const float d = hypotf(g_obj.at[enemy][0] - at[0], g_obj.at[enemy][1] - at[1]);
+                                if (d > 1500.0f && d < 2600.0f) wave++;
+                            }
+                            if (!stageFrom[slot]) stageFrom[slot] = now;
+                            if (wave >= 3 || now - stageFrom[slot] >= 15000)
+                            {
+                                pushing[slot] = true;
+                                static int told = 0;
+                                if (told++ < 80) { printf("bots: ctf: slot %u (side %u) goes in: %d of his side's attackers in the wave, after %.1f s\n", slot, side, wave, (now - stageFrom[slot]) / 1000.0f); fflush(stdout); }
+                            }
+                            else
+                            {
+                                atFlag = true;
+                                g_ctfHold[slot] = true;
+                                g_ctfWatchYaw[slot] = atan2f(g_obj.at[enemy][1] - me[1], g_obj.at[enemy][0] - me[0]) * 57.29578f;
+                                doing = "regroups for the assault";
+                                g_ctfOwnLegs[slot] = true;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // 0.5.541: defenders hold a place and watch: the middle ones
+                    // between the flags (as before), the others a cover spot by
+                    // their flag (CtfCoverSpots); there (within 70) each crouches
+                    // and sweeps his view over the way the enemy comes
+                    float hold[3] = { goal[0], goal[1], goal[2] };
+                    if (middle)
+                    {
+                        const float mx = (g_obj.at[own][0] + g_obj.at[enemy][0]) * 0.5f, my = (g_obj.at[own][1] + g_obj.at[enemy][1]) * 0.5f;
+                        const float across = (float((rank / 4) % 5) - 2.0f) * 300.0f;
+                        hold[0] = mx - uy * across - ux * 250.0f; hold[1] = my + ux * across - uy * 250.0f;
+                    }
+                    else
+                    {
+                        const std::vector<BotNavigation::Point>& cover = CtfCoverSpots(ctx, base, self, side, g_obj.at[own], g_obj.at[enemy]);
+                        if (!cover.empty())
+                        {
+                            const BotNavigation::Point& c = cover[(rank / 4) % cover.size()];
+                            hold[0] = c.x; hold[1] = c.y; hold[2] = c.z;
+                            doing = "holds cover by his flag";
+                        }
+                        else
+                        {
+                            const float r = 150.0f + float(rank % 4) * 80.0f;
+                            hold[0] += cosf(spread) * r; hold[1] += sinf(spread) * r;
+                        }
+                    }
+                    memcpy(goal, hold, sizeof(goal));
+                    if (hypotf(hold[0] - me[0], hold[1] - me[1]) < 70.0f && fabsf(hold[2] - me[2]) < 100.0f)
+                    {
+                        atFlag = true;
+                        g_ctfHold[slot] = true;
+                        const float wx = g_obj.at[own][0] + ux * 900.0f - me[0], wy = g_obj.at[own][1] + uy * 900.0f - me[1];
+                        g_ctfWatchYaw[slot] = atan2f(wy, wx) * 57.29578f;
+                    }
+                }
+                hasGoal = true;
+                g_ctfDoing[slot] = doing;   // 0.5.546
+                static uint32_t told[MaxClients] = {};
+                if (GetTickCount() - told[slot] > 20000)
+                {
+                    told[slot] = GetTickCount();
+                    printf("bots: slot %u plays %s: %s (%s)\n", slot, g_obj.mode.c_str(), doing, g_obj.name[enemy]);
+                    fflush(stdout);
+                }
+            }
+        }
+        else if (g_obj.count >= 1)
+        {
+            const int k = g_obj.count == 1 ? 0 : nearest({ me[0], me[1], me[2] });
+            memcpy(goal, g_obj.at[k], sizeof(goal));
+            hasGoal = true;
+            static uint32_t told[MaxClients] = {};
+            if (GetTickCount() - told[slot] > 20000)
+            {
+                told[slot] = GetTickCount();
+                printf("bots: slot %u plays %s: goes to the %s\n", slot, g_obj.mode.c_str(), g_obj.name[k]);
+                fflush(stdout);
+            }
+        }
+    }
+    // 0.5.849: a bot on his way to a vehicle far off: that is his goal, walked by the learnt map's
+    // route below like an objective (botveh5: walked straight at it, the one going for a Sherman by the
+    // river got stuck round 3800 1250); no ring round it, no long way
+    const bool toVehicle = GetTickCount() - g_vehicleGoalAt[slot] < 600u;
+    if (toVehicle) { memcpy(goal, g_vehicleGoal[slot], sizeof(goal)); hasGoal = true; atFlag = false; }
     // 0.5.196: each objective player his own place around the flag (40-100
     // units out), so they do not all pile onto one point (Domination).
-    if (hasGoal && !atFlag && !g_war.valid)
+    if (hasGoal && !atFlag && !toVehicle && !g_war.valid && !(g_obj.valid && GetTickCount() - g_obj.when < 10000))   // 0.5.463: onto a flag itself (it is picked up by touching)
     {
         // 0.5.200: a ring 120 to 360 out (was 40 to 100), each his own angle.
         const float angle = float(slot) * 2.39996323f, radius = 120.0f + float(slot % 4) * 80.0f;
         goal[0] += cosf(angle) * radius; goal[1] += sinf(angle) * radius;
     }
+    // 0.5.457: the long way round (Justin: "still some grouping up instead of
+    // splitting up even if that means taking the long way to the
+    // objectives"): to an objective 1400 or more away, two bots in three go
+    // first to a point of their own beside the straight way (half way along,
+    // 600 to 1200 off it, left or right by turns, on ground the trace finds
+    // near his height), then on to it; done there, or 20 s on.
+    const bool carrierNow = g_flagCarrier[0] == int(slot) || g_flagCarrier[1] == int(slot);   // 0.5.483: straight home, no long way
+    if (hasGoal && !atFlag && !toVehicle && slot % 3 != 0 && !carrierNow && !g_ctfOwnLegs[slot] && !g_ctfAttacker[slot])   // 0.5.541: a CTF squad or escort keeps together
+    {
+        static float via[MaxClients][3] = {};
+        static uint8_t viaLife[MaxClients] = {};
+        static uint32_t viaUntil[MaxClients] = {};
+        static bool viaOn[MaxClients] = {};
+        const float gx = goal[0] - me[0], gy = goal[1] - me[1];
+        const float length = sqrtf(gx * gx + gy * gy);
+        if (viaLife[slot] != uint8_t(g_botLife[slot] + 1))
+        {
+            viaLife[slot] = uint8_t(g_botLife[slot] + 1);
+            viaOn[slot] = false;
+            if (length > 1400.0f)
+            {
+                const float side = (slot / 3) % 2 ? 1.0f : -1.0f, off = 600.0f + float((slot * 97u) % 600u);
+                const float vx = me[0] + gx * 0.5f - gy / length * off * side, vy = me[1] + gy * 0.5f + gx / length * off * side;
+                float gz;
+                if (BotsGroundZ(ctx, base, self, vx, vy, me[2] + 1200.0f, gz) && fabsf(gz - me[2]) < 400.0f)
+                {
+                    via[slot][0] = vx; via[slot][1] = vy; via[slot][2] = gz;
+                    viaOn[slot] = true; viaUntil[slot] = now + 20000;
+                    static int told = 0;
+                    if (told++ < 60) { printf("bots: slot %u takes the long way: by %.0f %.0f first (%.0f off the straight way)\n", slot, vx, vy, off * side); fflush(stdout); }
+                }
+            }
+        }
+        if (viaOn[slot] && (now >= viaUntil[slot] || hypotf(via[slot][0] - me[0], via[slot][1] - me[1]) < 250.0f)) viaOn[slot] = false;
+        if (viaOn[slot]) memcpy(goal, via[slot], sizeof(goal));
+    }
+    // 0.5.466: to an objective along the ways players have walked (Justin, War on
+    // Rouen: "alot of the bots seem to get stuck walking around ... have them
+    // actively find a way to the flag/objectives"; its log: 193 stuck, 62 of
+    // them round -800 0, strikes up to 9): a route over the learnt map's links
+    // (MapKnowledge::Path, A*, deaths dearer), worked out again every 3 s or
+    // when the goal moves 200, followed a standing spot at a time (the next
+    // one 140 or more away); straight at it when no route is known.
+    if (hasGoal && !atFlag && record)
+    {
+        static std::vector<BotNavigation::Point> route[MaxClients];
+        static uint32_t routeAt[MaxClients] = {};
+        static float routeFor[MaxClients][2] = {};
+        const BotNavigation::Point feet{ ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) };
+        // 0.5.559: a route he is getting along is kept: worked out again only
+        // when the goal moves 200, the route runs out, or no spot of it has
+        // been reached for 5 s (was every 3 s whatever). 558's self-test: 11 of
+        // 26 attacker lives never left side 1's base (round -1800 0): the route
+        // made again every 3 s from a slightly different start, with the links
+        // found bad meanwhile, went out by the north side of the flag's building
+        // one time and the south the next (goals -1841 264 / -1572 -159 by
+        // turns), so he turned back and forth and took neither.
+        static uint32_t reachedAt[MaxClients] = {};
+        static size_t lastLeft[MaxClients] = {};
+        if (route[slot].size() < lastLeft[slot]) reachedAt[slot] = now;
+        lastLeft[slot] = route[slot].size();
+        const bool routeStale = route[slot].empty() || now - reachedAt[slot] >= 5000;
+        const bool goalMoved = hypotf(goal[0] - routeFor[slot][0], goal[1] - routeFor[slot][1]) > 200.0f;
+        if ((routeStale && now - routeAt[slot] >= (route[slot].empty() ? 3000u : 1000u)) || goalMoved)
+        {
+            // 0.5.562: why it is worked out again, counted for the log once a minute
+            {
+                static uint32_t counts[4] = {}, toldAt = 0;
+                const int why = goalMoved ? 0 : route[slot].empty() ? 1 : reachedAt[slot] == 0 ? 2 : 3;
+                counts[why]++;
+                g_routeRedo[slot] = why == 0 ? "goal moved" : why == 1 ? "route ran out" : why == 2 ? "lost (none walkable)" : "no spot reached in 5 s";
+                if (GetTickCount() - toldAt >= 60000)
+                {
+                    toldAt = GetTickCount();
+                    printf("bots: routes worked out again (all bots so far): goal moved %u, ran out %u, lost %u, no spot reached in 5 s %u\n", counts[0], counts[1], counts[2], counts[3]);
+                    fflush(stdout);
+                }
+            }
+            routeAt[slot] = now; routeFor[slot][0] = goal[0]; routeFor[slot][1] = goal[1];
+            reachedAt[slot] = now; lastLeft[slot] = 0;
+            const int32_t cell = g_mapKnow.Nearest({ goal[0], goal[1], goal[2] }, 400.0f);
+            // 0.5.553: the route starts at the nearest learnt spot he can walk
+            // to straight (Reachable, as his step), its own spot first. Path
+            // started at the nearest by distance and left it out: 552's
+            // self-test had the first spot 80-400 off and past a wall 739
+            // times of 891 (the step hit the wall 583 times).
+            int32_t start = -1;
+            auto query = [&](BotNavigation::Point a, BotNavigation::Point b, bool body) { return BotTrace(ctx, base, self, self, a, b, body); };
+            // 0.5.607: of the eight nearest he can walk to, the one with the least
+            // way round toward the goal (to it plus from it to the goal), not the
+            // nearest: 606's carrier slot 7, at -1160 44 going east, had his route
+            // start at -1205 68 behind him, back toward the base he had just left
+            {
+                float bestWay = 1e30f;
+                for (const int32_t around : g_mapKnow.NearestList(feet, 400.0f, 8))
+                {
+                    const BotNavigation::Point at = g_mapKnow.At(around);
+                    const float way = hypotf(at.x - feet.x, at.y - feet.y) + hypotf(goal[0] - at.x, goal[1] - at.y);
+                    if (way >= bestWay) continue;
+                    BotNavigation::Point landing;
+                    if (BotNavigation::Reachable(feet, at, query, landing)) { start = around; bestWay = way; }
+                }
+            }
+            const bool walkableStart = start >= 0;
+            if (start < 0) start = g_mapKnow.Nearest(feet, 300.0f);
+            // 0.5.554: the route's first six links walked by the test his step
+            // uses, spot to spot; one that fails is marked (dearer for every
+            // bot from now on) and the route worked out again, three times at
+            // most. 553's self-test: from a start he could walk to, the next
+            // spots were still out of reach 555 times of 822 (slot 22 went
+            // round -650 -700 for half a minute): the learnt links are any
+            // player's moves between two cells, jumps and climbs too, and two
+            // cells' spots can have a corner between them.
+            std::vector<int32_t> cells;
+            std::vector<uint8_t> via;
+            int marked = 0, crossed = 0;
+            for (int round = 0; round < 3 && cell >= 0 && start >= 0; round++)
+            {
+                // 0.5.564: a CTF attacker's route keeps to his lane (left,
+                // middle or right of the way between the flags) where the
+                // streets allow: 563's self-test had 12 of 24 attacker deaths
+                // by the other side's attackers, both sides' running the same
+                // best way through the same streets head on.
+                BotNavigation::MapKnowledge::Lane lane;
+                const uint32_t laneSide = BotSide(base, slot);
+                // 0.5.565: only out in the middle (over 900 from both flags),
+                // softer (0.25 a unit): 564's lanes from the spawn pushed routes
+                // out of side 1's cramped base into its walls (4 of 9 attacker
+                // lives left it; 561-563: 85-87%), reach fell (3 lives within
+                // 1500 of the enemy flag, 563: 12)
+                if (g_ctfLane[slot] != 0 && (laneSide == 1 || laneSide == 2) && g_ctfOwn[laneSide] >= 0 && g_ctfOwn[3 - laneSide] >= 0 &&
+                    hypotf(feet.x - g_obj.at[g_ctfOwn[laneSide]][0], feet.y - g_obj.at[g_ctfOwn[laneSide]][1]) > 900.0f &&
+                    hypotf(feet.x - g_obj.at[g_ctfOwn[3 - laneSide]][0], feet.y - g_obj.at[g_ctfOwn[3 - laneSide]][1]) > 900.0f)
+                {
+                    lane.a = { g_obj.at[g_ctfOwn[laneSide]][0], g_obj.at[g_ctfOwn[laneSide]][1], 0.0f };
+                    lane.b = { g_obj.at[g_ctfOwn[3 - laneSide]][0], g_obj.at[g_ctfOwn[3 - laneSide]][1], 0.0f };
+                    lane.side = g_ctfLane[slot]; lane.perUnit = 0.25f;
+                }
+                cells = g_mapKnow.PathCells(start, cell, 8000, true, lane.side != 0 ? &lane : nullptr);
+                via.assign(cells.size(), 0);
+                bool redo = false;
+                for (size_t k = 0; k + 1 < cells.size(); k++)
+                {
+                    if (g_mapKnow.IsBadLink(cells[k], cells[k + 1])) continue;   // known: kept only for want of another way
+                    BotNavigation::Point landing;
+                    const BotNavigation::Point a = g_mapKnow.At(cells[k]);
+                    // 0.5.580: the first six, and every link within 700 of a flag
+                    // (579's self-test: side 2's routes into the building at -1792
+                    // -91 went -1795 -304 -> -1675 -148 through its wall corner,
+                    // past the six checked, and the bots went round and round it)
+                    bool byFlag = false;
+                    if (k >= 6)
+                    {
+                        const BotNavigation::Point b = g_mapKnow.At(cells[k + 1]);
+                        for (int f = 0; f < g_obj.count && f < 2 && !byFlag; f++)
+                            byFlag = hypotf(a.x - g_obj.at[f][0], a.y - g_obj.at[f][1]) < 700.0f || hypotf(b.x - g_obj.at[f][0], b.y - g_obj.at[f][1]) < 700.0f;
+                        if (!byFlag) continue;
+                    }
+                    if (BotNavigation::Reachable(a, g_mapKnow.At(cells[k + 1]), query, landing)) continue;
+                    // 0.5.580: not straight: the way a player walked it this
+                    // session (a doorway), if he can get to its start and from its
+                    // end; the route then goes through those two spots
+                    BotNavigation::MapKnowledge::Crossing cross;
+                    if (g_mapKnow.CrossingOf(cells[k], cells[k + 1], cross) &&
+                        BotNavigation::Reachable(a, cross.from, query, landing) && BotNavigation::Reachable(cross.to, g_mapKnow.At(cells[k + 1]), query, landing))
+                    { via[k] = 1; crossed++; continue; }
+                    {
+                        g_mapKnow.BadLink(cells[k], cells[k + 1]);
+                        // 0.5.579: which, by a flag (the ways in and out of the
+                        // flag buildings), the first 80
+                        {
+                            const BotNavigation::Point b = g_mapKnow.At(cells[k + 1]);
+                            for (int f = 0; f < g_obj.count && f < 2; f++)
+                                if (hypotf(a.x - g_obj.at[f][0], a.y - g_obj.at[f][1]) < 600.0f || hypotf(b.x - g_obj.at[f][0], b.y - g_obj.at[f][1]) < 600.0f)
+                                {
+                                    static int toldBad[2] = {};
+                                    if (toldBad[f]++ < 50) { printf("bots: learnt map: link by flag %d not walkable: %.0f %.0f %.0f -> %.0f %.0f %.0f\n", f, a.x, a.y, a.z, b.x, b.y, b.z); fflush(stdout); }
+                                    break;
+                                }
+                        }
+                        marked++; redo = true;
+                    }
+                }
+                if (!redo) break;
+            }
+            route[slot].clear();
+            for (size_t k = 0; k < cells.size(); k++)
+            {
+                route[slot].push_back(g_mapKnow.At(cells[k]));
+                BotNavigation::MapKnowledge::Crossing cross;
+                if (k < via.size() && via[k] && k + 1 < cells.size() && g_mapKnow.CrossingOf(cells[k], cells[k + 1], cross))
+                { route[slot].push_back(cross.from); route[slot].push_back(cross.to); }
+            }
+            static uint32_t crossTotal = 0, crossTold = 0;
+            crossTotal += uint32_t(crossed);
+            if (crossed && crossTotal / 25 != crossTold) { crossTold = crossTotal / 25; printf("bots: learnt map: %u links not straight walked the way a player went (%zu ways known)\n", crossTotal, g_mapKnow.crossings.size()); fflush(stdout); }
+            static uint32_t badTotal = 0, badTold = 0;
+            badTotal += uint32_t(marked);
+            if (marked && badTotal / 25 != badTold) { badTold = badTotal / 25; printf("bots: learnt map: %u links found not walkable by a bot so far (%zu marked)\n", badTotal, g_mapKnow.badLinks.size()); fflush(stdout); }
+            g_routeStart[slot] = walkableStart ? "a spot he can walk to" : "the nearest (none walkable)";
+            static int told = 0;
+            if (told++ < 40 && !route[slot].empty()) { printf("bots: slot %u routes to his objective: %zu steps over the learnt map\n", slot, route[slot].size()); fflush(stdout); }
+        }
+        // 0.5.582: a CTF attacker within 700 of the enemy flag (at home) goes in
+        // by a way a player walked out of its base, backwards: from the spot of
+        // one he can walk to straight that is the fewest spots from the flag
+        // (once a second till he has one; a route made again drops it)
+        {
+            static bool onTrail[MaxClients] = {};
+            static uint32_t trailCheck[MaxClients] = {};
+            if (routeAt[slot] == now) onTrail[slot] = false;
+            const uint32_t ts = BotSide(base, slot);
+            const int enemyFlag = (ts == 1 || ts == 2) ? g_ctfOwn[3 - ts] : -1;
+            // 0.5.592: a carrier within 700 of his own flag (at home) goes in to it
+            // the same way, by one of its own base's ways out backwards, once a
+            // life (over his own trail's route): 591's capture, slot 21, was put on
+            // his flag by the stuck help from 207 out, outside its building
+            const int hf = (ts == 1 || ts == 2) ? g_ctfOwn[ts] : -1;
+            static uint8_t homeInLife[MaxClients] = {};
+            const bool carrierIn = carrierNow && hf >= 0 && hf <= 1 && homeInLife[slot] != uint8_t(g_botLife[slot] + 1);
+            const int ef = carrierIn ? hf : (g_ctfAttacker[slot] && !carrierNow) ? enemyFlag : -1;   // the flag he goes in to
+            if (ef >= 0 && ef <= 1 && (carrierIn || !onTrail[slot]) && g_flagCarrier[ef] < 0 && !g_flagDropped[ef] &&
+                now - trailCheck[slot] >= 1000 && hypotf(g_obj.at[ef][0] - feet.x, g_obj.at[ef][1] - feet.y) < 700.0f &&
+                hypotf(g_obj.at[ef][0] - feet.x, g_obj.at[ef][1] - feet.y) > 120.0f)
+            {
+                trailCheck[slot] = now;
+                struct Pick { float score; int t; size_t i; };
+                std::vector<Pick> picks;
+                for (int t = 0; t < 16; t++)
+                    for (size_t i = 0; i < g_flagTrails[ef][t].size(); i++)
+                    {
+                        const BotNavigation::Point& p = g_flagTrails[ef][t][i];
+                        const float d = hypotf(p.x - feet.x, p.y - feet.y);
+                        if (d < 350.0f && fabsf(p.z - feet.z) < 100.0f) picks.push_back({ float(i) * 80.0f + d, t, i });
+                    }
+                std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.score < b.score; });
+                auto query = [&](BotNavigation::Point a, BotNavigation::Point b, bool body) { return BotTrace(ctx, base, self, self, a, b, body); };
+                for (size_t k = 0; k < picks.size() && k < 4; k++)
+                {
+                    const auto& way = g_flagTrails[ef][picks[k].t];
+                    BotNavigation::Point landing;
+                    if (!BotNavigation::Reachable(feet, way[picks[k].i], query, landing)) continue;
+                    route[slot].clear();
+                    for (size_t i = picks[k].i + 1; i-- > 0;) route[slot].push_back(way[i]);
+                    route[slot].push_back({ g_obj.at[ef][0], g_obj.at[ef][1], way[0].z });
+                    onTrail[slot] = true; reachedAt[slot] = now; lastLeft[slot] = route[slot].size();
+                    if (carrierIn) homeInLife[slot] = uint8_t(g_botLife[slot] + 1);
+                    static int told = 0;
+                    if (told++ < 60) { printf("bots: slot %u (side %u%s) goes in by a way out of the flag's base: %zu spots from %.0f %.0f %.0f\n", slot, ts, carrierIn ? ", carrier, home" : "", route[slot].size(), way[picks[k].i].x, way[picks[k].i].y, way[picks[k].i].z); fflush(stdout); }
+                    break;
+                }
+            }
+            // 0.5.589: a carrier goes home the way he came: his own trail this life
+            // (a spot every 120 walked from his spawn, BotTrail), backwards, from
+            // the spot of it nearest home he can walk to straight; taken at the
+            // take, and again a second after any route made over it. 588's
+            // self-test: carrier slot 6's learnt-map routes home were "lost" and
+            // made again from wherever he stood, each another way (697 1272, then
+            // 1113 1244 3 s on, 400 back), and the stuck help put him forward 4 times.
+            static std::vector<BotNavigation::Point> homeWay[MaxClients];
+            static uint8_t homeWayLife[MaxClients] = {};
+            if (carrierNow && homeWayLife[slot] != uint8_t(g_botLife[slot] + 1))
+            {
+                homeWayLife[slot] = uint8_t(g_botLife[slot] + 1);
+                homeWay[slot] = g_trail[slot];
+                const int own = (ts == 1 || ts == 2) ? g_ctfOwn[ts] : -1;
+                // 0.5.590: a trail that began at least 500 nearer his flag than the
+                // flag he took (589 asked for one begun within 1500 of his flag:
+                // 3 carriers of 3 had none); its end on, his route from there
+                const size_t had = homeWay[slot].size();
+                const float frontHome = had && own >= 0 && own <= 1 ? hypotf(homeWay[slot].front().x - g_obj.at[own][0], homeWay[slot].front().y - g_obj.at[own][1]) : -1.0f;
+                const int took = g_flagCarrier[0] == int(slot) ? 0 : 1;
+                const float flagHome = own >= 0 && own <= 1 ? hypotf(g_obj.at[took][0] - g_obj.at[own][0], g_obj.at[took][1] - g_obj.at[own][1]) : 0.0f;
+                if (own < 0 || own > 1 || had < 4 || frontHome > flagHome - 500.0f)
+                    homeWay[slot].clear();
+                printf("bots: carrier slot %u: his trail this life %zu spots, begun %.0f from his flag (the flag he took %.0f)\n", slot, had, frontHome, flagHome); fflush(stdout);
+                static int told = 0;
+                if (told++ < 40) { printf("bots: carrier slot %u: his own way home: %zu spots%s\n", slot, homeWay[slot].size(), homeWay[slot].empty() ? " (none fit)" : ""); fflush(stdout); }
+            }
+            if (carrierNow && !homeWay[slot].empty() && !onTrail[slot] && now - trailCheck[slot] >= 1000)
+            {
+                trailCheck[slot] = now;
+                const auto& way = homeWay[slot];
+                auto query = [&](BotNavigation::Point a, BotNavigation::Point b, bool body) { return BotTrace(ctx, base, self, self, a, b, body); };
+                struct Pick { float score; size_t i; };
+                std::vector<Pick> picks;
+                for (size_t i = 0; i < way.size(); i++)
+                {
+                    const float d = hypotf(way[i].x - feet.x, way[i].y - feet.y);
+                    if (d < 400.0f && fabsf(way[i].z - feet.z) < 120.0f) picks.push_back({ float(i) * 120.0f + d, i });
+                }
+                std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.score < b.score; });
+                for (size_t k = 0; k < picks.size() && k < 5; k++)
+                {
+                    BotNavigation::Point landing;
+                    if (!BotNavigation::Reachable(feet, way[picks[k].i], query, landing)) continue;
+                    route[slot].clear();
+                    for (size_t i = picks[k].i + 1; i-- > 0;) route[slot].push_back(way[i]);
+                    const int own = g_ctfOwn[ts];
+                    route[slot].push_back({ g_obj.at[own][0], g_obj.at[own][1], way[0].z });
+                    onTrail[slot] = true; reachedAt[slot] = now; lastLeft[slot] = route[slot].size();
+                    static int told = 0;
+                    if (told++ < 80) { printf("bots: carrier slot %u goes home the way he came: %zu spots from %.0f %.0f\n", slot, route[slot].size(), way[picks[k].i].x, way[picks[k].i].y); fflush(stdout); }
+                    break;
+                }
+            }
+            // 0.5.584: a carrier within 600 of the flag he took (its base) goes
+            // out by one of its ways out, forwards: from a spot of one he can walk
+            // to straight, the way whose end is nearest his own flag, to its end
+            // (his route home from there). 583's self-test: slot 4 took the flag at
+            // 2112 462, his route out ran into a wall (1856 344 -> 1726 356), the
+            // stuck help put him back 10 s on, and he was shot in its base.
+            const int cf = g_flagCarrier[0] == int(slot) ? 0 : g_flagCarrier[1] == int(slot) ? 1 : -1;
+            // 0.5.607: each base's way out once a life (exitLife; both picks below):
+            // 606's 8-bot test, carrier slot 7 picked one six times in the base
+            // he took the flag from, each from another spot (often behind him:
+            // his velocity turned round every pick), and outside it the learnt
+            // map route home started back toward it, so the way out was taken
+            // again: round and round, the stuck help put him on 4 times
+            static uint8_t exitLife[MaxClients] = {};
+            const bool exitFree = exitLife[slot] != uint8_t(g_botLife[slot] + 1);
+            if (carrierNow && exitFree && cf >= 0 && hf >= 0 && hf <= 1 && hf != cf && !onTrail[slot] && now - trailCheck[slot] >= 1000 &&
+                hypotf(g_obj.at[cf][0] - feet.x, g_obj.at[cf][1] - feet.y) < 600.0f)
+            {
+                trailCheck[slot] = now;
+                struct Pick { float score; int t; size_t i; };
+                std::vector<Pick> picks;
+                for (int t = 0; t < 16; t++)
+                {
+                    const auto& way = g_flagTrails[cf][t];
+                    if (way.size() < 3) continue;
+                    const float endHome = hypotf(way.back().x - g_obj.at[hf][0], way.back().y - g_obj.at[hf][1]);
+                    for (size_t i = 0; i + 2 < way.size(); i++)
+                    {
+                        const float d = hypotf(way[i].x - feet.x, way[i].y - feet.y);
+                        if (d < 300.0f && fabsf(way[i].z - feet.z) < 100.0f) picks.push_back({ d + endHome * 0.5f, t, i });
+                    }
+                }
+                std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.score < b.score; });
+                auto query = [&](BotNavigation::Point a, BotNavigation::Point b, bool body) { return BotTrace(ctx, base, self, self, a, b, body); };
+                for (size_t k = 0; k < picks.size() && k < 4; k++)
+                {
+                    const auto& way = g_flagTrails[cf][picks[k].t];
+                    BotNavigation::Point landing;
+                    if (!BotNavigation::Reachable(feet, way[picks[k].i], query, landing)) continue;
+                    route[slot].assign(way.begin() + ptrdiff_t(picks[k].i), way.end());
+                    onTrail[slot] = true; reachedAt[slot] = now; lastLeft[slot] = route[slot].size();
+                    exitLife[slot] = uint8_t(g_botLife[slot] + 1);
+                    static int told = 0;
+                    if (told++ < 60) { printf("bots: carrier slot %u (side %u) goes out by a way out of the flag's base: %zu spots from %.0f %.0f %.0f to %.0f %.0f %.0f\n", slot, ts, route[slot].size(), way[picks[k].i].x, way[picks[k].i].y, way[picks[k].i].z, way.back().x, way.back().y, way.back().z); fflush(stdout); }
+                    break;
+                }
+                // 0.5.585: none (584's carriers never took one): why, once a life
+                static uint8_t toldNone[MaxClients] = {};
+                if (!onTrail[slot] && toldNone[slot] != uint8_t(g_botLife[slot] + 1))
+                {
+                    toldNone[slot] = uint8_t(g_botLife[slot] + 1);
+                    int ways = 0; for (const auto& way : g_flagTrails[cf]) ways += way.size() >= 3;
+                    printf("bots: carrier slot %u at %.0f %.0f %.0f: no way out of the base taken (%d ways known, %zu spots near, none walkable straight)\n", slot, feet.x, feet.y, feet.z, ways, picks.size()); fflush(stdout);
+                }
+            }
+            // 0.5.596: any bot within 350 of his own flag (at home) going over 700
+            // from it leaves by one of its base's ways out, forwards, the one
+            // ending nearest where he goes. 594's self-test: 75 of 302 stalls were
+            // side 1's bots in and by their flag's building (-1850 -220), its spots
+            // past its walls ("first (none walkable)", no step at all).
+            if (!carrierNow && exitFree && hf >= 0 && hf <= 1 && !onTrail[slot] && g_flagCarrier[hf] < 0 && !g_flagDropped[hf] && now - trailCheck[slot] >= 1000 &&
+                hypotf(g_obj.at[hf][0] - feet.x, g_obj.at[hf][1] - feet.y) < 350.0f && hypotf(g_obj.at[hf][0] - goal[0], g_obj.at[hf][1] - goal[1]) > 700.0f)
+            {
+                trailCheck[slot] = now;
+                struct Pick { float score; int t; size_t i; };
+                std::vector<Pick> picks;
+                for (int t = 0; t < 16; t++)
+                {
+                    const auto& way = g_flagTrails[hf][t];
+                    if (way.size() < 3) continue;
+                    const float endGoal = hypotf(way.back().x - goal[0], way.back().y - goal[1]);
+                    for (size_t i = 0; i + 2 < way.size(); i++)
+                    {
+                        const float d = hypotf(way[i].x - feet.x, way[i].y - feet.y);
+                        if (d < 300.0f && fabsf(way[i].z - feet.z) < 100.0f) picks.push_back({ d + endGoal * 0.5f, t, i });
+                    }
+                }
+                std::sort(picks.begin(), picks.end(), [](const Pick& a, const Pick& b) { return a.score < b.score; });
+                auto query = [&](BotNavigation::Point a, BotNavigation::Point b, bool body) { return BotTrace(ctx, base, self, self, a, b, body); };
+                for (size_t k = 0; k < picks.size() && k < 4; k++)
+                {
+                    const auto& way = g_flagTrails[hf][picks[k].t];
+                    BotNavigation::Point landing;
+                    if (!BotNavigation::Reachable(feet, way[picks[k].i], query, landing)) continue;
+                    route[slot].assign(way.begin() + ptrdiff_t(picks[k].i), way.end());
+                    onTrail[slot] = true; reachedAt[slot] = now; lastLeft[slot] = route[slot].size();
+                    exitLife[slot] = uint8_t(g_botLife[slot] + 1);
+                    static int told = 0;
+                    if (told++ < 60) { printf("bots: slot %u (side %u) leaves his base by a way out: %zu spots from %.0f %.0f to %.0f %.0f\n", slot, ts, route[slot].size(), way[picks[k].i].x, way[picks[k].i].y, way.back().x, way.back().y); fflush(stdout); }
+                    break;
+                }
+            }
+        }
+        // 0.5.606: a carrier, every half second: where he is, his route's next
+        // spot and how many are left, and his velocity (605's 8-bot test: slot
+        // 4 ran at 200 for 12 s at a "walkable" spot 330 off and stayed round
+        // -1700 350; the 3 s ctftrace cannot show why)
+        if (carrierNow)
+        {
+            static uint32_t carryTold[MaxClients] = {};
+            if (now - carryTold[slot] >= 500)
+            {
+                carryTold[slot] = now;
+                const float vx = ReadFloat(base, record + 16), vy = ReadFloat(base, record + 20);
+                const bool any = !route[slot].empty();
+                printf("carrytrace: slot %u at %.0f %.0f %.0f vel %.0f %.0f; next %.0f %.0f (%.0f off), %zu left; routed %u ms ago\n", slot, feet.x, feet.y, feet.z, vx, vy,
+                       any ? route[slot].front().x : 0.0f, any ? route[slot].front().y : 0.0f, any ? hypotf(route[slot].front().x - feet.x, route[slot].front().y - feet.y) : 0.0f,
+                       route[slot].size(), unsigned(now - routeAt[slot]));
+                fflush(stdout);
+            }
+        }
+        // 0.5.552: a spot is dropped once he is within 40 of it (was 140).
+        // 551's self-test: in 736 of 797 attacker samples none of the next
+        // spots could be walked to straight, nor the first: dropping every
+        // spot within 140 dropped the ones that lead round the corner beside
+        // him, so all that was left lay past it, straight at it was the wall
+        // (544 refused steps), and he circled.
+        // 0.5.573: the last spot of the route he reached (he walked from it, so
+        // he can walk back to it, and the next spot is linked to it)
+        static BotNavigation::Point lastReached[MaxClients] = {};
+        static bool haveLast[MaxClients] = {};
+        while (!route[slot].empty() && hypotf(route[slot].front().x - feet.x, route[slot].front().y - feet.y) < 40.0f)
+        { lastReached[slot] = route[slot].front(); haveLast[slot] = true; route[slot].erase(route[slot].begin()); }
+        // 0.5.559: and reaching any of the next six drops those before it (the
+        // picker steers to the farthest walkable one, so the first is often
+        // never come within 40 of), so a shorter route is real progress
+        for (size_t k = std::min<size_t>(6, route[slot].size()); k-- > 1;)
+            if (hypotf(route[slot][k].x - feet.x, route[slot][k].y - feet.y) < 40.0f)
+            { lastReached[slot] = route[slot][k]; haveLast[slot] = true; route[slot].erase(route[slot].begin(), route[slot].begin() + ptrdiff_t(k) + 1); break; }
+        if (routeAt[slot] == now) haveLast[slot] = false;   // a new route: the old one's spot is not on it
+        if (route[slot].size() < 2) snprintf(g_pickInfo[slot], sizeof(g_pickInfo[slot]), "no route spot (%zu left): straight at the goal", route[slot].size());   // 0.5.551
+        // 0.5.579: an attacker within 400 of the enemy flag, once a life: his
+        // route's last spots (how it goes into the flag's building)
+        if (g_ctfAttacker[slot])
+        {
+            static uint8_t toldLife[MaxClients] = {};
+            const uint32_t ts = BotSide(base, slot);
+            if ((ts == 1 || ts == 2) && g_ctfOwn[3 - ts] >= 0 && g_ctfOwn[3 - ts] <= 1 && toldLife[slot] != uint8_t(g_botLife[slot] + 1) &&
+                hypotf(g_obj.at[g_ctfOwn[3 - ts]][0] - feet.x, g_obj.at[g_ctfOwn[3 - ts]][1] - feet.y) < 400.0f)
+            {
+                toldLife[slot] = uint8_t(g_botLife[slot] + 1);
+                std::string tail;
+                for (size_t k = route[slot].size() > 4 ? route[slot].size() - 4 : 0; k < route[slot].size(); k++)
+                { char t[48]; snprintf(t, sizeof(t), " %.0f %.0f %.0f;", route[slot][k].x, route[slot][k].y, route[slot][k].z); tail += t; }
+                printf("bots: slot %u (side %u) %.0f from the enemy flag at %.0f %.0f %.0f: his route's last spots (%zu left):%s\n", slot, ts,
+                       hypotf(g_obj.at[g_ctfOwn[3 - ts]][0] - feet.x, g_obj.at[g_ctfOwn[3 - ts]][1] - feet.y), feet.x, feet.y, feet.z, route[slot].size(), tail.c_str());
+                fflush(stdout);
+            }
+        }
+        if (route[slot].size() >= 2)
+        {
+            // 0.5.467: the farthest of the next four spots he has a clear line
+            // to (knee and chest high), else the next one: 466's bots walked
+            // straight at the next spot (128 to 256 off) and cut the corners
+            // into the walls (Justin: "still noticing alot of bots just walking
+            // into walls"; its log: 357 walls met)
+            // 0.5.468: looked again every 250 ms (not every frame), the spot kept between
+            static uint32_t lookedAt[MaxClients] = {};
+            static BotNavigation::Point picked[MaxClients] = {};
+            if (now - lookedAt[slot] >= 250 || hypotf(picked[slot].x - feet.x, picked[slot].y - feet.y) < 40.0f)
+            {
+                lookedAt[slot] = now;
+                size_t pick = 0;
+                // 0.5.552: the farthest of the first six spots he can walk to
+                // straight by the very test his step uses (TacticalMove's
+                // Reachable: his body's box, a stair, a slope in pieces of 48,
+                // walkable ground at the end), so the spot and the step agree;
+                // none: the first (his step goes round)
+                const size_t look = std::min<size_t>(5, route[slot].size() - 1);
+                auto query = [&](BotNavigation::Point a, BotNavigation::Point b, bool body) { return BotTrace(ctx, base, self, self, a, b, body); };
+                bool passed = false;
+                for (size_t k = look + 1; k-- > 0;)
+                {
+                    BotNavigation::Point landing;
+                    if (BotNavigation::Reachable(feet, route[slot][k], query, landing)) { pick = k; passed = true; break; }
+                }
+                // 0.5.560: none of the next six walkable: the farthest walkable
+                // spot further along the SAME route (up to 24, once a second) is
+                // taken and those before it dropped, so he keeps his way out;
+                // none on the route: worked out again at once from a walkable
+                // start. 559's self-test: side 1's trapped attackers ran at full
+                // speed inside the flag's building with no route spot walkable
+                // (the step hit a wall at x -1600), and each 5 s a new route
+                // aimed at another wall.
+                const char* how = passed ? "walkable" : "first (none walkable)";
+                // 0.5.563: none walkable in a straight line, but a spot of the
+                // route within 200: he is on his way, not lost; steered to the
+                // nearest one (those before it dropped), his step finding its
+                // way round what is between. 562's self-test: routes were made
+                // again 1700 times for "lost" (goal moved 38, ran out 102, no
+                // spot reached 137): Reachable's single sweep over more than
+                // 192 fails on any rise over 18, so on Rouen's uneven streets
+                // far spots are seldom "walkable", and each new route could
+                // point another way.
+                if (!passed)
+                {
+                    // 0.5.573: first, back to the last spot of the route he reached
+                    // when he can walk there straight (572's carrier test: a carrier
+                    // at 650 450 steered to a spot within 200 he could not walk to
+                    // straight, and the step's small Detour search sent him 100-150
+                    // off his way, 21 s for half the way home)
+                    if (haveLast[slot] && hypotf(lastReached[slot].x - feet.x, lastReached[slot].y - feet.y) > 40.0f)
+                    {
+                        BotNavigation::Point landing;
+                        if (BotNavigation::Reachable(feet, lastReached[slot], query, landing))
+                        {
+                            route[slot].insert(route[slot].begin(), lastReached[slot]);
+                            pick = 0; passed = true; how = "back to the last spot reached";
+                        }
+                    }
+                }
+                if (!passed)
+                {
+                    // the farthest along within 200, not the nearest: one he has
+                    // passed would turn him back
+                    size_t along = route[slot].size();
+                    for (size_t k = std::min<size_t>(24, route[slot].size()); k-- > 0;)
+                        if (hypotf(route[slot][k].x - feet.x, route[slot][k].y - feet.y) < 200.0f) { along = k; break; }
+                    if (along < route[slot].size())
+                    {
+                        route[slot].erase(route[slot].begin(), route[slot].begin() + ptrdiff_t(along));
+                        pick = 0; passed = true; how = "on the route within 200 (not straight)";
+                    }
+                }
+                if (!passed)
+                {
+                    static uint32_t widerAt[MaxClients] = {};
+                    if (now - widerAt[slot] >= 1000)
+                    {
+                        widerAt[slot] = now;
+                        const size_t reach = std::min<size_t>(24, route[slot].size());   // (not "far": a Windows macro)
+                        for (size_t k = reach; k-- > look + 1;)
+                        {
+                            BotNavigation::Point landing;
+                            if (BotNavigation::Reachable(feet, route[slot][k], query, landing))
+                            {
+                                route[slot].erase(route[slot].begin(), route[slot].begin() + ptrdiff_t(k));
+                                pick = 0; passed = true; how = "walkable further along (re-anchored)";
+                                break;
+                            }
+                        }
+                        if (!passed) { reachedAt[slot] = 0; how = "none on the route walkable (worked out again)"; }
+                    }
+                }
+                snprintf(g_pickInfo[slot], sizeof(g_pickInfo[slot]), "spot %zu of %zu, %s, %.0f away; made (%s)", pick, route[slot].size(),
+                         how, hypotf(route[slot][pick].x - feet.x, route[slot][pick].y - feet.y),
+                         g_routeRedo[slot] ? g_routeRedo[slot] : "?");
+                picked[slot] = route[slot][pick];
+            }
+            goal[0] = picked[slot].x; goal[1] = picked[slot].y; goal[2] = picked[slot].z;
+        }
+    }
+    memcpy(g_steer[slot], goal, sizeof(g_steer[slot])); g_steerValid[slot] = hasGoal;   // 0.5.483
     const float enemyDistance = found ? sqrtf(best) : 1e30f;
-    const bool toFlag = hasGoal && !atFlag && (!visible || enemyDistance > (warTaker ? 600.0f : 900.0f));
-    if (toFlag)
+    // 0.5.471: a taker keeps on to the flag unless an enemy is within 250 (was
+    // 600): 0.5.470's War on Rouen had the middle flag in play from 91 s to
+    // the end (386 s), never taken, both sides' takers stopping to trade shots
+    // round it (Justin: "the enemy bots are not catching and hoding the
+    // objective and pushing to the next"); on it he fights, crouched
+    // 0.5.566: a CTF attacker within 1600 of the enemy flag runs on for it
+    // as War's taker does (an enemy within 250 stops him, not 900). 565's
+    // 10-minute self-test: no attacker in 36 lives came within 700 of the
+    // enemy flag; both sides' died about 1250 out from it (side 1 at x 850 to
+    // 1160, side 2 at x -500), stopping to fight the stream of the enemy's
+    // respawns leaving their base, one or two against many
+    bool ctfRunner = false, clearFirst = false, ctfDash = false, ctfCommitted = false;
+    if (g_ctfAttacker[slot] && !carrierNow)
+    {
+        const uint32_t rs = BotSide(base, slot);
+        if ((rs == 1 || rs == 2) && g_ctfOwn[3 - rs] >= 0 && g_ctfOwn[3 - rs] <= 1)
+        {
+            const float toEnemyFlag = hypotf(g_obj.at[g_ctfOwn[3 - rs]][0] - me[0], g_obj.at[g_ctfOwn[3 - rs]][1] - me[1]);
+            ctfRunner = toEnemyFlag < 1600.0f;
+            // 0.5.576: within 300 he dashes for it whatever is about (the grab
+            // is a touch at 60): 575's 10-minute match had slot 4 stand 147 from
+            // the enemy flag for half a minute in Think's fight (an enemy within
+            // the runner's 250 there always), till shot
+            ctfDash = toEnemyFlag < 300.0f;
+            // 0.5.581: within 450 he is committed: no falling back hurt (580's
+            // self-test: slot 4, on the walkable way into the building at -1792
+            // -91, 273 from the flag, fell back 300 behind smoke at low health
+            // and was killed out there anyway)
+            ctfCommitted = toEnemyFlag < 450.0f;
+            // 0.5.574: within 700 of it, an enemy in sight within 600 is
+            // fought before the grab (the wave clears the flag's defenders):
+            // 571-573's carrier tests, a taker put on the flag, died 0.3-6 s
+            // after the take, shot by the cover defenders there
+            // 0.5.575: OFF unless COD3_CTF_CLEARFIRST=1: 574's assault test
+            // (waves put 500-800 out) had them stall 350-400 from the flag
+            // trading shots with defenders in cover, no take in 10 assaults;
+            // kept for comparing
+            static const bool clearFirstOn = []() { const char* t = getenv("COD3_CTF_CLEARFIRST"); return t && t[0] == '1'; }();
+            clearFirst = clearFirstOn && toEnemyFlag < 700.0f && visible && enemyDistance < 600.0f;
+        }
+    }
+    // 0.5.568: and a flag carrier always runs (he cannot fire; Think's fight
+    // branch stood him still)
+    const bool toFlag = hasGoal && !atFlag && (carrierNow || ctfDash || (!clearFirst && (!visible || enemyDistance > ((warTaker || ctfRunner) ? 250.0f : 900.0f))));
+    // 0.5.583: running for the flag with an enemy in sight within 900 he
+    // shoots on the move: looks and fires at him, legs to the flag (582's
+    // self-test: side 2's three attacker deaths nearest the flag at -1792 -91,
+    // 211-418 from it, were all running "to goal", looking at the flag, shot by
+    // the defenders in cover 130-300 off without a shot back). Not a carrier.
+    const bool runGun = toFlag && !carrierNow && found && visible && enemyDistance < 900.0f;
+    if (toFlag && !runGun)
     {
         memcpy(target, goal, sizeof(target));
         target[2] = me[2];   // look ahead, level, while running there
@@ -3942,10 +5454,10 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             // camping hold on spawn when there is nobody visible to fight.
             if (campUntil[slot] == 0) { roamUntil[slot]=now+8000;campUntil[slot]=now+11000; }
             if (now >= campUntil[slot]) { roamUntil[slot]=now+8000;campUntil[slot]=now+11000; }
-            if (now < roamUntil[slot]) { g_yaw[slot] += 0.4f; orders.forward = 110; routeRoam(); return orders; }
+            if (now < roamUntil[slot]) { g_yaw[slot] += 0.4f; orders.forward = 110; routeRoam(); g_why[slot] = "roam (no goal)"; return orders; }
             g_yaw[slot] += (now / 2500) % 2 ? 0.7f : -0.7f;
             orders.buttons = BotCrouch(slot, true);
-            routeRoam(); return orders;
+            routeRoam(); g_why[slot] = "roam (no goal)"; return orders;
         }
         if (g_role[slot] == RoleFlanker || g_role[slot] == RoleRusher)
         {
@@ -3961,12 +5473,12 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             g_yaw[slot] += fmaxf(-4.0f, fminf(4.0f, step));
             orders.forward = 127;
             if (g_role[slot] == RoleRusher || fabsf(step) < 10.0f) orders.buttons |= SprintButton;
-            routeRoam(); return orders;
+            routeRoam(); g_why[slot] = "roam (no goal)"; return orders;
         }
         // The objective player with nothing to do: wander, turning slowly.
         g_yaw[slot] += 0.6f;
         orders.forward = 90;
-        routeRoam(); return orders;
+        routeRoam(); g_why[slot] = "roam (no goal)"; return orders;
     }
     // 0.5.195: how he plays this fight, from his role, his health, his gun
     // and his enemy's health: aggressive (closes in), defensive (keeps his
@@ -3993,7 +5505,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     g_charging[slot] = charge;
     static uint32_t retreatUntil[MaxClients] = {}, retreatStart[MaxClients] = {}, retreatCooldown[MaxClients] = {};
     if (found && visible && !atFlag && !charge && health <= 35 && enemyDistance < 750.0f &&
-        now >= retreatCooldown[slot] && now >= tactics.coverUntil && !(g_role[slot] == RoleRusher && health > 20))
+        now >= retreatCooldown[slot] && now >= tactics.coverUntil && !(g_role[slot] == RoleRusher && health > 20) && !ctfCommitted)
     {
         retreatStart[slot] = now; retreatUntil[slot] = now + 3000; retreatCooldown[slot] = now + 9000;
         g_wantSmoke[slot] = GetTickCount() + 500;
@@ -4024,6 +5536,16 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     bool flanking = found && now < flankUntil[slot] && !retreating && !charge;
     if (flanking && (hypotf(flankAt[slot][0] - me[0], flankAt[slot][1] - me[1]) < 90.0f || (visible && enemyDistance < 400.0f)))
     { flankUntil[slot] = 0; flanking = false; }
+    // 0.5.541: a CTF defender at his place with no one about: crouched most
+    // of the time, his view sweeping 55 either side of the way the enemy
+    // comes, slowly (his own phase); with an enemy he fights from there (atFlag)
+    if (!found && g_ctfHold[slot])
+    {
+        const float want = g_ctfWatchYaw[slot] + sinf(float((now + slot * 977u) % 7854u) * 0.0008f) * 55.0f;
+        g_yaw[slot] += fmaxf(-2.0f, fminf(2.0f, AngleDifference(want, g_yaw[slot])));
+        orders.buttons = BotCrouch(slot, (now / 1000u + slot * 3u) % 10u < 7u);
+        g_why[slot] = "cover hold"; return orders;
+    }
     if (!found && hasGoal && atFlag)
     {
         // At his flag with no one about: hold it, looking around.
@@ -4034,7 +5556,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         const uint32_t cycle = (now / 1000u + slot * 5u) % 12u;
         orders.buttons = BotCrouch(slot, cycle >= 8);
         if (cycle < 8) orders.right = ((now / 1500u + slot) % 2) ? 40 : -40;
-        return orders;
+        g_why[slot] = "flag hold"; return orders;
     }
     const float dx = target[0] - me[0], dy = target[1] - me[1], dz = target[2] - me[2];
     const float flat = sqrtf(dx * dx + dy * dy);
@@ -4068,7 +5590,9 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             offset[slot] = known[slot] ? offset[slot] + AngleDifference(measured, offset[slot]) * 0.5f : measured;
             known[slot] = true;
         }
-        if (known[slot])
+        // 0.5.843: not while he lines up on a vehicle (LookAtVehicle turns him; this
+        // pulled him back 8 degrees a frame: sherman6, his view 50-160 off the tank)
+        if (known[slot] && int32_t(GetTickCount() - g_lookVehicleUntil[slot]) >= 0)   // (real time: Think's now is the server's)
         {
             const float step = AngleDifference(wantYaw - offset[slot], g_yaw[slot]);
             g_yaw[slot] += fmaxf(-8.0f, fminf(8.0f, step));
@@ -4095,16 +5619,18 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     // enemy) he takes 350 to 650 ms before he fires, as a player would.
     static uint32_t seenSlot[MaxClients], seenAt[MaxClients];
     if (found && targetSlot != seenSlot[slot]) { seenSlot[slot] = targetSlot; seenAt[slot] = now; }
-    const bool reacted = found && visible && now - seenAt[slot] >= 350 + (phase % 300) &&
-                         (!g_botTactics.load() || now-tactics.sightSince>=350+(phase%300));
+    // 0.5.456: 450 to 850 ms (was 350 to 650)
+    const bool reacted = found && visible && now - seenAt[slot] >= 450 + (phase % 400) &&
+                         (!g_botTactics.load() || now-tactics.sightSince>=450+(phase%400));
+    g_engagedAt[slot] = seenAt[slot];
     if (retreating)
     {
         orders.wantsFire = false; orders.buttons = 0;
-        if (smokeFirst) { orders.forward = 0; orders.right = 0; return orders; }
+        if (smokeFirst) { g_why[slot] = "retreat (smoke)"; orders.forward = 0; orders.right = 0; return orders; }
         orders.forward = 127; orders.right = 0; orders.buttons |= SprintButton;
         BotCrouch(slot, false);
         TacticalMove(ctx,base,self,0,slot,now,health,viewYaw,escape,false,orders);
-        return orders;
+        g_why[slot] = "retreat"; return orders;
     }
     if (exploring)
     {
@@ -4119,18 +5645,18 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             {   // 0.5.202: lying down, scoped in, watching
                 BotProne(slot);
                 if (BotsScopedWeapon(base, HeldDef(base, record))) orders.buttons |= 0x8u;
-                return orders;
+                g_why[slot] = "explore (overwatch)"; return orders;
             }
             if (st == St::High && slot % 2) BotProne(slot);
             else BotCrouch(slot, st == St::High || st == St::Low);
-            return orders;
+            g_why[slot] = "explore (hold)"; return orders;
         }
         orders.forward = 127; orders.right = 0;
         BotCrouch(slot, false);
         const float fx = exploreGoal[0] - me[0], fy = exploreGoal[1] - me[1];
         if (g_explore[slot].style == BotNavigation::MapKnowledge::Style::Outskirts || fx * fx + fy * fy > 500.0f * 500.0f) orders.buttons |= SprintButton;
         TacticalMove(ctx,base,self,0,slot,now,health,viewYaw,exploreGoal,false,orders);
-        return orders;
+        g_why[slot] = "explore (errand)"; return orders;
     }
     // 0.5.198: crossing to the flag, or charging in from range, with an enemy
     // near enough to see him: a smoke thrown ahead first, now and then.
@@ -4143,7 +5669,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             printf("bots: slot %u smokes his way %s\n", slot, toFlag ? "to the flag" : "in"); fflush(stdout);
         }
     }
-    if (toFlag)
+    if (toFlag && !runGun)
     {
         // Running to the flag, weaving a little, sprinting (0x4, the button
         // the host's commands carry while he runs flat out).
@@ -4151,7 +5677,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         orders.right = ((now + phase) / 1400) % 2 ? 30 : -30;
         orders.buttons |= SprintButton;
         TacticalMove(ctx,base,self,0,slot,now,health,viewYaw,goal,false,orders);
-        return orders;
+        g_why[slot] = "to goal"; return orders;
     }
 
     bool crouch = false, prone = false;
@@ -4163,6 +5689,11 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         orders.right = 0;
         crouch = ((now + phase) / 2000) % 2 == 0;
         if (!crouch) orders.right = ((now + phase) / 900) % 2 ? 60 : -60;
+    }
+    else if (runGun)
+    {
+        orders.forward = 127;
+        orders.right = ((now + phase) / 1400) % 2 ? 30 : -30;
     }
     else if (charge)
     {
@@ -4185,11 +5716,14 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         // At range, he stops to shoot: crouched, or dropped prone when hurt,
         // defensive, or far off (0.5.88 crouched a third of the time).
         // A shotgun never stops at range: it closes in.
-        if (!shotgun && visible && fabsf(yawError) < 15.0f && flat > (defensive ? 400.0f : 700.0f) &&
-            (defensive || ((now + phase) / 2200) % 3 == 0))
+        // 0.5.457: past 450 (defensive 300; was 700 and 400), two times in three
+        // (was one in three); prone when hurt (60 or less), defensive or past
+        // 900 (was 50 and 1100). Justin: "not alot of bots take cover or go prone"
+        if (!shotgun && visible && fabsf(yawError) < 15.0f && flat > (defensive ? 300.0f : 450.0f) &&
+            (defensive || ((now + phase) / 2200) % 3 != 2))
         {
             orders.forward = 0; orders.right = 0;
-            if ((health <= 50 || defensive || flat > 1100.0f) && ((now + phase) / 4000) % 2 == 0) prone = true;
+            if ((health <= 60 || defensive || flat > 900.0f) && ((now + phase) / 4000) % 2 == 0) prone = true;
             else crouch = true;
         }
         if (flanking)
@@ -4202,6 +5736,39 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     // rifle that wants each shot its own press fires too).
     // 0.5.201: no team kills, one rocket at a time (BotHoldsLauncher above).
     const bool launcher = BotHoldsLauncher(base, record);
+    // 0.5.457: a launcher bot's pistol up close (it never fires within 300, so
+    // he stood there), his launcher again past 700 while it has rockets
+    {
+        static uint32_t nextSwap[MaxClients] = {};
+        static const char* const pistols[] = { "colt", "p38", "webley", "tt33" };
+        static const char* const launchers[] = { "bazooka", "panzerschreck" };
+        if (record && found && now >= nextSwap[slot] && !throwing)
+        {
+            const bool riflenadeHeld = riflenade;
+            if (launcher && !riflenadeHeld && visible && flat < 350.0f)
+            {
+                for (const char* name : pistols)
+                    if (BotOwnsLoaded(base, record, name) && BotSwitch(ctx, base, self, name))
+                    {
+                        nextSwap[slot] = now + 3000;
+                        static int told = 0;
+                        if (told++ < 40) { printf("bots: slot %u draws his %s (launcher, enemy %.0f away)\n", slot, name, flat); fflush(stdout); }
+                        break;
+                    }
+            }
+            else if (!launcher && flat > 700.0f)
+            {
+                for (const char* name : launchers)
+                    if (BotOwnsLoaded(base, record, name) && BotSwitch(ctx, base, self, name))
+                    {
+                        nextSwap[slot] = now + 3000;
+                        static int told = 0;
+                        if (told++ < 40) { printf("bots: slot %u takes his %s again (enemy %.0f away)\n", slot, name, flat); fflush(stdout); }
+                        break;
+                    }
+            }
+        }
+    }
     uint32_t blocker = 0xFFFFFFFFu;
     const bool aimed = !throwing && reacted && fabsf(yawError) < 6.0f && fabsf(pitchError) < 6.0f && (flat < 1600.0f || (riflenade && flat < 2300.0f));
     // 0.5.202: aim down the sights (button 0x8, the game's +speed: what the
@@ -4213,9 +5780,10 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     const bool scopedHeld = BotsScopedWeapon(base, HeldDef(base, record));
     static uint32_t adsSince[MaxClients] = {};
     const bool wantAds = visible && reacted && !throwing && fabsf(yawError) < 20.0f &&
-                         (BotHoldsLauncher(base, record) || scopedHeld || (flat > 700.0f && fight != FightAggressive && !charge));
+                         (BotHoldsLauncher(base, record) || scopedHeld || (flat > 250.0f && !charge));   // 0.5.456: sights up past 250 (was 700, and not when aggressive): Justin, "make sure the bots do ads when shooting and adjusting"
     if (wantAds) { if (!adsSince[slot]) adsSince[slot] = now; } else adsSince[slot] = 0;
     const bool adsReady = !wantAds || now - adsSince[slot] >= (BotHoldsLauncher(base, record) ? 700u : 350u);
+    g_adsNow[slot] = wantAds && adsSince[slot] && now - adsSince[slot] >= 250u;
     bool mateBlocks = false;
     if (aimed)
     {
@@ -4259,7 +5827,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     int bunched = 0;
     for (int k = 0; k < 3; k++)
         if (nearSlot[k] < MaxClients && nearSlot[k] != targetSlot && hypotf(nearAt[k][0] - target[0], nearAt[k][1] - target[1]) < 300.0f) bunched++;
-    if (!throwing && (visible || hidingNear) && now >= g_nextNade[slot] && flat > (visible ? (bunched ? 300.0f : 350.0f) : 250.0f) && flat < 1500.0f && fabsf(yawError) < 12.0f &&
+    if (!throwing && now - g_lastThrowAt[slot % 32] >= ThrowGapMs && SideThrowFree(mySide, me[0], me[1], now) && (visible || hidingNear) && now >= g_nextNade[slot] && flat > (visible ? (bunched ? 300.0f : 350.0f) : 250.0f) && flat < 1500.0f && fabsf(yawError) < 12.0f &&
         !MateNear(base, self, mySide, target, 320.0f))   // 0.5.201: not onto teammates
     {
         const uint32_t ammo = BotNadeAmmo(base, Guest::Read32(base, self + 512), false);
@@ -4267,7 +5835,9 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         if (ammo)
         {
             g_nadeBit[slot] = g_fragSearch.Next(slot, now, ammo, 0);
-            g_nadeUntil[slot] = g_throwUntil[slot] = now + 350;
+            g_nadeUntil[slot] = g_throwUntil[slot] = now + ThrowPressMs;
+            g_lastThrowAt[slot % 32] = now;
+            SideThrew(mySide, me[0], me[1], now);   // 0.5.608
             g_throwWeapon[slot] = BotNadeWeapon(base, Guest::Read32(base, self + 512), false); g_throwFrames[slot] = 1; g_throwQuiet[slot] = 60;   // the first command names the grenade; 60 commands with no stance, sprint or fire
             printf("bots: slot %u throws a grenade at %.0f%s (button %08X, weapon %u, %u left)\n", slot, flat, bunched ? " (enemies bunched)" : hidingNear ? " (behind cover)" : "", g_nadeBit[slot], g_throwWeapon[slot], ammo); fflush(stdout);
         }
@@ -4288,7 +5858,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             {
                 const uint32_t def = Guest::Read32(base, list + 4 * n);
                 const uint32_t text = (def >= 0x40000000u && def < 0xA0000000u) ? Guest::Read32(base, def + 8) : 0;
-                if (text < 0x40000000u || text >= 0xA0000000u) continue;
+                if (text < 0x40000000u || text >= 0xC0000000u) continue;   // (0.5.757: copies' names lie at 0xAA..)
                 char name[32] = {};
                 for (int c = 0; c < 31; c++) { const char ch = char(tolower(Guest::Read8(base, text + c))); if (!ch) break; name[c] = ch; }
                 if (!strstr(name, "_rg")) continue;
@@ -4305,7 +5875,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
         !MateNear(base, self, mySide, target, 350.0f) && !BotHoldsLauncher(base, record))
     {
         const uint32_t rg = BotRifleGrenade(base, record);
-        g_nextRg[slot] = now + (BotIsDemolitionist(slot) ? 6000 + (phase % 3000) : 10000 + (phase % 6000));
+        g_nextRg[slot] = now + (BotIsDemolitionist(slot) ? 5000 + (phase % 2000) : 7000 + (phase % 4000));   // 0.5.456: more often (was 6-9 s / 10-16 s)
         if (rg)
         {
             g_rgWeapon[slot] = rg; g_rgUntil[slot] = now + 5000;
@@ -4361,7 +5931,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     // own lane (up to 520 units to either side of the straight line), so a
     // group arrives from several directions, not in single file.
     float laneAt[3] = {};
-    const float* moveTo = flanking ? flankAt[slot] : nullptr;
+    const float* moveTo = runGun ? goal : flanking ? flankAt[slot] : nullptr;
     if (!flanking && found && !visible && !atFlag && enemyDistance > 600.0f)
     {
         const float lx = target[0] - me[0], ly = target[1] - me[1], ll = hypotf(lx, ly);
@@ -4374,8 +5944,8 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     }
     TacticalMove(ctx,base,self,threat,slot,now,health,viewYaw,target,atFlag,orders,moveTo);
     // 0.5.201: a teammate in his line of fire: a step aside to clear it.
-    if (now < g_sidestepUntil[slot]) { orders.right = int8_t(g_sidestepDir[slot] * 110); }
-    return orders;
+    if (now < g_sidestepUntil[slot] && !runGun) { orders.right = int8_t(g_sidestepDir[slot] * 110); }
+    g_why[slot] = runGun ? "to goal, shooting" : "fight"; return orders;
 }
 
 // 0.5.170: Justin: the bots should melee when close, use their smoke
@@ -4419,17 +5989,30 @@ static void BotExtras(uint8_t* base, uint32_t slot, BotOrders& orders)
     // to cross under (at most every 16-26 s, as the others).
     const bool screen = g_role[slot] == RoleRusher && slot % 3 == 0 && orders.forward > 60 &&   // 0.5.277: a third of the rushers only
                         g_seeDist[slot] > 700.0f && g_seeDist[slot] < 2500.0f && now >= nextSmoke[slot];
-    if ((health <= 60 && g_seeDist[slot] < 1500.0f && now >= nextSmoke[slot]) || evasive || screen)
+    const uint32_t throwSide = BotSide(base, slot);   // 0.5.608: one throw a side at a time (SideThrowFree)
+    const float throwX = ReadFloat(base, record), throwY = ReadFloat(base, record + 4);
+    // 0.5.752: COD3_BOT_SMOKE_EVERY=ms (tests): a smoke thrown that often, whatever else
+    static const uint32_t smokeEvery = getenv("COD3_BOT_SMOKE_EVERY") ? uint32_t(atoi(getenv("COD3_BOT_SMOKE_EVERY"))) : 0;
+    const bool forced = smokeEvery > 0 && now >= nextSmoke[slot];
+    if (((health <= 60 && g_seeDist[slot] < 1500.0f && now >= nextSmoke[slot]) || evasive || screen || forced) && now - g_lastThrowAt[slot % 32] >= ThrowGapMs &&
+        SideThrowFree(throwSide, throwX, throwY, now))
     {
         const uint32_t ammo = BotNadeAmmo(base, record, true);
-        nextSmoke[slot] = now + 47250 + phase % 21000;   // 0.5.333: 5% fewer (Justin): 47 to 68 s (277: 45 to 65 s; 198: 16 to 26 s)
+        nextSmoke[slot] = now + (smokeEvery ? smokeEvery : 47250 + phase % 21000);   // 0.5.333: 5% fewer (Justin): 47 to 68 s (277: 45 to 65 s; 198: 16 to 26 s)
         static int toldSmoke = 0;   // 0.5.199: its own count (shared with the melees it ran out)
         if (ammo)
         {
             smokeBit[slot] = g_smokeSearch.Next(slot, now, ammo, 0);
-            smokeUntil[slot] = g_throwUntil[slot] = now + 350;
-            g_throwWeapon[slot] = BotNadeWeapon(base, record, true); g_throwFrames[slot] = 1; g_throwQuiet[slot] = 60;   // the first command names the grenade; 60 commands with no stance, sprint or fire
-            if ((toldSmoke < 200 && toldSmoke++ < 200)) { printf("bots: slot %u throws smoke (health %d%s, button %08X, %u left)\n", slot, health, evasive ? ", for cover" : "", smokeBit[slot], ammo); fflush(stdout); }
+            smokeUntil[slot] = g_throwUntil[slot] = now + ThrowPressMs;
+            g_lastThrowAt[slot % 32] = now;
+            SideThrew(throwSide, throwX, throwY, now);   // 0.5.608
+            // 0.5.754: 30 commands name the smoke (or the flare), as the host's throw
+            // does (its 159 commands named 0x30, the flare, 740's trace): 753's trace
+            // had the bots name it in the first only, their gun from the second, and
+            // the game took the gun back (+168 3, then 1; +164 the gun): no smoke
+            // or flare thrown, nothing spent (their frags go with one)
+            g_throwWeapon[slot] = BotNadeWeapon(base, record, true); g_throwFrames[slot] = 30; g_throwQuiet[slot] = 60;   // 60 commands with no stance, sprint or fire
+            if ((toldSmoke < 200 && toldSmoke++ < 200)) { printf("bots: slot %u throws smoke (health %d%s, button %08X, weapon %u, %u left)\n", slot, health, evasive ? ", for cover" : "", smokeBit[slot], g_throwWeapon[slot], ammo); fflush(stdout); }
         }
         else
         {
@@ -4446,7 +6029,7 @@ static void BotExtras(uint8_t* base, uint32_t slot, BotOrders& orders)
                     const uint32_t def = Guest::Read32(base, list + 4 * w);
                     if (def < 0x40000000u || def >= 0xA0000000u) continue;
                     const uint32_t text = Guest::Read32(base, def + 8);
-                    if (text < 0x40000000u || text >= 0xA0000000u) continue;
+                    if (text < 0x40000000u || text >= 0xC0000000u) continue;   // (0.5.757: copies' names lie at 0xAA..)
                     char name[40] = {};
                     for (int c = 0; c < 39; c++) { const char ch = char(Guest::Read8(base, text + c)); if (!ch) break; name[c] = ch; }
                     std::string lower(name); for (char& ch : lower) ch = char(tolower(static_cast<unsigned char>(ch)));
@@ -4529,6 +6112,7 @@ static void RememberMgSpot(BotNavigation::Point p)
 // player presses to get in) and reload 0x400. 0.5.198's bots pressed 0x20 and
 // 0x400 beside 40 motorcycles and never got on.
 constexpr uint32_t UseButtons = 0x20 | 0x40 | 0x400;
+constexpr uint32_t FlagUseButton = 0x40;   // 0.5.483: CTF flags (BotFlagUse)
 
 struct BotVehicleInfo { uint32_t entity, record; BotNavigation::Point at; float yaw; char kind[24]; uint32_t driver, riders; };
 static BotVehicleInfo g_vehicles[24];
@@ -4594,6 +6178,13 @@ static void LookAtVehicle(uint8_t* base, uint32_t slot, uint32_t record, uint32_
     if (!std::isfinite(dx) || !std::isfinite(dy) || !std::isfinite(dz)) return;
     const float want = BotAim::Pitch(dx, dy, dz) * PitchSign();
     g_pitch[slot] += std::clamp(want - g_pitch[slot], -5.0f, 5.0f);
+    // 0.5.841: and his facing, every frame (a third of what is left, at most 8 degrees: the view
+    // lags the orders a frame or two). Before, tank_fire turned him 30 degrees once a try, so he
+    // pressed use looking past the tank (sherman1-4: no Sherman in five, either side, while the
+    // user got into one by hand: the game never even checked him against it).
+    const float bearing = atan2f(dy, dx) * 57.29578f;
+    g_yaw[slot] += std::clamp(AngleDifference(bearing, ReadFloat(base, record + 208)) * 0.33f, -8.0f, 8.0f);
+    g_lookVehicleUntil[slot] = GetTickCount() + 250;
 }
 
 struct BotSeat {
@@ -4609,6 +6200,279 @@ struct BotSeat {
     bool haveDriveTo = false;
 };
 static BotSeat g_seat[MaxClients];
+
+// 0.5.796: "tank_fire [seconds]" (console or COD3_CMD), for tests: tests
+// cannot fire a tank themselves, and bots get into one only by luck (they go
+// for one, then give up in a fight). The first living bot is put (the game's
+// teleport, sub_8255E118) beside the free tank nearest the host, presses use
+// until he is in, then fires the tank's own gun (the fire button, held 0.3 s
+// every 3 s) at the ground ~700 ahead of it, for the seconds asked (60 by
+// default). Nothing is made by hand: the game's own shot, shell and events.
+// Logged "bots: tank_fire ...".
+// 0.5.799: a second bot rides as the gunner (the tank's machine gun, seat 1)
+// once the first is in: "tank_fire [seconds] [crew 1|2]" (2 by default).
+static std::atomic<int> g_tankFireAsk{0}, g_tankFireCrew{2};
+struct TankFireState { uint32_t slot = ~0u, entity = 0, vehicle = 0, until = 0, nextUse = 0, useUntil = 0, nextShot = 0, shotUntil = 0, tries = 0, shots = 0; bool inside = false; };
+static TankFireState g_tankFire, g_tankGunner;
+static std::vector<uint32_t> g_tankFireFailed;   // 0.5.800: tanks he could not get into
+void BotsTankFire(int seconds, int crew)
+{
+    g_tankFireCrew.store(crew == 1 ? 1 : 2);
+    g_tankFireAsk.store(seconds > 0 ? seconds : 60);
+    printf("bots: tank_fire %d s asked, crew %d\n", seconds > 0 ? seconds : 60, crew == 1 ? 1 : 2);
+    fflush(stdout);
+}
+static bool IsTankKind(const char* kind)
+{
+    std::string k = kind;
+    for (char& c : k) c = char(tolower(static_cast<unsigned char>(c)));
+    return k.find("panzer") != std::string::npos || k.find("sherman") != std::string::npos || k.find("tiger") != std::string::npos;
+}
+// 0.5.798: a vehicle's own update (sub_82582280, the vehicle r3, its time
+// r4; called from sub_82591B40) fires its gun (events 25, 26, the shell)
+// only for a rider whose move-lock byte (0x82C73024 + his client's +2804) is
+// clear and whose buttons (his client's +1940) have fire. That byte is set
+// for every bot (a networked game's "not this machine's player"; ThinkBots
+// clears it only for his own think), so a bot in a tank never fired its
+// cannon (796's tankfire2: in a Panzer, fire held 41 times, no tank event;
+// tankfire1's turret events were the HOST's, "host buttons 00000001"). While a
+// vehicle is updated the bots' bytes are clear, as for their thinks.
+extern "C" PPC_FUNC(__imp__sub_82582280);
+PPC_FUNC(sub_82582280)
+{
+    uint32_t bytes[MaxClients * 2]; uint8_t was[MaxClients * 2]; int n = 0;
+    const uint32_t entities = Guest::Read32(base, EntityList);
+    for (uint32_t slot = FirstBotSlot(); entities && slot < ActiveSlots() && slot < MaxClients; slot++)
+    {
+        if (!g_bot[slot]) continue;
+        const uint32_t e = Guest::Read32(base, entities + 4 * (slot + 1));
+        const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+        uint32_t index[2] = { slot, r ? Guest::Read32(base, r + 2804) : 0xFFFFFFFFu };
+        for (uint32_t i : index)
+        {
+            if (i >= 64) continue;
+            bool dup = false; for (int k = 0; k < n; k++) if (bytes[k] == MoveLocked + i) dup = true;
+            if (dup || n >= int(MaxClients * 2)) continue;
+            bytes[n] = MoveLocked + i; was[n] = Guest::Read8(base, bytes[n]); Guest::Write8(base, bytes[n], 0); n++;
+        }
+    }
+    __imp__sub_82582280(ctx, base);
+    for (int k = n - 1; k >= 0; k--) Guest::Write8(base, bytes[k], was[k]);
+}
+
+// true: this bot is the tank_fire bot this frame (his orders are set here)
+static bool BotTankFire(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t self, uint32_t record, BotOrders& orders, uint32_t inVehicle, int32_t seatNo)
+{
+    using namespace BotNavigation;
+    TankFireState& t = g_tankFire;
+    const uint32_t now = GetTickCount();
+    const int asked = g_tankFireAsk.exchange(0);
+    if (asked > 0)
+    {
+        t = {}; g_tankGunner = {}; g_tankFireFailed.clear();
+        t.until = now + uint32_t(asked) * 1000u;
+    }
+    if (!t.until) return false;
+    if (now >= t.until)
+    {
+        printf("bots: tank_fire over: %u cannon shots, %u machine gun bursts asked\n", t.shots, g_tankGunner.shots); fflush(stdout);
+        t = {}; g_tankGunner = {};
+        return false;
+    }
+    if (t.slot == ~0u) { t.slot = slot; t.entity = self; printf("bots: tank_fire: slot %u is the driver (the cannon)\n", slot); fflush(stdout); }
+    if (t.slot != slot)
+    {
+        // 0.5.799: the gunner: once the driver is in, into the same tank (seat 1)
+        TankFireState& g = g_tankGunner;
+        if (g_tankFireCrew.load() < 2 || !t.inside || !t.vehicle) return false;
+        // 0.5.806: a bot of the driver's side (seelowcheck1: the gunner could not
+        // get in, 16 tries; in tankmortar2 one of his side did)
+        if (g.slot == ~0u && BotSide(base, slot) != BotSide(base, t.slot)) return false;
+        if (g.slot == ~0u) { g.slot = slot; g.entity = self; printf("bots: tank_fire: slot %u is the gunner (the machine gun)\n", slot); fflush(stdout); }
+        if (g.slot != slot) return false;
+        if (g.entity != self) { g.entity = self; g.inside = false; g.tries = 0; }
+        ListVehicles(base, now);
+        const BotVehicleInfo* tank = nullptr;
+        for (int i = 0; i < g_vehicleCount; i++) if (g_vehicles[i].entity == t.vehicle) tank = &g_vehicles[i];
+        orders.forward = orders.right = 0;
+        orders.buttons &= ~(1u | UseButtons | SprintButton | StanceButton);
+        orders.wantsFire = false;
+        if (inVehicle)
+        {
+            if (!g.inside) { g.inside = true; g.nextShot = now + 1000; printf("bots: tank_fire: slot %u is in %s, seat %d: fires the machine gun\n", slot, tank ? tank->kind : "?", seatNo); fflush(stdout); }
+            if (tank)
+            {
+                // the same ground ~700 ahead of the tank
+                const float yaw = tank->yaw * 0.017453293f;
+                const float gx = tank->at.x + 700.0f * cosf(yaw), gy = tank->at.y + 700.0f * sinf(yaw);
+                const float eye = BotAim::EyeHeight(ReadFloat(base, record + 220));
+                const float dx = gx - ReadFloat(base, record), dy = gy - ReadFloat(base, record + 4), dz = tank->at.z - (ReadFloat(base, record + 8) + eye);
+                if (std::isfinite(dx) && std::isfinite(dy) && std::isfinite(dz))
+                {
+                    const float bearing = atan2f(dy, dx) * 57.29578f;
+                    g_yaw[slot] += std::clamp(AngleDifference(bearing, ReadFloat(base, record + 208)), -3.0f, 3.0f);
+                    const float want = BotAim::Pitch(dx, dy, dz) * PitchSign();
+                    g_pitch[slot] += std::clamp(want - g_pitch[slot], -3.0f, 3.0f);
+                    g_wantYaw[slot] = bearing; g_wantPitch[slot] = want;
+                }
+            }
+            // bursts: 1.2 s of fire every 4 s
+            if (now >= g.nextShot) { g.shotUntil = now + 1200; g.nextShot = now + 4000; g.shots++; if (g.shots <= 40) { printf("bots: tank_fire: machine gun burst %u\n", g.shots); fflush(stdout); } }
+            if (now < g.shotUntil) { orders.buttons |= 1u; orders.wantsFire = true; }
+            return true;
+        }
+        if (g.inside) { g.inside = false; g.tries = 0; printf("bots: tank_fire: slot %u (gunner) is out: in again\n", slot); fflush(stdout); }
+        if (!tank) return true;
+        if (now < g.useUntil) { orders.buttons |= UseButtons; LookAtVehicle(base, slot, record, tank->entity); return true; }
+        if (now < g.nextUse) { LookAtVehicle(base, slot, record, tank->entity); return true; }
+        if (g.tries >= 32) { if (g.tries++ == 32) { printf("bots: tank_fire: slot %u could not get in as the gunner\n", slot); fflush(stdout); } return true; }
+        static uint32_t gunnerPlace = 0;
+        if (!gunnerPlace) gunnerPlace = Guest::AllocatePhysical(0x20);
+        // 0.5.845: eight places round it at 95, then 130, as the driver's (0.5.844)
+        const float side = float((g.tries / 2) % 8) * 0.78539816f;
+        const float reach = (g.tries / 16) % 2 ? 130.0f : 95.0f;
+        const float yaw = tank->yaw * 0.017453293f + side;
+        const float at[3] = { tank->at.x + reach * cosf(yaw), tank->at.y + reach * sinf(yaw), tank->at.z + 8.0f };
+        if (g.tries % 2 == 0)
+        {
+            auto putF = [&](uint32_t a, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, a, w); };
+            putF(gunnerPlace, at[0]); putF(gunnerPlace + 4, at[1]); putF(gunnerPlace + 8, at[2]);
+            PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+            place.r3.u64 = self; place.r4.u64 = gunnerPlace; place.lr = 0;
+            Guest::Lookup(0x8255E118)(place, base);
+        }
+        const float bearing = atan2f(tank->at.y - ReadFloat(base, record + 4), tank->at.x - ReadFloat(base, record)) * 57.29578f;
+        g_yaw[slot] += std::clamp(AngleDifference(bearing, ReadFloat(base, record + 208)), -30.0f, 30.0f);
+        LookAtVehicle(base, slot, record, tank->entity);
+        g.tries++;
+        g.useUntil = now + 400; g.nextUse = g.useUntil + 1200;
+        printf("bots: tank_fire: slot %u (gunner) presses use at %s (try %u)\n", slot, tank->kind, g.tries); fflush(stdout);
+        return true;
+    }
+    if (t.entity != self) { t.entity = self; t.vehicle = 0; t.inside = false; t.tries = 0; printf("bots: tank_fire: slot %u has a new body: again\n", slot); fflush(stdout); }
+    ListVehicles(base, now);
+    const BotVehicleInfo* tank = nullptr;
+    for (int i = 0; i < g_vehicleCount; i++) if (g_vehicles[i].entity == (inVehicle ? inVehicle : t.vehicle)) tank = &g_vehicles[i];
+    // pick: the free tank nearest the host (so the host sees it)
+    if (!t.vehicle || !tank)
+    {
+        const uint32_t entities = Guest::Read32(base, EntityList);
+        const uint32_t host = entities ? Guest::Read32(base, entities + 4) : 0;
+        const Point hostAt = host ? Point{ ReadFloat(base, host + 336), ReadFloat(base, host + 340), ReadFloat(base, host + 344) } : Point{};
+        float best = 1e9f;
+        tank = nullptr;
+        // 0.5.802: his own side's first (a Sherman for the Allies, a Panzer IV
+        // for the Axis): mervtank1's Axis bot pressed use at a Sherman 12 times
+        const bool allies = BotSide(base, slot) == 1;
+        for (int i = 0; i < g_vehicleCount; i++)
+        {
+            const BotVehicleInfo& v = g_vehicles[i];
+            if (!IsTankKind(v.kind) || v.riders) continue;
+            if (std::find(g_tankFireFailed.begin(), g_tankFireFailed.end(), v.entity) != g_tankFireFailed.end()) continue;   // 0.5.800
+            std::string kind = v.kind;
+            for (char& c : kind) c = char(tolower(static_cast<unsigned char>(c)));
+            // 0.5.811: the Panzer IV first whatever his side: on Seelow no bot has got
+            // into a Sherman (tankboom1, seelowcheck1-3: twelve tries each), while
+            // the Allied and Axis bots alike get into a Panzer IV
+            (void)allies;
+            // 0.5.839: COD3_TANK_FIRE_KIND=sherman (or panzer): that kind first (the Shermans' test)
+            static const char* const wantKind = getenv("COD3_TANK_FIRE_KIND");
+            const bool own = wantKind ? kind.find(wantKind) != std::string::npos : kind.find("sherman") == std::string::npos;
+            const float d = Distance(hostAt, v.at) + (own ? 0.0f : 100000.0f);
+            if (d < best) { best = d; tank = &v; }
+        }
+        if (best >= 100000.0f) best -= 100000.0f;
+        static uint32_t toldNone = 0;
+        if (!tank) { if (now - toldNone > 5000) { toldNone = now; printf("bots: tank_fire: no free tank (%d vehicles)\n", g_vehicleCount); fflush(stdout); } return false; }
+        t.vehicle = tank->entity; t.tries = 0; t.nextUse = 0;
+        printf("bots: tank_fire: slot %u (side %d) takes %s at %.0f %.0f %.0f (%.0f from the host)\n", slot, BotSide(base, slot), tank->kind, tank->at.x, tank->at.y, tank->at.z, best); fflush(stdout);
+    }
+    orders.forward = orders.right = 0;
+    orders.buttons &= ~(1u | UseButtons | SprintButton | StanceButton);
+    if (inVehicle)
+    {
+        if (!t.inside)
+        {
+            t.inside = true; t.nextShot = now + 1500;
+            printf("bots: tank_fire: slot %u is in %s, seat %d: fires\n", slot, tank ? tank->kind : "?", seatNo); fflush(stdout);
+        }
+        // aim at the ground ~700 ahead of the tank
+        if (tank)
+        {
+            const float yaw = tank->yaw * 0.017453293f;
+            const float gx = tank->at.x + 700.0f * cosf(yaw), gy = tank->at.y + 700.0f * sinf(yaw);
+            const float eye = BotAim::EyeHeight(ReadFloat(base, record + 220));
+            const float dx = gx - ReadFloat(base, record), dy = gy - ReadFloat(base, record + 4), dz = tank->at.z - (ReadFloat(base, record + 8) + eye);
+            if (std::isfinite(dx) && std::isfinite(dy) && std::isfinite(dz))
+            {
+                const float bearing = atan2f(dy, dx) * 57.29578f;
+                g_yaw[slot] += std::clamp(AngleDifference(bearing, ReadFloat(base, record + 208)), -3.0f, 3.0f);
+                const float want = BotAim::Pitch(dx, dy, dz) * PitchSign();
+                g_pitch[slot] += std::clamp(want - g_pitch[slot], -3.0f, 3.0f);
+            }
+        }
+        if (now >= t.nextShot)
+        {
+            t.shotUntil = now + 300; t.nextShot = now + 3000; t.shots++;
+            printf("bots: tank_fire: shot %u (fire held 0.3 s): view pitch %.1f yaw %.1f, wanted pitch %.1f; tank at %.0f %.0f %.0f yaw %.0f\n", t.shots,
+                   ReadFloat(base, record + 204), ReadFloat(base, record + 208), g_pitch[slot], tank ? tank->at.x : 0.0f, tank ? tank->at.y : 0.0f, tank ? tank->at.z : 0.0f, tank ? tank->yaw : 0.0f);
+            fflush(stdout);
+        }
+        if (now < t.shotUntil) orders.buttons |= 1u;
+        return true;
+    }
+    if (t.inside) { t.inside = false; t.tries = 0; printf("bots: tank_fire: slot %u is out of the tank: in again\n", slot); fflush(stdout); }
+    if (!tank) return true;
+    if (now < t.useUntil)
+    {
+        orders.buttons |= UseButtons; LookAtVehicle(base, slot, record, tank->entity);
+        // 0.5.842: where he really is and looks while pressing (sherman5: still never in)
+        static uint32_t toldTry = ~0u;
+        if (toldTry != t.tries && t.useUntil - now < 200)
+        {
+            toldTry = t.tries;
+            const float bx = ReadFloat(base, record), by = ReadFloat(base, record + 4), bz = ReadFloat(base, record + 8);
+            const float bearing = atan2f(tank->at.y - by, tank->at.x - bx) * 57.29578f;
+            printf("bots: tank_fire: slot %u pressing use: at %.0f %.0f %.0f (%.0f from the tank's middle, %.0f below/above it), view yaw %.0f (the tank at %.0f), pitch %.0f, buttons %08X\n",
+                   slot, bx, by, bz, sqrtf((tank->at.x - bx) * (tank->at.x - bx) + (tank->at.y - by) * (tank->at.y - by)), bz - tank->at.z,
+                   ReadFloat(base, record + 208), bearing, ReadFloat(base, record + 204), orders.buttons);
+            fflush(stdout);
+        }
+        return true;
+    }
+    if (now < t.nextUse) { LookAtVehicle(base, slot, record, tank->entity); return true; }
+    // beside it (the side the try says), then use
+    if (t.tries >= 32)   // 0.5.844: 16 places, two presses each (was 12)
+    {
+        // 0.5.800: not that one again (tankmortar1: the same Sherman ten times over)
+        g_tankFireFailed.push_back(tank->entity);
+        if (g_tankFireFailed.size() >= 6) g_tankFireFailed.erase(g_tankFireFailed.begin());
+        printf("bots: tank_fire: slot %u could not get into %s: another\n", slot, tank->kind); fflush(stdout); t.vehicle = 0; return true;
+    }
+    static uint32_t placeAt = 0;
+    if (!placeAt) placeAt = Guest::AllocatePhysical(0x20);
+    // 0.5.844: eight places round it (sides and corners) at 95 and then 130 (was the four sides at 110:
+    // sherman7 faced the tank at each and was never let in; the user got into one from its rear corner)
+    const float side = float((t.tries / 2) % 8) * 0.78539816f;
+    const float reach = (t.tries / 16) % 2 ? 130.0f : 95.0f;
+    const float yaw = tank->yaw * 0.017453293f + side;
+    const float at[3] = { tank->at.x + reach * cosf(yaw), tank->at.y + reach * sinf(yaw), tank->at.z + 8.0f };
+    if (t.tries % 2 == 0)
+    {
+        auto putF = [&](uint32_t a, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, a, w); };
+        putF(placeAt, at[0]); putF(placeAt + 4, at[1]); putF(placeAt + 8, at[2]);
+        PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+        place.r3.u64 = self; place.r4.u64 = placeAt; place.lr = 0;
+        Guest::Lookup(0x8255E118)(place, base);
+    }
+    const float bearing = atan2f(tank->at.y - ReadFloat(base, record + 4), tank->at.x - ReadFloat(base, record)) * 57.29578f;
+    g_yaw[slot] += std::clamp(AngleDifference(bearing, ReadFloat(base, record + 208)), -30.0f, 30.0f);
+    LookAtVehicle(base, slot, record, tank->entity);
+    t.tries++;
+    t.useUntil = now + 400; t.nextUse = t.useUntil + 1200;
+    printf("bots: tank_fire: slot %u presses use at %s (try %u, at %.0f %.0f %.0f)\n", slot, tank->kind, t.tries, at[0], at[1], at[2]); fflush(stdout);
+    return true;
+}
 
 static int BotsCrewing(uint8_t* base, uint32_t side)
 {
@@ -4654,6 +6518,7 @@ static void BotSeats(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& o
     int32_t seatNo = -1;
     const uint32_t inVehicle = InVehicle(base, self, &seatNo);
     const bool mounted = (Guest::Read32(base, record + 240) & 0x100000u) != 0 && !inVehicle;
+    if (BotTankFire(ctx, base, slot, self, record, orders, inVehicle, seatNo)) return;   // 0.5.796: the test's tank gunner
     if (now < seat.useUntil)
     {
         orders.buttons = (orders.buttons & ~1u) | UseButtons; orders.forward = orders.right = 0;
@@ -4839,15 +6704,83 @@ static void BotSeats(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& o
         return;
     }
     // Walk to it; beside it, face it and press use.
+    // 0.5.846: to its nearer rear corner (100 from its middle, 135 degrees round from its front), not
+    // its middle: the hull stopped him short of 75 from the middle, and a tank lets you in from its
+    // corners (the user's Sherman, sherman8/9's: the sides at 110 never did)
     const float d = Distance(feet, mine->at);
     const float bearing = atan2f(mine->at.y - feet.y, mine->at.x - feet.x) * 57.29578f;
-    if (d > 75.0f)   // 0.5.199: right up to it (was 110)
+    float corner[2];
     {
-        const float goal[3] = { mine->at.x, mine->at.y, feet.z };
+        const float a1 = (mine->yaw + 135.0f) * 0.017453293f, a2 = (mine->yaw - 135.0f) * 0.017453293f;
+        const float c1[2] = { mine->at.x + 100.0f * cosf(a1), mine->at.y + 100.0f * sinf(a1) };
+        const float c2[2] = { mine->at.x + 100.0f * cosf(a2), mine->at.y + 100.0f * sinf(a2) };
+        const float d1 = hypotf(c1[0] - feet.x, c1[1] - feet.y), d2 = hypotf(c2[0] - feet.x, c2[1] - feet.y);
+        corner[0] = d1 <= d2 ? c1[0] : c2[0]; corner[1] = d1 <= d2 ? c1[1] : c2[1];
+    }
+    float toCorner = hypotf(corner[0] - feet.x, corner[1] - feet.y);
+    // 0.5.850: near it, the corner he heads for changes every 8 s he has not got in, nearest first, all
+    // four (botveh6: 7 of 8 gave up 130-340 from the corner they had: it was walled or blocked)
+    if (toCorner <= 300.0f)
+    {
+        static uint32_t nearSince[MaxClients] = {}, nearFor[MaxClients] = {};
+        if (nearFor[slot] != seat.claimedAt) { nearFor[slot] = seat.claimedAt; nearSince[slot] = now; }
+        const uint32_t shift = ((now - nearSince[slot]) / 8000u) % 4u;
+        if (shift)
+        {
+            float c[4][2], dist[4]; int order[4] = { 0, 1, 2, 3 };
+            const float turns[4] = { 135.0f, -135.0f, 45.0f, -45.0f };
+            for (int k = 0; k < 4; k++)
+            {
+                const float a = (mine->yaw + turns[k]) * 0.017453293f;
+                c[k][0] = mine->at.x + 100.0f * cosf(a); c[k][1] = mine->at.y + 100.0f * sinf(a);
+                dist[k] = hypotf(c[k][0] - feet.x, c[k][1] - feet.y);
+            }
+            std::sort(order, order + 4, [&](int x, int y) { return dist[x] < dist[y]; });
+            static uint32_t lastShift[MaxClients] = {};
+            const int pick = order[shift];
+            corner[0] = c[pick][0]; corner[1] = c[pick][1];
+            toCorner = dist[pick];
+            if (lastShift[slot] != shift) { lastShift[slot] = shift; printf("bots: vehicle: slot %u tries another corner of %s (%.0f %.0f, %.0f away)\n", slot, mine->kind, corner[0], corner[1], toCorner); fflush(stdout); }
+        }
+    }
+    // 0.5.849: far off, Think walks him there by its route (his goal the corner); his orders are its
+    if (toCorner > 300.0f)
+    {
+        g_vehicleGoal[slot][0] = corner[0]; g_vehicleGoal[slot][1] = corner[1]; g_vehicleGoal[slot][2] = mine->at.z;
+        g_vehicleGoalAt[slot] = now;
+        static uint32_t toldAt[MaxClients] = {};
+        if (now - toldAt[slot] > 4000) { toldAt[slot] = now; printf("bots: vehicle: slot %u routes to %s: %.0f from its corner (%.0f %.0f), at %.0f %.0f %.0f\n", slot, mine->kind, toCorner, corner[0], corner[1], feet.x, feet.y, feet.z); fflush(stdout); }
+        return;
+    }
+    if (toCorner > 35.0f && d > 75.0f)
+    {
+        // 0.5.851: round the tank, not through it: when the corner is more than 50 degrees round from
+        // him (as seen from its middle), the next 45 degrees of a ring 170 out first (botveh7: bots
+        // hovered 170-375 off, walking straight at a corner on its far side into the hull)
+        float aim[2] = { corner[0], corner[1] };
+        {
+            const float mine0 = atan2f(feet.y - mine->at.y, feet.x - mine->at.x) * 57.29578f;
+            const float cornerAt = atan2f(corner[1] - mine->at.y, corner[0] - mine->at.x) * 57.29578f;
+            const float aroundDeg = AngleDifference(cornerAt, mine0);
+            if (fabsf(aroundDeg) > 50.0f)
+            {
+                const float stepAt = (mine0 + (aroundDeg > 0 ? 45.0f : -45.0f)) * 0.017453293f;
+                aim[0] = mine->at.x + 170.0f * cosf(stepAt); aim[1] = mine->at.y + 170.0f * sinf(stepAt);
+            }
+        }
+        const float cornerBearing = atan2f(aim[1] - feet.y, aim[0] - feet.x) * 57.29578f;
+        {
+            static uint32_t toldAt[MaxClients] = {};
+            if (now - toldAt[slot] > 4000) { toldAt[slot] = now; printf("bots: vehicle: slot %u on his way to %s: %.0f from its middle, %.0f from its corner (%.0f %.0f), at %.0f %.0f %.0f\n", slot, mine->kind, d, toCorner, corner[0], corner[1], feet.x, feet.y, feet.z); fflush(stdout); }
+        }
+        const float goal[3] = { aim[0], aim[1], feet.z };
         const float viewYaw = ReadFloat(base, record + 208);
         orders.forward = 127; orders.right = 0;
         if (d > 500.0f) orders.buttons |= SprintButton;
-        g_yaw[slot] += std::clamp(AngleDifference(bearing, viewYaw), -6.0f, 6.0f);
+        g_yaw[slot] += std::clamp(AngleDifference(cornerBearing, viewYaw), -6.0f, 6.0f);
+        // 0.5.848: Think's own steering left out meanwhile (botveh4: it turned him back to its own goal
+        // as fast as this turned him to the tank: four bots walked from ~1000 to ~2000 away in 40 s)
+        g_lookVehicleUntil[slot] = GetTickCount() + 250;
         TacticalMove(ctx, base, self, 0, slot, serverTime, int32_t(Guest::Read32(base, record + 304)), viewYaw, goal, false, orders);
         return;
     }
@@ -5128,12 +7061,15 @@ static void BotDispense(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders
     const uint32_t now = GetTickCount();
     const bool american = BotSide(base, slot) == 1;
     const char* special = kit == 3 ? "mp_revive" : american ? "mp_ammo" : "mp_ammo_axis";
-    const bool sees = g_tactical[slot].visible && g_seeDist[slot] < 5000.0f;
-    if (!p.next) p.next = now + 20000 + slot * 1777u % 20000u;
+    // 0.5.456: only an enemy within 1500 stops it (was 5000: on a busy map one
+    // was always in sight; 0.5.453's whole test had one ammo and one health
+    // pack). Justin: "make sure they use the ... medics, and ammo packs as intended"
+    const bool sees = g_tactical[slot].visible && g_seeDist[slot] < 1500.0f;
+    if (!p.next) p.next = now + 12000 + slot * 1777u % 15000u;
     auto backToGun = [&](const char* why) {
         if (p.back[0]) BotSwitch(ctx, base, self, p.back);
         printf("bots: pack: slot %u back to %s (%s)\n", slot, p.back[0] ? p.back : "?", why); fflush(stdout);
-        p.stage = 0; p.next = now + 60000;
+        p.stage = 0; p.next = now + 30000;   // 0.5.456: 30 s (was 60)
     };
     if (p.stage == 0)
     {
@@ -5147,9 +7083,20 @@ static void BotDispense(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders
             const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
             const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
             if (!r || Side(base, e) != side || int32_t(Guest::Read32(base, r + 304)) <= 0) continue;
-            if (BotNavigation::Distance(me, { ReadFloat(base, r), ReadFloat(base, r + 4), ReadFloat(base, r + 8) }) < 450.0f) nearMates++;
+            if (BotNavigation::Distance(me, { ReadFloat(base, r), ReadFloat(base, r + 4), ReadFloat(base, r + 8) }) < 700.0f) nearMates++;   // 0.5.456: 700 (was 450)
         }
-        if (nearMates < 2) { p.next = now + 3000; return; }
+        // 0.5.456: one teammate near is enough (was two), or none when he needs
+        // it himself: a medic hurt (70 or less), a support short of rounds
+        bool needsIt = false;
+        if (kit == 3) needsIt = int32_t(Guest::Read32(base, record + 304)) <= 70;
+        else
+        {
+            const uint32_t held = Guest::Read32(base, record + 164), list = Guest::Read32(base, 0x82BCBF9C);
+            const uint32_t def = (held && held < 128 && list) ? Guest::Read32(base, list + 4 * held) : 0;
+            const uint32_t spare = (def >= 0x40000000u && def < 0xA0000000u) ? Guest::Read32(base, def + 1460) : 0;
+            needsIt = spare > 0 && spare <= 128 && int32_t(Guest::Read32(base, record + 4 * (80 + spare))) <= 30;
+        }
+        if (nearMates < 1 && !needsIt) { p.next = now + 3000; return; }
         // The gun to go back to: the one in hand now.
         const uint32_t held = Guest::Read32(base, record + 164), list = Guest::Read32(base, 0x82BCBF9C);
         const uint32_t def = (held && held < 128 && list) ? Guest::Read32(base, list + 4 * held) : 0;
@@ -5386,6 +7333,33 @@ static bool BotRevive(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& 
             static int told = 0;
             if ((told < 60 && told++ < 60)) { printf("bots: revive: slot %u stands slot %u up (Plyr_Revive, handles %08X %08X): health now %d, state %u\n", slot, o, deadHandle, medicHandle,
                                       int32_t(Guest::Read32(base, tr + 304)), Guest::Read32(base, tr + 1924)); fflush(stdout); }
+            // 0.5.544: Plyr_Revive gives health and state 3 but leaves a bot's
+            // body in its death pose (user: "a bot in the dead animation running
+            // around"; 543: slot 13 revived at 29249). A player's client stands
+            // him up; a bot has none. So he is spawned again the game's way (a
+            // fresh body) and put back where he lay, with the revive's health.
+            const int32_t revivedHealth = int32_t(Guest::Read32(base, tr + 304));
+            if (revivedHealth > 0 && Guest::Read32(base, tr + 1924) == 3 && o < MaxClients)
+            {
+                const float lay[3] = { ReadFloat(base, tr), ReadFloat(base, tr + 4), ReadFloat(base, tr + 8) };
+                g_revivedAt[o] = GetTickCount();
+                Respawn(ctx, base, te, BotSide(base, o) == 1);
+                const uint32_t nr = Guest::Read32(base, te + 512);
+                if (nr && int32_t(Guest::Read32(base, nr + 304)) > 0)
+                {
+                    static uint32_t layAt = 0;
+                    if (!layAt) layAt = Guest::AllocatePhysical(0x20);
+                    auto putF = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+                    putF(layAt, lay[0]); putF(layAt + 4, lay[1]); putF(layAt + 8, lay[2] + 1.0f);
+                    PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+                    place.r3.u64 = te; place.r4.u64 = layAt; place.lr = 0;
+                    Guest::Lookup(0x8255E118)(place, base);
+                    for (int k = 0; k < 3; k++) putF(nr + 16 + 4 * k, 0.0f);
+                    Guest::Write32(base, nr + 304, uint32_t(revivedHealth));
+                    printf("bots: revive: slot %u respawned in place (a fresh body, not the death pose) at %.0f %.0f, health %d\n", o, lay[0], lay[1], revivedHealth);
+                    fflush(stdout);
+                }
+            }
         }
         else if (direct == 2 && te)
         {
@@ -5446,7 +7420,7 @@ static bool PoseHolds(uint32_t slot);
 static void BotFeelers(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& orders, uint32_t now)
 {
     using namespace BotNavigation;
-    struct Feel { uint32_t at = 0, until = 0, bumps = 0, firstBump = 0, backUntil = 0; float slideYaw = 0; bool sliding = false; Point bumpAt{}; };
+    struct Feel { uint32_t at = 0, until = 0, bumps = 0, firstBump = 0, backUntil = 0, scanNext = 0, escapeUntil = 0; float slideYaw = 0; bool sliding = false; Point bumpAt{}; };
     static Feel feel[MaxClients];
     static uint32_t total = 0, learnt = 0, lastTold = 0;
     if (orders.forward == 0 && orders.right == 0) return;
@@ -5465,6 +7439,7 @@ static void BotFeelers(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders&
         orders.right = int8_t(std::clamp(-std::sin(rel) * magnitude * scale, -127.0f, 127.0f));
     };
     if (now < f.backUntil) { steer(f.slideYaw, 1.0f); orders.buttons &= ~SprintButton; return; }
+    if (now < f.escapeUntil) { steer(f.slideYaw, 1.0f); return; }   // 0.5.467: the way the look round chose, held
     if (now - f.at < 150) { if (f.sliding && now < f.until) steer(f.slideYaw, 1.0f); return; }
     f.at = now; f.sliding = false;
     const Point feet{ ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) };
@@ -5476,7 +7451,62 @@ static void BotFeelers(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders&
     };
     const Hit ahead = probe(moveYaw, 44.0f);
     if (!ahead.valid || ahead.fraction >= 0.95f || ahead.normal.z > 0.6f) return;   // open, or only a slope/step
+    // 0.5.469: stairs (Justin: bots should "be able to walk upstairs"): a stair's
+    // risers pass the 18-high feeler for a step or two, then meet it, and the
+    // stairs were taken for a wall and slid along. Clear at 44 high and a floor
+    // ahead 2 to 40 above his feet, flat enough to stand on: a step, walked up.
+    {
+        const Point fromHigh{ feet.x, feet.y, feet.z + 44.0f };
+        const Point toHigh{ feet.x + std::cos(moveYaw) * 44.0f, feet.y + std::sin(moveYaw) * 44.0f, feet.z + 44.0f };
+        const Hit high = BotTrace(ctx, base, self, self, fromHigh, toHigh, true);
+        if (!high.valid || high.fraction >= 0.95f)
+        {
+            const Hit floor = BotTrace(ctx, base, self, self, toHigh, { toHigh.x, toHigh.y, feet.z - 8.0f }, true);
+            const float rise = floor.end.z - feet.z;
+            if (floor.valid && floor.fraction < 1.0f && floor.normal.z > 0.7f && rise > 2.0f && rise < 40.0f)
+            {
+                static int told = 0;
+                if (told++ < 40) { printf("bots: feelers: slot %u takes the stairs at %.0f %.0f (a step %.0f up)\n", slot, feet.x, feet.y, rise); fflush(stdout); }
+                return;
+            }
+        }
+    }
     total++;
+    // 0.5.467: a look round (Justin: "they need to learn to turn and look around
+    // and walk through doors and into other rooms and be able to walk upstairs
+    // and keep actively searching for new routes instead of soley walking into
+    // a wall over and over"). Meeting a wall again where he met one (80, 12 s),
+    // he sweeps 24 ways (every 15 degrees) 240 out at knee and chest height:
+    // a doorway or a stair's opening is clear at both. The clearest way (70 at
+    // least), the nearer to where he was going the better, is held 1.5 s.
+    if (now >= f.scanNext)   // 0.5.469: at the first wall (was the second at one spot)
+    {
+        auto probeAt = [&](float yaw, float height) {
+            const Point from{ feet.x, feet.y, feet.z + height };
+            const Point to{ feet.x + std::cos(yaw) * 240.0f, feet.y + std::sin(yaw) * 240.0f, feet.z + height };
+            return BotTrace(ctx, base, self, self, from, to, true);
+        };
+        float bestYaw = 0.0f, bestScore = -1e9f, bestClear = 0.0f;
+        for (int k = 0; k < 24; k++)
+        {
+            const float yaw = moveYaw + float(k) * 0.2617994f;
+            const Hit knee = probeAt(yaw, 18.0f), chest = probeAt(yaw, 48.0f);
+            const float clear = std::fmin(knee.valid ? knee.fraction : 1.0f, chest.valid ? chest.fraction : 1.0f) * 240.0f;
+            if (clear < 55.0f) continue;   // 0.5.469: 55 (was 70): narrower doorways
+            const float score = clear + 120.0f * std::cos(float(k) * 0.2617994f);
+            if (score > bestScore) { bestScore = score; bestYaw = yaw; bestClear = clear; }
+        }
+        f.scanNext = now + 2500;
+        if (bestScore > -1e8f)
+        {
+            f.slideYaw = bestYaw; f.sliding = true; f.until = now + 1500; f.escapeUntil = now + 1500;
+            steer(f.slideYaw, 1.0f);
+            static int told = 0;
+            if (told++ < 80) { printf("bots: feelers: slot %u looks round at %.0f %.0f: takes the way %.0f degrees off (%.0f clear)\n", slot, feet.x, feet.y, AngleDifference(bestYaw * 57.29578f, moveYaw * 57.29578f), bestClear); fflush(stdout); }
+            if (f.bumps) f.bumps++;
+            return;
+        }
+    }
     // Along the wall: the move with its part into the wall taken out.
     const float nx = ahead.normal.x, ny = ahead.normal.y, nl = std::hypot(nx, ny);
     float mx = std::cos(moveYaw), my = std::sin(moveYaw);
@@ -5788,6 +7818,2146 @@ static void PoseFrame(PPCContext& ctx, uint8_t* base)
         g_wantYaw[slot] = face; g_wantPitch[slot] = 0.0f;
     }
 }
+// 0.5.474: CTF's flag is taken with the use button, not by touch (the game's
+// hint_flag_pickup): 473's bots stood on the enemy flag five times and never
+// had it (Justin: "still they havent picked up a flag"). On the enemy flag
+// (within 80), he stands and presses use in pulses (400 ms on, 200 off) for
+// up to 3 s, then moves on.
+// 0.5.483: a bot with the enemy flag goes home whatever happens (user: "once
+// a bot grabs the enemy flag his mission is to get back to his flag to score
+// no matter what"; a carrier cannot shoot, "his team mates defend him"): his
+// legs go along his route home (g_steer), sprinting, never stopping,
+// crouching or backing off for a fight; no seats, revives, packs or mines
+// on the way (FeedBots). Attackers go with him (the CTF goal: escort).
+static bool BotCarries(uint32_t slot) { return g_flagCarrier[0] == int(slot) || g_flagCarrier[1] == int(slot); }
+// 0.5.522: each bot's own trail this life (a point every 120 walked, up to
+// 300), recorded while he does not carry; carrying, he walks it back: a way
+// he has just walked, from his side to the enemy flag (520's carriers, on the
+// learnt map's routes, wandered 2 minutes and the watchdog's points led away).
+// (g_trail itself is declared with the CTF state at the top: 0.5.589's routes use it)
+static uint32_t g_trailLife[MaxClients] = {};
+// 0.5.536: CTF routes (user: record a run and the bots learn the flag route):
+// every time a player, bot or the host, reaches the enemy flag (within 120)
+// with a trail that began by his own flag (within 1500), the trail is kept
+// as a route for his side on that map, in ctf-routes.txt ("<map> <side>
+// x,y,z ..."), up to 16 a side. Attackers walk one (AttackerRoute), carriers
+// one reversed when their own trail runs out.
+static std::map<std::string, std::vector<std::vector<BotNavigation::Point>>> g_ctfRoutes;   // key: map + side
+static std::string g_routesLoadedFor;
+static void LoadCtfRoutes(const std::string& map)
+{
+    if (g_routesLoadedFor == map) return;
+    g_routesLoadedFor = map;
+    g_ctfRoutes.clear();
+    FILE* f = fopen("ctf-routes.txt", "r");
+    if (!f) return;
+    char line[16384];
+    int n = 0;
+    while (fgets(line, sizeof(line), f))
+    {
+        char name[64]; int side = 0, used = 0;
+        if (sscanf(line, "%63s %d%n", name, &side, &used) != 2 || map != name || side < 1 || side > 2) continue;
+        std::vector<BotNavigation::Point> route;
+        const char* p = line + used;
+        float x, y, z; int got = 0;
+        while (sscanf(p, " %f,%f,%f%n", &x, &y, &z, &got) == 3) { route.push_back({ x, y, z }); p += got; }
+        if (route.size() >= 3) { g_ctfRoutes[map + std::to_string(side)].push_back(route); n++; }
+    }
+    fclose(f);
+    printf("bots: ctf routes for %s: %d loaded from ctf-routes.txt\n", map.c_str(), n); fflush(stdout);
+}
+static void SaveCtfRoute(const std::string& map, uint32_t side, const std::vector<BotNavigation::Point>& route, uint32_t slot)
+{
+    std::vector<std::vector<BotNavigation::Point>>& list = g_ctfRoutes[map + std::to_string(side)];
+    if (list.size() >= 16) return;
+    list.push_back(route);
+    if (FILE* f = fopen("ctf-routes.txt", "a"))
+    {
+        fprintf(f, "%s %u", map.c_str(), side);
+        for (const BotNavigation::Point& q : route) fprintf(f, " %.0f,%.0f,%.0f", q.x, q.y, q.z);
+        fprintf(f, "\n");
+        fclose(f);
+    }
+    printf("bots: ctf route saved for side %u on %s (%zu points, walked by %s slot %u; %zu routes now)\n", side, map.c_str(), route.size(), g_bot[slot] ? "bot" : "player", slot, list.size()); fflush(stdout);
+}
+static void BotTrail(uint8_t* base, uint32_t slot)
+{
+    if (slot >= MaxClients) return;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    // 0.5.536: a new life by health (the host has no g_spawnedTick)
+    static bool dead[MaxClients] = {};
+    static bool routeSaved[MaxClients] = {};
+    if (!record || int32_t(Guest::Read32(base, record + 304)) <= 0) { dead[slot] = true; return; }
+    if (dead[slot] || g_trailLife[slot] == 0) { dead[slot] = false; g_trailLife[slot] = 1; g_trail[slot].clear(); routeSaved[slot] = false; }
+    if (BotCarries(slot)) return;
+    const BotNavigation::Point here{ ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) };
+    std::vector<BotNavigation::Point>& t = g_trail[slot];
+    // 0.5.537: a jump (over 400 since the last point: a teleport, a spawn move,
+    // an unstick) starts the trail over: 536 saved the test host's teleports
+    // as a "route" across the map
+    if (!t.empty() && hypotf(t.back().x - here.x, t.back().y - here.y) > 400.0f) { t.clear(); routeSaved[slot] = false; }
+    if (t.empty() || hypotf(t.back().x - here.x, t.back().y - here.y) >= 120.0f)
+    {
+        if (t.size() >= 300) t.erase(t.begin());
+        t.push_back(here);
+    }
+    // a route: at the enemy flag, his trail begun by his own
+    const uint32_t side = Side(base, entity);
+    if (!routeSaved[slot] && side >= 1 && side <= 2 && g_ctfOwn[side] >= 0 && g_ctfOwn[side] <= 1 && g_ctfOwn[3 - side] >= 0 && g_ctfOwn[3 - side] <= 1 && t.size() >= 5)
+    {
+        const float* enemy = g_obj.at[g_ctfOwn[3 - side]];
+        const float* own = g_obj.at[g_ctfOwn[side]];
+        if (hypotf(enemy[0] - here.x, enemy[1] - here.y) < 120.0f && hypotf(own[0] - t.front().x, own[1] - t.front().y) < 1500.0f)
+        {
+            routeSaved[slot] = true;
+            const std::string map = Kernel::CurrentMap();
+            LoadCtfRoutes(map);
+            SaveCtfRoute(map, side, t, slot);
+        }
+    }
+}
+// 0.5.536: an attacker (his CTF role), the enemy flag at its base, not in a
+// fight, walks a saved route of his side's toward it (one by his slot, from
+// the point nearest him on), his legs after the feelers' as a carrier's
+static void AttackerRoute(uint8_t* base, uint32_t slot, BotOrders& orders)
+{
+    // 0.5.547: off unless COD3_CTF_SAVED_ROUTES=1. 546's self-test trace: with
+    // the saved route on his legs an attacker made a median 3 units toward the
+    // enemy flag in 3 s (52% of samples stalled) against 13 on his own way
+    // (39%); near the flag it pulled against his own path (slot 7 held at 276
+    // from it, slot 15 at 1282). The routes are still learnt (BotTrail).
+    static const bool on = getenv("COD3_CTF_SAVED_ROUTES") != nullptr && getenv("COD3_CTF_SAVED_ROUTES")[0] == '1';
+    if (!on) return;
+    if (slot >= MaxClients || !g_bot[slot] || !g_ctfAttacker[slot] || g_ctfOwnLegs[slot] || BotCarries(slot) || orders.wantsFire) return;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    if (!record || int32_t(Guest::Read32(base, record + 304)) <= 0) return;
+    const uint32_t side = Side(base, entity);
+    if (side < 1 || side > 2 || g_ctfOwn[3 - side] < 0 || g_ctfOwn[3 - side] > 1) return;
+    const int enemy = g_ctfOwn[3 - side];
+    if (g_flagCarrier[enemy] >= 0 || g_flagDropped[enemy]) return;
+    const std::string map = Kernel::CurrentMap();
+    LoadCtfRoutes(map);
+    const auto it = g_ctfRoutes.find(map + std::to_string(side));
+    if (it == g_ctfRoutes.end() || it->second.empty()) return;
+    // 0.5.542: a route he gets nowhere on is dropped for him for 60 s, the
+    // next one tried, and with none left the navigation's own way (541: side
+    // 1's routes go over raised places, z 55-80, a bot cannot climb; its
+    // attackers walked into the wall below at -1103 132 the whole game)
+    static uint32_t bannedUntil[MaxClients][8] = {};
+    static uint32_t progressAt[MaxClients] = {}; static size_t bestNext[MaxClients] = {}; static size_t onRoute[MaxClients] = {};
+    const uint32_t now = GetTickCount();
+    const size_t count = it->second.size();
+    size_t pick = count;
+    for (size_t k = 0; k < count && pick == count; k++) { const size_t r = (slot + k) % count; if (r >= 8 || now >= bannedUntil[slot][r]) pick = r; }
+    if (pick == count) return;
+    if (onRoute[slot] != pick) { onRoute[slot] = pick; bestNext[slot] = 0; progressAt[slot] = now; }
+    const std::vector<BotNavigation::Point>& route = it->second[pick];
+    const float mx = ReadFloat(base, record), my = ReadFloat(base, record + 4);
+    if (hypotf(g_obj.at[enemy][0] - mx, g_obj.at[enemy][1] - my) < 250.0f) return;   // the last steps his own
+    size_t nearest = 0; float bestD = 1e30f;
+    for (size_t i = 0; i < route.size(); i++) { const float d = hypotf(route[i].x - mx, route[i].y - my); if (d < bestD) { bestD = d; nearest = i; } }
+    if (bestD > 600.0f) { progressAt[slot] = now; return; }   // far off it: his own way back to it
+    size_t next = nearest;
+    while (next + 1 < route.size() && hypotf(route[next].x - mx, route[next].y - my) < 80.0f) next++;
+    if (next > bestNext[slot] || now - progressAt[slot] > 30000) { bestNext[slot] = next; progressAt[slot] = now; }
+    else if (now - progressAt[slot] > 4000)
+    {
+        if (pick < 8) bannedUntil[slot][pick] = now + 60000;
+        printf("bots: slot %u (side %u) gets nowhere on saved route %zu (stuck before point %zu at %.0f %.0f): dropped for 60 s\n", slot, side, pick, next, mx, my);
+        fflush(stdout);
+        onRoute[slot] = count;
+        return;
+    }
+    const float dx = route[next].x - mx, dy = route[next].y - my;
+    const float rel = atan2f(dy, dx) - ReadFloat(base, record + 208) * 0.01745329252f;
+    orders.forward = int8_t(std::clamp(cosf(rel) * 127.0f, -127.0f, 127.0f));
+    orders.right = int8_t(std::clamp(-sinf(rel) * 127.0f, -127.0f, 127.0f));
+    static uint32_t told = 0;
+    if (told++ < 20) { printf("bots: slot %u (side %u) takes a saved route to the enemy flag (%zu points, at point %zu)\n", slot, side, route.size(), next); fflush(stdout); }
+}
+static void CarrierHome(uint8_t* base, uint32_t slot, BotOrders& orders)
+{
+    static bool told[MaxClients] = {};
+    if (!BotCarries(slot)) { told[slot] = false; return; }
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    if (!record || int32_t(Guest::Read32(base, record + 304)) <= 0) return;
+    const float mx = ReadFloat(base, record), my = ReadFloat(base, record + 4);
+    // 0.5.522: his own trail back (the last points first), then his flag
+    float target[2] = { g_steer[slot][0], g_steer[slot][1] };
+    bool have = g_steerValid[slot];
+    std::vector<BotNavigation::Point>& t = g_trail[slot];
+    // 0.5.535: from the trail point nearest him (the later ones dropped: he
+    // may stand past a corner from the last one he laid), then on toward home
+    if (!t.empty())
+    {
+        size_t nearest = t.size() - 1; float bestD = 1e30f;
+        for (size_t i = 0; i < t.size(); i++) { const float d = hypotf(t[i].x - mx, t[i].y - my); if (d < bestD) { bestD = d; nearest = i; } }
+        t.resize(nearest + 1);
+    }
+    while (!t.empty() && hypotf(t.back().x - mx, t.back().y - my) < 80.0f) t.pop_back();
+    {   // 0.5.523: within 300 of his flag, straight to it (the trail's points lead back out)
+        const uint32_t s = BotSide(base, slot);
+        if (s >= 1 && s <= 2 && g_ctfOwn[s] >= 0 && g_ctfOwn[s] <= 1 && hypotf(g_obj.at[g_ctfOwn[s]][0] - mx, g_obj.at[g_ctfOwn[s]][1] - my) < 300.0f) t.clear();
+    }
+    if (!t.empty()) { target[0] = t.back().x; target[1] = t.back().y; have = true; }
+    else
+    {
+        const uint32_t side = BotSide(base, slot);
+        if (side >= 1 && side <= 2 && g_ctfOwn[side] >= 0 && g_ctfOwn[side] <= 1) { target[0] = g_obj.at[g_ctfOwn[side]][0]; target[1] = g_obj.at[g_ctfOwn[side]][1]; have = true; }
+    }
+    if (!have) return;
+    const float dx = target[0] - mx, dy = target[1] - my;
+    if (dx * dx + dy * dy < 20.0f * 20.0f) return;
+    // 0.5.568: his legs are Think's (his learnt route home, round the walls)
+    // unless Think gave him none or he is within 300 of his flag (then straight
+    // onto it, to touch it). 567's 10-minute self-test, the first bot takes since
+    // the spawns were put right (3): carrier slot 11 stood 9 s at 1823 215, Think's
+    // legs along his route (111 60) and these, straight back along his trail,
+    // the other way (-108 -66), into a wall, till he was shot.
+    bool straight = orders.forward == 0 && orders.right == 0;
+    {
+        const uint32_t s = BotSide(base, slot);
+        if (s >= 1 && s <= 2 && g_ctfOwn[s] >= 0 && g_ctfOwn[s] <= 1 && hypotf(g_obj.at[g_ctfOwn[s]][0] - mx, g_obj.at[g_ctfOwn[s]][1] - my) < 300.0f) straight = true;
+    }
+    if (straight)
+    {
+        const float rel = atan2f(dy, dx) - ReadFloat(base, record + 208) * 0.01745329252f;
+        orders.forward = int8_t(std::clamp(cosf(rel) * 127.0f, -127.0f, 127.0f));
+        orders.right = int8_t(std::clamp(-sinf(rel) * 127.0f, -127.0f, 127.0f));
+    }
+    // user: "the flag carrier cant shoot so just make his mission home while
+    // his team mates defend him": no firing, sprint all the way
+    orders.buttons &= ~(UseButtons | StanceButton | 0x8u | 1u);   // 0x8: aim down the sights
+    orders.wantsFire = false;
+    orders.buttons |= SprintButton;
+    if (!told[slot]) { told[slot] = true; printf("bots: slot %u has the flag: home whatever happens\n", slot); fflush(stdout); }
+}
+// 0.5.517: THE CTF PICKUP IS ASKED FOR BY THE PLAYER'S CLIENT. 516's wraps:
+// the flag handler (sub_82204A08) and its caller (sub_82205788) ran only for
+// the host's takes, never a bot's. Their caller, sub_823EB8F0, handles a
+// message from a player's client (read from its bit stream, sub_820D9D08)
+// and calls the server's callback at Callbacks (0x82BCBF64) +3420 with the
+// message's value, a pointer to the player's handle and a flag: the client,
+// seeing its player in the flag's pick-up area, asks; the server gives. A
+// bot has no client, so nothing ever asked (488-516 all agree). Now, while a
+// bot stands on the enemy flag at its base (BotFlagUse pressing), every 500
+// ms that callback is called for him as the host's request was: (2, his
+// handle, 0) (516's log: sub_82205788(2, &0x4001, 0, ..) for each take).
+// 0.5.519: a flag carrier not 150 nearer home in 10 s is put 3 spots further
+// along his learnt route home (the game's teleport, as the navigation's
+// unstuck does). 518's carrier circled one spot (960 270) for 100 s, the
+// navigation's own stuck test never firing (the jitter counted as progress).
+static void CarrierUnstick(PPCContext& ctx, uint8_t* base, uint32_t slot)
+{
+    static float best[MaxClients] = {};
+    static uint32_t since[MaxClients] = {};
+    // 0.5.538: a bot carrier killed drops the flag, as the game does for a
+    // player (user: "when an enemy drops a flag it just goes invisible ... but
+    // it shows on the radar"; the game never dropped it for a bot): the drop
+    // callback (Callbacks +3424, 523: it drops a carrier's flag where he is)
+    if (slot < MaxClients && g_bot[slot] && (BotCarries(slot) || g_dropPending[slot]))
+    {
+        const uint32_t dlist = Guest::Read32(base, EntityList);
+        const uint32_t dEntity = dlist ? Guest::Read32(base, dlist + 4 * (slot + 1)) : 0;
+        const uint32_t dRecord = dEntity ? Guest::Read32(base, dEntity + 512) : 0;
+        static bool dropped[MaxClients] = {};
+        const bool deadNow = !dRecord || int32_t(Guest::Read32(base, dRecord + 304)) <= 0;
+        if (!deadNow) dropped[slot] = false;
+        else if (!dropped[slot])
+        {
+            dropped[slot] = true; g_dropPending[slot] = false;
+            uint32_t handle = 0;
+            for (uint32_t i = 0; i < 4096 && !handle && dEntity; i++) if (Guest::Read32(base, 0x82BD1FC0 + 8 * i) == dEntity) handle = 0x4000u | i;
+            const uint32_t object = Guest::Read32(base, 0x82BCBF64);
+            const uint32_t drop = object ? Guest::Read32(base, object + 3424) : 0;
+            if (handle && drop)
+            {
+                static uint32_t cell = 0;
+                if (!cell) cell = Guest::AllocatePhysical(0x10);
+                Guest::Write32(base, cell, handle);
+                printf("bots: carrier slot %u killed: his flag dropped (the drop callback %08X)\n", slot, drop); fflush(stdout);
+                BotClientScope clientScope(base, slot, "flag drop");
+                Call(ctx, base, drop, cell, 0, 0);
+            }
+            return;
+        }
+    }
+    if (slot >= MaxClients || !BotCarries(slot)) { if (slot < MaxClients) since[slot] = 0; return; }
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    if (!record || int32_t(Guest::Read32(base, record + 304)) <= 0) return;
+    const uint32_t side = BotSide(base, slot);
+    if (side < 1 || side > 2 || g_ctfOwn[side] < 0 || g_ctfOwn[side] > 1) return;
+    const float* home = g_obj.at[g_ctfOwn[side]];
+    const BotNavigation::Point feet{ ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) };
+    const float dist = hypotf(home[0] - feet.x, home[1] - feet.y);
+    const uint32_t now = GetTickCount();
+    if (!since[slot] || dist < best[slot] - 150.0f) { best[slot] = dist; since[slot] = now; return; }
+    if (now - since[slot] < 10000) return;
+    since[slot] = now; best[slot] = dist;
+    // 0.5.523: within 400 of home, onto his flag (522 put a carrier 108 from
+    // home back along his trail, away)
+    if (dist < 400.0f)
+    {
+        static uint32_t nearPos = 0;
+        if (!nearPos) nearPos = Guest::AllocatePhysical(0x20);
+        auto putN = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+        putN(nearPos, home[0] + 20.0f); putN(nearPos + 4, home[1]); putN(nearPos + 8, home[2] + 1.0f);
+        PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+        place.r3.u64 = entity; place.r4.u64 = nearPos; place.lr = 0;
+        Guest::Lookup(0x8255E118)(place, base);
+        printf("bots: carrier slot %u stuck %.0f from home: put by his flag\n", slot, dist); fflush(stdout);
+        return;
+    }
+    // 0.5.522: along his own trail first: the point two back
+    // 0.5.586: only one within 300 (a step back out of a dead end); farther,
+    // forwards along his route instead: 585's self-test put slot 6, stuck at
+    // 1021 1320, back at 1998 1211, by the base he took the flag from
+    if (g_trail[slot].size() >= 2 &&
+        hypotf(g_trail[slot][g_trail[slot].size() - 2].x - feet.x, g_trail[slot][g_trail[slot].size() - 2].y - feet.y) < 300.0f)
+    {
+        g_trail[slot].pop_back();
+        const BotNavigation::Point to = g_trail[slot].back();
+        g_trail[slot].pop_back();
+        static uint32_t trailPos = 0;
+        if (!trailPos) trailPos = Guest::AllocatePhysical(0x20);
+        auto putT = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+        putT(trailPos, to.x); putT(trailPos + 4, to.y); putT(trailPos + 8, to.z + 1.0f);
+        PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+        place.r3.u64 = entity; place.r4.u64 = trailPos; place.lr = 0;
+        Guest::Lookup(0x8255E118)(place, base);
+        for (int k = 0; k < 3; k++) putT(record + 16 + 4 * k, 0.0f);
+        printf("bots: carrier slot %u stuck %.0f from home for 10 s: put back along his own trail at %.0f %.0f (%zu points left)\n", slot, dist, to.x, to.y, g_trail[slot].size()); fflush(stdout);
+        return;
+    }
+    const int32_t cell = g_mapKnow.Nearest({ home[0], home[1], home[2] }, 600.0f);
+    const std::vector<BotNavigation::Point> way = cell >= 0 ? g_mapKnow.Path(feet, cell) : std::vector<BotNavigation::Point>{};
+    if (way.empty()) { printf("bots: carrier slot %u stuck %.0f from home, no learnt route\n", slot, dist); fflush(stdout); return; }
+    const BotNavigation::Point to = way[std::min<size_t>(3, way.size() - 1)];
+    static uint32_t position = 0;
+    if (!position) position = Guest::AllocatePhysical(0x20);
+    auto put = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+    put(position, to.x); put(position + 4, to.y); put(position + 8, to.z + 1.0f);
+    PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+    place.r3.u64 = entity; place.r4.u64 = position; place.lr = 0;
+    Guest::Lookup(0x8255E118)(place, base);
+    for (int k = 0; k < 3; k++) put(record + 16 + 4 * k, 0.0f);
+    printf("bots: carrier slot %u stuck %.0f from home for 10 s: put at %.0f %.0f along his route (%zu spots)\n", slot, dist, to.x, to.y, way.size()); fflush(stdout);
+}
+static void BotFlagClaim(PPCContext& ctx, uint8_t* base, uint32_t slot)
+{
+    static uint32_t lastAt[MaxClients] = {};
+    if (slot >= MaxClients || !g_bot[slot]) return;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    if (!record || int32_t(Guest::Read32(base, record + 304)) <= 0 || Guest::Read32(base, record + 1924) != 3) return;
+    const uint32_t side = BotSide(base, slot);
+    if (side < 1 || side > 2 || g_ctfOwn[side] < 0 || g_ctfOwn[3 - side] < 0) return;
+    const int enemy = g_ctfOwn[3 - side], own = g_ctfOwn[side];
+    if (enemy > 1 || own > 1) return;
+    const float mx = ReadFloat(base, record), my = ReadFloat(base, record + 4);
+    auto near60 = [&](const float* p) { return hypotf(p[0] - mx, p[1] - my) < 60.0f; };
+    // 0.5.518: the four requests a client makes (the first word the side
+    // whose flag it is): the enemy's at its base or lying out (take); his own
+    // at its base while he carries the enemy's (capture); his own lying out
+    // (return)
+    uint32_t ask = 0; const char* why = "";
+    // 0.5.533: in the unattended test only side 1 takes (so side 1's flag stays
+    // home and its carrier can capture: 532's took both at once)
+    static const bool testMode = [] { const char* m = getenv("COD3_CTF_PROBE"); return m && m[0]; }();   // 0.5.538: probe only
+    if (testMode && side == 2 && !BotCarries(slot)) {}
+    else if (!BotCarries(slot) && g_flagCarrier[enemy] < 0 && !g_flagDropped[enemy] && near60(g_obj.at[enemy])) { ask = 3 - side; why = "take"; }
+    // 0.5.524: not the enemy's flag lying by his OWN flag (523: a carrier's
+    // drop at his base (+3424, "C") was taken straight back 5 times: if
+    // dropping it there is the capture, leave it to the game)
+    else if (!BotCarries(slot) && g_flagDropped[enemy] && near60(g_flagDropAt[enemy]) &&
+             hypotf(g_flagDropAt[enemy][0] - g_obj.at[own][0], g_flagDropAt[enemy][1] - g_obj.at[own][1]) > 300.0f) { ask = 3 - side; why = "take (lying out)"; }
+    // 0.5.531: no capture requests: a capture is the game's own, walking onto
+    // the home flag (user; 526's host); A (his side) made the game announce
+    // "flag returned" twice a second (user: "it says enemy flag returned over
+    // and over"), B did nothing, C dropped the flag
+    else if (g_flagDropped[own] && near60(g_flagDropAt[own])) { ask = side; why = "return"; }
+    // 0.5.532: the capture, asked as a client does (sub_823E3298 -> Callbacks
+    // +3432 -> sub_82203E00): carrying, on his own flag at its base, every 2 s:
+    // (his slot, his side - 1); sub_82203E00's wrapper shows a real one's
+    if (!ask && BotCarries(slot) && g_flagCarrier[own] < 0 && !g_flagDropped[own] &&
+        hypotf(g_obj.at[own][0] - mx, g_obj.at[own][1] - my) < 40.0f)
+    {
+        static uint32_t capAt[MaxClients] = {};
+        const uint32_t nowCap = GetTickCount();
+        if (nowCap - capAt[slot] < 2000) return;
+        capAt[slot] = nowCap;
+        const uint32_t object = Guest::Read32(base, 0x82BCBF64);
+        const uint32_t capture = object ? Guest::Read32(base, object + 3432) : 0;
+        // 0.5.533: (his client number, 1 or 0 by turns): sub_823E3298 passes the
+        // message's first value as a client index (a per-client array) and a
+        // 0/1 value second; 532 never asked (its own flag was away: no
+        // capture then, as in the game)
+        static uint32_t capTurn[MaxClients] = {};
+        const uint32_t second = (capTurn[slot]++ % 2) ? 0u : 1u;
+        g_captureTry = int(second);
+        static int toldCap = 0;
+        if (toldCap++ < 40) { printf("bots: slot %u (side %u) on his own flag carrying: the capture callback %08X asked (%u, %u), as a client does\n", slot, side, capture, slot, second); fflush(stdout); }
+        if (!capture) return;
+        BotClientScope clientScope(base, slot, "flag capture");
+        Call(ctx, base, capture, slot, second);
+        return;
+    }
+    if (!ask) return;
+    const uint32_t now = GetTickCount();
+    if (now - lastAt[slot] < 500) return;
+    lastAt[slot] = now;
+    uint32_t handle = 0;
+    for (uint32_t i = 0; i < 4096 && !handle; i++) if (Guest::Read32(base, 0x82BD1FC0 + 8 * i) == entity) handle = 0x4000u | i;
+    const uint32_t object = Guest::Read32(base, 0x82BCBF64);
+    const uint32_t callback = object ? Guest::Read32(base, object + 3420) : 0;
+    if (!handle || !callback) return;
+    static uint32_t cell = 0;
+    if (!cell) cell = Guest::AllocatePhysical(0x10);
+    Guest::Write32(base, cell, handle);
+    static int told = 0;
+    if (told++ < 60) { printf("bots: slot %u (side %u) asks the server's flag callback %08X to %s: (%u, handle %08X, 0), as a client does\n", slot, side, callback, why, ask, handle); fflush(stdout); }
+    BotClientScope clientScope(base, slot, "flag claim");
+    // 0.5.518: the first word is the side whose flag it is (517: side 1 bots
+    // asking with 2 took side 2's flag; a side 2 bot asking with 2 at side
+    // 1's flag was refused 14 times)
+    if (ask == 0xC0DE)
+    {
+        const uint32_t other = object ? Guest::Read32(base, object + 3424) : 0;   // 0.5.523: try C
+        if (other) Call(ctx, base, other, cell, 0, 0);
+        return;
+    }
+    Call(ctx, base, callback, ask, cell, 0);
+}
+static void BotFlagUse(uint8_t* base, uint32_t slot, BotOrders& orders)
+{
+    static uint32_t arrived[MaxClients] = {};
+    if (!g_obj.valid || g_obj.count < 2 || GetTickCount() - g_obj.when > 10000 || g_obj.mode.find("ctf") == std::string::npos) { arrived[slot] = 0; return; }
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    if (!record || int32_t(Guest::Read32(base, record + 304)) <= 0) { arrived[slot] = 0; return; }
+    const float me[3] = { ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) };
+    const uint32_t side = BotSide(base, slot);
+    // 0.5.480: the enemy flag only from the sides known from real spawns
+    if (side < 1 || side > 2 || g_ctfOwn[3 - side] < 0 || g_ctfOwn[3 - side] >= g_obj.count) { arrived[slot] = 0; return; }
+    const int enemy = g_ctfOwn[3 - side];
+    // and on his own (within 80) too, in case bringing it in wants use as well
+    auto near80 = [&](int k) { return hypotf(g_obj.at[k][0] - me[0], g_obj.at[k][1] - me[1]) < 80.0f && fabsf(g_obj.at[k][2] - me[2]) < 120.0f; };
+    // 0.5.482: at base only while it is there (not carried or lying out)
+    int at = (enemy <= 1 && g_flagCarrier[enemy] < 0 && !g_flagDropped[enemy] && near80(enemy)) ? enemy : -1;
+    // 0.5.476: and on a flag lying out (dropped; 0.5.482: the real state)
+    for (int k = 0; k < 2 && k < g_obj.count && at < 0; k++)
+        if (g_flagDropped[k] && hypotf(g_flagDropAt[k][0] - me[0], g_flagDropAt[k][1] - me[1]) < 80.0f && fabsf(g_flagDropAt[k][2] - me[2]) < 120.0f) at = k;
+    const uint32_t now = GetTickCount();
+    if (at < 0) { arrived[slot] = 0; return; }
+    if (!arrived[slot]) { arrived[slot] = now; printf("bots: slot %u presses use on the %s flag\n", slot, at == enemy ? "enemy" : "his own"); fflush(stdout); }
+    const uint32_t held = now - arrived[slot];
+    // 0.5.479: on to the flag's very place while pressing, for 5 s (was:
+    // stood still within 80, 3 s): 478's bots pressed use on the enemy flag
+    // 23 times and never had it (its props never moved), standing short of
+    // its small touch area; Justin took it walking onto it
+    // 0.5.484: 8 s (was 5)
+    if (held > 8000) { g_flagUseMode[slot] = 0; return; }
+    const float* spot = (g_flagDropped[at] ? g_flagDropAt[at] : g_obj.at[at]);
+    const float dx = spot[0] - me[0], dy = spot[1] - me[1];
+    orders.right = 0;
+    // 0.5.484: facing it and looking down at it, stopped 30 out (was: onto
+    // its very place, eyes level): the user took it from 40 away, looking at
+    // it; X counts as use only with the pickup prompt up, which needs the
+    // flag in view. 483's bots held X 116 times with no touch logged at all.
+    const float want = atan2f(dy, dx) * 57.2957795f;
+    g_yaw[slot] += fmaxf(-8.0f, fminf(8.0f, AngleDifference(want, g_yaw[slot])));
+    const float flat = sqrtf(dx * dx + dy * dy);
+    g_pitch[slot] = atan2f((me[2] + 60.0f) - (spot[2] + 20.0f), fmaxf(flat, 1.0f)) * 57.2957795f;   // down is positive
+    orders.forward = flat > 12.0f ? 70 : 0;   // 0.5.497: 12 (was 30; the host took it from 18, still)
+    orders.buttons &= ~(StanceButton | SprintButton);   // 0.5.497: upright, not sprinting
+    // 0.5.480: held (user: took it holding use), after a 200 ms release so
+    // the press is new; again from fresh each 2.5 s
+    // 0.5.483: 0x40 alone (the console's X): the user took it holding 0x40
+    // (482's log: host buttons 00000044, 00000040, then TAKEN); the bots held
+    // 0x20|0x40|0x400 (UseButtons, for vehicles) 1092 times and never had it,
+    // the reload (0x400) most likely in the way
+    // 0.5.484: in turns of 2.4 s: X alone 1 s, then X with activate (0x20,
+    // no reload) 1 s, each after a 200 ms release; the mode in use goes into
+    // the TAKEN line (g_flagUseMode), to learn which the game wants
+    orders.buttons &= ~UseButtons;
+    // 0.5.497: X alone held steadily after a 200 ms release, as the host's
+    // command-only take in 496 (no turns with activate)
+    if (held >= 200) { orders.buttons = (orders.buttons & ~1u) | FlagUseButton; orders.wantsFire = false; g_flagUseMode[slot] = 1; }
+}
+// 0.5.475: CTF's sides spawn by their own flag. 474's CTF on Rouen (Justin:
+// "the enemies spawn on our flag and we spawn on the enemies flag ... Teams
+// should spawn on there respected flag side"): the game put the allies about
+// 1300 1600 (by the flag at 2112 462) and the axis about -1650 -1100 (by the
+// one at -1792 -91). Once a map, each side's own flag is set as the one
+// farther from where its game spawns are (g_ctfOwn); then everyone (the
+// players too) who spawns nearer the enemy's flag than his own is moved (the
+// game's teleport, sub_8255E118) to a spawn point within 1400 of his own
+// flag, none within 80 of a living player, away from living enemies where
+// there is one (at random among those, so they do not stack).
+// 0.5.481: what the game changes in a flag when it is taken. A taken flag's
+// model never moved (478-480: no "prop moved" for the flags, though the user
+// took one in 478), so the port could not tell a flag taken. Every 250 ms the
+// script_models and trigger_multiples within 100 of a flag are compared word
+// by word (their first 1 KB) with the last look; a changed word is logged with
+// who is within 200 of that flag (slot, side, bot or player, distance). A word
+// that has changed 12 times is muted (clocks, animation).
+static void FlagEntityWatch(uint8_t* base, const std::string& key)
+{
+    struct Watched { uint32_t e, index; char cls[20]; int flag; uint32_t words[256]; uint8_t changes[256]; };
+    static std::vector<Watched> list;
+    static std::string listFor;
+    static uint32_t last = 0, told = 0;
+    const uint32_t now = GetTickCount();
+    if (now - last < 250) return;
+    last = now;
+    if (listFor != key)
+    {
+        listFor = key; list.clear(); told = 0; g_flagModels.clear(); g_flagTriggers.clear(); g_flagCarrier[0] = g_flagCarrier[1] = -1; g_flagDropped[0] = g_flagDropped[1] = false;
+        for (uint32_t i = 0; i < 4096; i++)
+        {
+            const uint32_t e = Guest::Read32(base, 0x82BD1FC0 + 8 * i);
+            if (e < 0x40000000u || e >= 0xA0000000u) continue;
+            const uint32_t cls = Guest::Read32(base, e + 548);
+            if (cls < 0x40000000u || cls >= 0xA0000000u) continue;
+            char name[20] = {};
+            for (int c = 0; c < 19; c++) { const char ch = char(Guest::Read8(base, cls + 12 + c)); if (!ch) break; name[c] = char(tolower(static_cast<unsigned char>(ch))); }
+            if (strcmp(name, "script_model") != 0 && strcmp(name, "trigger_multiple") != 0) continue;
+            const float p[2] = { ReadFloat(base, e + 336), ReadFloat(base, e + 340) };
+            for (int k = 0; k < 2; k++)
+                if (hypotf(p[0] - g_obj.at[k][0], p[1] - g_obj.at[k][1]) < 100.0f)
+                {
+                    Watched w = {}; w.e = e; w.index = i; w.flag = k; memcpy(w.cls, name, sizeof(w.cls));
+                    for (int j = 0; j < 256; j++) w.words[j] = Guest::Read32(base, e + 4 * j);
+                    list.push_back(w);
+                    if (strcmp(name, "script_model") == 0) g_flagModels.push_back(e);   // 0.5.493
+                    else g_flagTriggers.push_back(e);                                 // 0.5.512
+                    printf("flagwatch: watching %s %u (entity %08X) at flag %d (%.0f %.0f)\n", name, i, e, k, g_obj.at[k][0], g_obj.at[k][1]); fflush(stdout);
+                    break;
+                }
+        }
+    }
+    const uint32_t entities = Guest::Read32(base, EntityList);
+    for (Watched& w : list)
+    {
+        std::string changed;
+        for (int j = 0; j < 256; j++)
+        {
+            const uint32_t v = Guest::Read32(base, w.e + 4 * j);
+            if (v == w.words[j]) continue;
+            if (w.changes[j] < 255) w.changes[j]++;
+            if (w.changes[j] <= 12 && changed.size() < 600)
+            {
+                char t[48]; snprintf(t, sizeof(t), " +%d %08X->%08X", 4 * j, w.words[j], v); changed += t;
+            }
+            w.words[j] = v;
+        }
+        if (changed.empty() || told >= 300) continue;
+        told++;
+        std::string around;
+        for (uint32_t o = 0; entities && o < ActiveSlots() && o < MaxClients; o++)
+        {
+            const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+            const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+            if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0) continue;
+            const float d = hypotf(ReadFloat(base, r) - g_obj.at[w.flag][0], ReadFloat(base, r + 4) - g_obj.at[w.flag][1]);
+            if (d > 200.0f) continue;
+            char t[48]; snprintf(t, sizeof(t), " slot %u side %u %s %.0f;", o, Side(base, e), g_bot[o] ? "bot" : "PLAYER", d); around += t;
+        }
+        printf("flagwatch: %s %u at flag %d changed:%s | near:%s\n", w.cls, w.index, w.flag, changed.c_str(), around.empty() ? " nobody" : around.c_str());
+        fflush(stdout);
+    }
+    // 0.5.482: each flag's state from its script_models (481's capture: taken,
+    // the model went to z -9970 with the taker 24 from it; dropped, shown at
+    // 204 -531; captured, back at its base)
+    for (int k = 0; k < 2; k++)
+    {
+        // 0.5.525: a carrier who has died carries nothing (524's stayed a
+        // "carrier" after death and respawn, wandering for his "home")
+        if (g_flagCarrier[k] >= 0 && entities)
+        {
+            const uint32_t ce = Guest::Read32(base, entities + 4 * (uint32_t(g_flagCarrier[k]) + 1));
+            const uint32_t cr = ce ? Guest::Read32(base, ce + 512) : 0;
+            if (!cr || int32_t(Guest::Read32(base, cr + 304)) <= 0)
+            {
+                printf("flagwatch: flag %d's carrier slot %d died\n", k, g_flagCarrier[k]); fflush(stdout);
+                if (g_flagCarrier[k] > 0 && g_flagCarrier[k] < int(MaxClients) && g_bot[g_flagCarrier[k]]) g_dropPending[g_flagCarrier[k]] = true;   // 0.5.538
+                g_flagCarrier[k] = -1;
+            }
+        }
+        bool hidden = false, away = false; float at[3] = {};
+        for (const Watched& w : list)
+        {
+            if (w.flag != k || strcmp(w.cls, "script_model") != 0) continue;
+            const float p[3] = { ReadFloat(base, w.e + 336), ReadFloat(base, w.e + 340), ReadFloat(base, w.e + 344) };
+            if (!std::isfinite(p[2])) continue;
+            if (p[2] < -5000.0f) hidden = true;
+            else if (hypotf(p[0] - g_obj.at[k][0], p[1] - g_obj.at[k][1]) > 50.0f) { away = true; memcpy(at, p, sizeof(at)); }
+        }
+        const float* last = g_flagDropped[k] ? g_flagDropAt[k] : g_obj.at[k];
+        if (hidden && g_flagCarrier[k] < 0)
+        {
+            // 0.5.520: this flag's own weapon: side 2's flag gives mp_flag_allies
+            const int ownerSide = g_ctfOwn[1] == k ? 1 : g_ctfOwn[2] == k ? 2 : 0;
+            // taken: by the nearest living player to where it was
+            // 0.5.588: of the other side only (a side's own flag is never carried
+            // by it): 586's carrier test had flag 1 "taken" 13 times by side 2's
+            // own defenders standing by it (the real taker a side 1 attacker
+            // further off), and the stuck-carrier help put them on it every 10 s
+            int best = -1; float bestD = 250.0f; uint32_t bestSide = 0;
+            for (uint32_t o = 0; entities && o < ActiveSlots() && o < MaxClients; o++)
+            {
+                const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+                const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+                if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0) continue;
+                const uint32_t oSide = g_bot[o] ? BotSide(base, o) : Side(base, e);
+                if (ownerSide && oSide == uint32_t(ownerSide)) continue;
+                const float d = hypotf(ReadFloat(base, r) - last[0], ReadFloat(base, r + 4) - last[1]);
+                if (d < bestD) { bestD = d; best = int(o); bestSide = oSide; }
+            }
+            // 0.5.501: the flag weapon's owner when there is one (the real carrier)
+            uint32_t flagWeapon = 0;
+            const int holder = ownerSide ? FlagWeaponHolder(base, ownerSide == 2 ? "mp_flag_allies" : "mp_flag_axis", &flagWeapon) : -1;
+            if (holder >= 0 && holder != best)
+            {
+                printf("flagwatch: the nearest was slot %d, but slot %d owns the flag weapon %u: him\n", best, holder, flagWeapon); fflush(stdout);
+                best = holder;
+                const uint32_t e = Guest::Read32(base, entities + 4 * (uint32_t(holder) + 1));
+                bestSide = e ? Side(base, e) : 0;
+            }
+            // 0.5.526: nobody found (a flag hidden with no holder: 525's after
+            // its carrier died): no take, and no line every frame
+            if (best < 0)
+            {
+                static uint32_t toldAt[2] = {};
+                if (GetTickCount() - toldAt[k] > 10000) { toldAt[k] = GetTickCount(); printf("flagwatch: flag %d hidden with nobody holding it\n", k); fflush(stdout); }
+                continue;
+            }
+            g_flagCarrier[k] = best; g_flagDropped[k] = false;
+            const uint8_t mode = best >= 0 ? g_flagUseMode[best] : 0;   // 0.5.484
+            printf("flagwatch: flag %d (%.0f %.0f) TAKEN by slot %d (side %u, %s, %.0f away%s)\n", k, g_obj.at[k][0], g_obj.at[k][1], best, bestSide, best >= 0 && g_bot[best] ? "bot" : "player", bestD,
+                   best >= 0 && g_bot[best] ? (mode == 1 ? ", holding X alone" : mode == 2 ? ", holding X with activate" : ", not pressing") : ""); fflush(stdout);
+            if (best > 0 && g_bot[best]) { printf("flagwatch: a BOT took it (slot %d, side %u)\n", best, bestSide); fflush(stdout); }   // 0.5.511
+            // 0.5.520: a take no longer proves or puts right the sides (519: a take
+            // credited to the other flag's carrier swapped them mid-match); the
+            // sides come from ctf-flags.txt and the start; only an owner-checked
+            // take (the flag's own weapon) by a player still proves them
+            const bool checked = holder >= 0 && holder == best;
+            if (checked && !g_bot[best] && bestSide >= 1 && bestSide <= 2) { g_ctfProvenSide = bestSide; g_ctfProvenFlag = k; }   // 0.5.487: saved by CtfSpawnSides
+            if (false && best >= 0 && bestSide >= 1 && bestSide <= 2 && !g_flagDropped[k] && g_ctfOwn[bestSide] == k)
+            {
+                g_ctfOwn[bestSide] = 1 - k; g_ctfOwn[3 - bestSide] = k;
+                printf("bots: ctf sides corrected by a take: side %u owns the flag at %.0f %.0f\n", bestSide, g_obj.at[1 - k][0], g_obj.at[1 - k][1]); fflush(stdout);
+            }
+        }
+        else if (!hidden && away && (!g_flagDropped[k] || hypotf(at[0] - g_flagDropAt[k][0], at[1] - g_flagDropAt[k][1]) > 1.0f))
+        {
+            g_flagCarrier[k] = -1; g_flagDropped[k] = true; memcpy(g_flagDropAt[k], at, sizeof(at));
+            printf("flagwatch: flag %d dropped at %.0f %.0f %.0f\n", k, at[0], at[1], at[2]); fflush(stdout);
+        }
+        else if (!hidden && !away && (g_flagCarrier[k] >= 0 || g_flagDropped[k]))
+        {
+            // 0.5.584: home straight from carried (no drop between) is a capture
+            if (g_flagCarrier[k] >= 0 && !g_flagDropped[k]) { printf("flagwatch: flag %d CAPTURED by slot %d\n", k, g_flagCarrier[k]); fflush(stdout); }
+            g_flagCarrier[k] = -1; g_flagDropped[k] = false;
+            printf("flagwatch: flag %d home (the last bot capture request's second value: %d)\n", k, g_captureTry); fflush(stdout);
+        }
+    }
+}
+// 0.5.485: what the game's scripts know about a player that they do not know
+// about a bot. 484: bots could neither take the enemy flag nor return their
+// own dropped one (98 and 101 tries; it lay out 9 minutes) while the user
+// took it at once: the CTF script most likely compares the player's own
+// script-side team with the flag's, and the port puts bots on a side through
+// the engine. The script variables of the host (slot 0) and of the first bot
+// of each side (sub_821DE680 on the entity handle, +484: +0 the count, +8
+// pairs of name hash and value) are logged side by side, with what differs:
+// once 20 s into a CTF match and at each take.
+static void ScriptVarsCompare(PPCContext& ctx, uint8_t* base, const char* why)
+{
+    const uint32_t list = Guest::Read32(base, EntityList);
+    if (!list) return;
+    auto vars = [&](uint32_t slot, std::map<uint32_t, uint32_t>& out) {
+        const uint32_t e = Guest::Read32(base, list + 4 * (slot + 1));
+        const uint32_t handle = e ? Guest::Read32(base, e + 484) : 0;
+        if (!handle) return false;
+        const uint32_t table = Call(ctx, base, 0x821DE680, handle);
+        if (table < 0x40000000u || table >= 0xA0000000u) return false;
+        const uint32_t count = std::min<uint32_t>(Guest::Read32(base, table), 256);
+        for (uint32_t i = 0; i < count; i++) out[Guest::Read32(base, table + 8 + 8 * i)] = Guest::Read32(base, table + 12 + 8 * i);
+        return true;
+    };
+    std::map<uint32_t, uint32_t> host;
+    if (!vars(0, host)) return;
+    uint32_t bots[3] = { 0, MaxClients, MaxClients };
+    for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+    {
+        if (!g_bot[o]) continue;
+        const uint32_t s = BotSide(base, o);
+        if (s >= 1 && s <= 2 && bots[s] == MaxClients) bots[s] = o;
+    }
+    const uint32_t hostSide = BotSide(base, 0);
+    std::string line;
+    for (const auto& kv : host) { char t[24]; snprintf(t, sizeof(t), " %08X=%08X", kv.first, kv.second); line += t; }
+    printf("scriptvars (%s): host slot 0 side %u, %zu vars:%s\n", why, hostSide, host.size(), line.c_str());
+    for (int s = 1; s <= 2; s++)
+    {
+        if (bots[s] == MaxClients) continue;
+        std::map<uint32_t, uint32_t> bot;
+        if (!vars(bots[s], bot)) continue;
+        std::string missing, extra, differ;
+        for (const auto& kv : host)
+        {
+            const auto it = bot.find(kv.first);
+            char t[40];
+            if (it == bot.end()) { snprintf(t, sizeof(t), " %08X", kv.first); missing += t; }
+            else if (it->second != kv.second) { snprintf(t, sizeof(t), " %08X(%08X/%08X)", kv.first, kv.second, it->second); differ += t; }
+        }
+        for (const auto& kv : bot) if (!host.count(kv.first)) { char t[24]; snprintf(t, sizeof(t), " %08X=%08X", kv.first, kv.second); extra += t; }
+        printf("scriptvars (%s): bot slot %u side %u, %zu vars; MISSING (host has):%s | ONLY THE BOT:%s | DIFFER (host/bot):%s\n",
+               why, bots[s], s, bot.size(), missing.empty() ? " none" : missing.c_str(), extra.empty() ? " none" : extra.c_str(), differ.empty() ? " none" : differ.c_str());
+    }
+    fflush(stdout);
+}
+// 0.5.493: who moves a flag's model (the game's CTF take hides it 10000 down).
+// 488-492 could not find what the take checks by probing fields; so the pages
+// holding the flags' script_models are made read-only (unattended test only)
+// and a write to a model's origin (+336..+347) stops the CPU: the native
+// stack (the recompiled sub_XXXXXXXX functions, by the PDB) is logged
+// ("flagtrap:"), then that one write is let through (single step) and the
+// page locked again. The host's take at 200 s then names the take's code.
+// 0.5.513: the trigger-touch queue's consumer (sub_8256FFC8, each server
+// frame): a touch is queued by sub_82567328 as (trigger handle, toucher
+// handle, the trigger's +204, the toucher's +204) at 0x82C281D0 + 3196, 16
+// bytes each, the count at +7292; here each one's handles are resolved in
+// the entity table (0x82BD1FC0: index = handle & 0x3FFF, the generation
+// handle >> 14 at +4 of the entry) and both +204s compared with the queued
+// ones; only then the script is told (sub_820B0898: "trigger"). 488-512: a
+// bot's touch is recorded on the trigger but the script never acts. So each
+// queued touch BY A BOT is checked the same way first and its outcome logged.
+extern "C" PPC_FUNC(__imp__sub_8256FFC8);
+PPC_FUNC(sub_8256FFC8)
+{
+    constexpr uint32_t Queue = 0x82C281D0u, Table = 0x82BD1FC0u;
+    const int32_t count = int32_t(Guest::Read32(base, Queue + 7292));
+    const uint32_t list = Guest::Read32(base, EntityList);
+    static int told = 0;
+    static uint32_t passed = 0, failed[4] = {};
+    for (int32_t i = 0; list && i < count && i < 256; i++)
+    {
+        const uint32_t at = Queue + 3196 + 16 * uint32_t(i);
+        const uint32_t trigH = Guest::Read32(base, at), actH = Guest::Read32(base, at + 4);
+        const uint32_t trig204 = Guest::Read32(base, at + 8), act204 = Guest::Read32(base, at + 12);
+        auto resolve = [&](uint32_t h) -> uint32_t {
+            const uint32_t idx = h & 0x3FFFu;
+            if (idx >= 4096) return 0;
+            return Guest::Read32(base, Table + 8 * idx + 4) == ((h >> 14) & 0x3FFFFu) ? Guest::Read32(base, Table + 8 * idx) : 0;
+        };
+        // is the toucher a bot? (by his handle's entity, else his entity's +484)
+        const uint32_t actRaw = Guest::Read32(base, Table + 8 * (actH & 0x3FFFu));
+        int slot = -1;
+        for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients && slot < 0; o++)
+        {
+            if (!g_bot[o]) continue;
+            const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+            if (e && (e == actRaw || Guest::Read32(base, e + 484) == actH)) slot = int(o);
+        }
+        if (slot < 0) continue;
+        // 0.5.514: the flags' triggers only (513's 60 lines were all other
+        // triggers, spawn and zone volumes): the trigger's entity among
+        // FlagEntityWatch's flag triggers
+        {
+            const uint32_t trigRaw = Guest::Read32(base, Table + 8 * (trigH & 0x3FFFu));
+            bool flagTrigger = false;
+            for (uint32_t f : g_flagTriggers) if (f == trigRaw) flagTrigger = true;
+            if (!flagTrigger) continue;
+        }
+        const uint32_t trig = resolve(trigH), act = resolve(actH);
+        int why = -1;
+        if (!trig) why = 0;
+        else if (Guest::Read32(base, trig + 204) != trig204) why = 1;
+        else if (!act) why = 2;
+        else if (Guest::Read32(base, act + 204) != act204) why = 3;
+        static const char* const reasons[4] = { "the trigger's handle does not resolve", "the trigger's +204 changed", "the BOT's handle does not resolve", "the BOT's +204 changed" };
+        if (why < 0) passed++; else failed[why]++;
+        if (told < 60)
+        {
+            told++;
+            const uint32_t e = Guest::Read32(base, list + 4 * (uint32_t(slot) + 1));
+            printf("touchqueue: bot slot %d touched FLAG trigger %08X: %s (his handle %08X: table entity %08X gen %u, his entity %08X +484 %08X; +204 queued %08X now %08X)\n",
+                   slot, trigH, why < 0 ? "PASSES (the script is told)" : reasons[why], actH, actRaw, Guest::Read32(base, Table + 8 * (actH & 0x3FFFu) + 4),
+                   e, e ? Guest::Read32(base, e + 484) : 0, act204, act ? Guest::Read32(base, act + 204) : 0);
+            fflush(stdout);
+        }
+    }
+    static uint32_t lastSum = 0;
+    if (const uint32_t sum = passed + failed[0] + failed[1] + failed[2] + failed[3]; sum && sum / 50 != lastSum / 50)
+    {
+        lastSum = sum;
+        printf("touchqueue: bots' FLAG touches so far: %u passed, %u trigger unresolved, %u trigger changed, %u bot unresolved, %u bot +204 changed\n", passed, failed[0], failed[1], failed[2], failed[3]);
+        fflush(stdout);
+    }
+    __imp__sub_8256FFC8(ctx, base);
+}
+// 0.5.516: the game's scripts are compiled native code: sub_82204A08 is the
+// CTF flag handler itself (its end gives the carrier the flag weapon, gi
+// +2664/+2872/+2692, then hides the base flag, sub_821E5718); its caller
+// sub_82205788. Both wrapped: each call logged with its arguments and the
+// player (r4 points at his handle in sub_82204A08), so a bot's touch shows
+// where it stops: never reaching the caller, the caller not calling the
+// handler, or the handler returning early.
+namespace
+{
+    int SlotOfHandle(uint8_t* base, uint32_t handle)
+    {
+        const uint32_t list = Guest::Read32(base, EntityList);
+        const uint32_t e = (handle & 0x3FFFu) < 4096 ? Guest::Read32(base, 0x82BD1FC0u + 8 * (handle & 0x3FFFu)) : 0;
+        for (uint32_t o = 0; list && e && o < ActiveSlots() && o < MaxClients; o++) if (Guest::Read32(base, list + 4 * (o + 1)) == e) return int(o);
+        return -1;
+    }
+    std::atomic<int> g_flagCallsTold{ 0 };
+}
+extern "C" PPC_FUNC(__imp__sub_82204A08);
+PPC_FUNC(sub_82204A08)
+{
+    const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32;
+    const uint32_t handle = (r4 >= 0x40000000u && r4 < 0xA0000000u) ? Guest::Read32(base, r4) : 0;
+    const int slot = handle ? SlotOfHandle(base, handle) : -1;
+    const bool bot = slot > 0 && g_bot[slot];
+    const bool tell = g_flagCallsTold.fetch_add(1) < 3000;   // 0.5.522: 3000 (the bots' capture asks used up 200)
+    if (tell) { printf("flagcode: sub_82204A08 (the flag handler) called: r3 %08X, player handle %08X (slot %d, %s), r5 %08X, r6 %08X\n", r3, handle, slot, bot ? "BOT" : slot == 0 ? "host" : "?", r5, r6); fflush(stdout); }
+    __imp__sub_82204A08(ctx, base);
+    if (tell) { printf("flagcode: sub_82204A08 returned %08X for slot %d\n", ctx.r3.u32, slot); fflush(stdout); }
+}
+// 0.5.525: the other two message callbacks too (+3424 sub_822049D8: 523
+// showed it DROPS the carried flag; +3428 sub_821F33A0), to see what a real
+// client's capture sends (the test puts the host, carrying, by his flag)
+extern "C" PPC_FUNC(__imp__sub_822049D8);
+PPC_FUNC(sub_822049D8)
+{
+    const uint32_t h = (ctx.r3.u32 >= 0x40000000u && ctx.r3.u32 < 0xA0000000u) ? Guest::Read32(base, ctx.r3.u32) : 0;
+    if (g_flagCallsTold.fetch_add(1) < 3000) { printf("flagcode: +3424 sub_822049D8 (drop) called: r3 %08X (-> %08X slot %d), r4 %08X, r5 %08X\n", ctx.r3.u32, h, h ? SlotOfHandle(base, h) : -1, ctx.r4.u32, ctx.r5.u32); fflush(stdout); }
+    // 0.5.529: who drops it (528: a bot carrier by his own flag was dropped by
+    // the game, where the host's carry was captured): the native callers
+    {
+        void* frames[24] = {};
+        const USHORT n = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+        char buffer[sizeof(SYMBOL_INFO) + 128] = {};
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        std::string chain;
+        for (USHORT i = 0; i < n && i < 14; i++)
+        {
+            memset(buffer, 0, sizeof(buffer)); symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = 127;
+            DWORD64 d = 0; char t[160];
+            if (SymFromAddr(GetCurrentProcess(), reinterpret_cast<DWORD64>(frames[i]), &d, symbol)) snprintf(t, sizeof(t), " %s+0x%llx", symbol->Name, (unsigned long long)d);
+            else snprintf(t, sizeof(t), " %p", frames[i]);
+            chain += t;
+        }
+        printf("flagcode: the drop's callers:%s\n", chain.c_str()); fflush(stdout);
+    }
+    __imp__sub_822049D8(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_821F33A0);
+PPC_FUNC(sub_821F33A0)
+{
+    const uint32_t a = (ctx.r3.u32 >= 0x40000000u && ctx.r3.u32 < 0xA0000000u) ? Guest::Read32(base, ctx.r3.u32) : 0;
+    const uint32_t b = (ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0xA0000000u) ? Guest::Read32(base, ctx.r4.u32) : 0;
+    if (g_flagCallsTold.fetch_add(1) < 3000) { printf("flagcode: +3428 sub_821F33A0 called: r3 %08X (-> %08X), r4 %08X (-> %08X slot %d), r5 %08X, r6 %08X\n", ctx.r3.u32, a, ctx.r4.u32, b, b ? SlotOfHandle(base, b) : -1, ctx.r5.u32, ctx.r6.u32); fflush(stdout); }
+    __imp__sub_821F33A0(ctx, base);
+}
+// 0.5.532: THE CAPTURE IS ASKED FOR TOO. 531's trap: the host's capture moved
+// the flag home from sub_82203E00, called (through Callbacks +3432) by
+// sub_823E3298, a client message handler like the take's. Wrapped to log the
+// real arguments of a capture (r3, r4: its first branch is on r4).
+extern "C" PPC_FUNC(__imp__sub_82203E00);
+PPC_FUNC(sub_82203E00)
+{
+    if (g_flagCallsTold.fetch_add(1) < 3000) { printf("flagcode: sub_82203E00 (the CAPTURE) called: r3 %08X, r4 %08X, r5 %08X\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32); fflush(stdout); }
+    __imp__sub_82203E00(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_82205788);
+PPC_FUNC(sub_82205788)
+{
+    const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32, r6 = ctx.r6.u32;
+    std::string args;
+    for (uint32_t v : { r3, r4, r5, r6 })
+    {
+        char t[64];
+        const uint32_t pointed = (v >= 0x40000000u && v < 0xA0000000u) ? Guest::Read32(base, v) : 0;
+        const int slot = (pointed & 0xFFFFC000u) == 0x4000u ? SlotOfHandle(base, pointed) : ((v & 0xFFFFC000u) == 0x4000u ? SlotOfHandle(base, v) : -1);
+        snprintf(t, sizeof(t), " %08X(->%08X%s%d)", v, pointed, slot >= 0 ? " slot " : "", slot);
+        args += t;
+    }
+    const bool tell = g_flagCallsTold.fetch_add(1) < 3000;   // 0.5.522: 3000 (the bots' capture asks used up 200)
+    if (tell) { printf("flagcode: sub_82205788 (its caller) called:%s\n", args.c_str()); fflush(stdout); }
+    __imp__sub_82205788(ctx, base);
+}
+namespace FlagTrap
+{
+    struct Range { uintptr_t from, to; };
+    std::vector<Range> g_origins;      // host addresses of the models' origins
+    std::vector<Range> g_touches;      // 0.5.512: the flag triggers' +760..+808
+    std::vector<Range> g_touch496;     // 0.5.531: and their +496
+    std::vector<uintptr_t> g_pages;    // the pages locked
+    std::atomic<int> g_told{ 0 };
+    thread_local uintptr_t t_relock = 0;
+    thread_local DWORD t_relockProt = PAGE_READONLY;
+    bool g_symbols = false;
+    // 0.5.494: reads of chosen words (the pad state found by PadScan), while on
+    std::vector<uintptr_t> g_readWords, g_readPages;
+    std::atomic<bool> g_readOn{ false };
+    // 0.5.496: named ranges of one player's memory, and the interpreter's code
+    struct WatchRange { uintptr_t from, to; const char* who; const char* region; };
+    std::vector<WatchRange> g_ranges;
+    uintptr_t g_vmFrom = 0, g_vmTo = 0;
+    std::atomic<int> g_readTold{ 0 };
+    std::string StackText(CONTEXT* context);
+    void PrintStack(CONTEXT* context)
+    {
+        printf("flagtrap: a flag model's origin written by:%s\n", StackText(context).c_str()); fflush(stdout);
+    }
+    std::string StackText(CONTEXT* context)
+    {
+        void* frames[40] = {};
+        const USHORT n = RtlCaptureStackBackTrace(0, 40, frames, nullptr);
+        const HANDLE process = GetCurrentProcess();
+        char buffer[sizeof(SYMBOL_INFO) + 256] = {};
+        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+        std::string out;
+        // the faulting instruction first, then the callers (after the dispatcher)
+        auto name = [&](DWORD64 pc) {
+            memset(buffer, 0, sizeof(buffer));
+            symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = 255;
+            DWORD64 displacement = 0;
+            char t[300];
+            if (SymFromAddr(process, pc, &displacement, symbol)) snprintf(t, sizeof(t), " %s+0x%llx", symbol->Name, (unsigned long long)displacement);
+            else snprintf(t, sizeof(t), " %llx", (unsigned long long)pc);
+            out += t;
+        };
+        name(context->Rip);
+        bool past = false;
+        for (USHORT i = 0; i < n; i++)
+        {
+            const DWORD64 pc = reinterpret_cast<DWORD64>(frames[i]);
+            if (!past) { memset(buffer, 0, sizeof(buffer)); symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = 255; DWORD64 d = 0;
+                         if (SymFromAddr(process, pc, &d, symbol) && strstr(symbol->Name, "KiUserExceptionDispatch")) past = true; continue; }
+            name(pc);
+        }
+        return out;
+    }
+    LONG CALLBACK Handler(EXCEPTION_POINTERS* info)
+    {
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_SINGLE_STEP && t_relock)
+        {
+            DWORD old; VirtualProtect(reinterpret_cast<void*>(t_relock), 4096, (g_readOn || t_relockProt == PAGE_READONLY) ? t_relockProt : PAGE_READWRITE, &old);
+            t_relock = 0;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2) return EXCEPTION_CONTINUE_SEARCH;
+        const uintptr_t at = info->ExceptionRecord->ExceptionInformation[1];
+        const uintptr_t page = at & ~uintptr_t(4095);
+        // 0.5.494: a read-watched page: the reads of the watched words from
+        // the script interpreter's calls are logged
+        for (uintptr_t p : g_readPages)
+        {
+            if (p != page) continue;
+            DWORD old;  /* 0.5.496: unlocked first, so the value can be read */ VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
+            // 0.5.496: reads of one player's memory (entity, record, session)
+            // made while the script interpreter (sub_82204A08) is on the stack:
+            // the player fields the CTF script looks at, for a bot pressing at
+            // the enemy flag and for the host taking it. One line per (who,
+            // region, offset, the function that read it).
+            if (g_readOn && g_vmFrom)
+                for (const WatchRange& r : g_ranges)
+                {
+                    if (at < r.from || at >= r.to) continue;
+                    void* frames[48] = {};
+                    const USHORT n = RtlCaptureStackBackTrace(0, 48, frames, nullptr);
+                    bool vm = false;
+                    for (USHORT i = 0; i < n && !vm; i++) { const uintptr_t pc = reinterpret_cast<uintptr_t>(frames[i]); vm = pc >= g_vmFrom && pc < g_vmTo; }
+                    if (!vm) break;
+                    const uint32_t offset = uint32_t(at - r.from) & ~3u;
+                    char reader[160] = "?";
+                    {
+                        char buffer[sizeof(SYMBOL_INFO) + 128] = {};
+                        auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                        symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = 127;
+                        DWORD64 d = 0;
+                        if (SymFromAddr(GetCurrentProcess(), info->ContextRecord->Rip, &d, symbol)) snprintf(reader, sizeof(reader), "%s", symbol->Name);
+                    }
+                    char key[256]; snprintf(key, sizeof(key), "%s %s +%u %s", r.who, r.region, offset, reader);
+                    static std::vector<std::string> seen;
+                    bool fresh = true; for (const std::string& s : seen) if (s == key) fresh = false;
+                    if (fresh && seen.size() < 400)
+                    {
+                        seen.push_back(key);
+                        uint32_t value; memcpy(&value, reinterpret_cast<void*>(at & ~uintptr_t(3)), 4);
+                        printf("vmread: %s %s +%u = %08X by %s\n", r.who, r.region, offset, _byteswap_ulong(value), reader); fflush(stdout);
+                    }
+                    break;
+                }
+            t_relock = page; t_relockProt = PAGE_NOACCESS;
+            info->ContextRecord->EFlags |= 0x100;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (info->ExceptionRecord->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
+        bool ours = false;
+        for (uintptr_t p : g_pages) if (p == page) ours = true;
+        if (!ours) return EXCEPTION_CONTINUE_SEARCH;
+        // 0.5.530: each distinct chain once (a take, a drop, a return, a
+        // capture), not the first 60 writes
+        for (const Range& r : g_origins)
+            if (at >= r.from && at < r.to)
+            {
+                const std::string stack = StackText(info->ContextRecord);
+                static std::vector<std::string> seenOrigin;
+                bool fresh = true; for (const std::string& s : seenOrigin) if (s == stack) fresh = false;
+                if (fresh && seenOrigin.size() < 40) { seenOrigin.push_back(stack); printf("flagtrap: a flag model's origin written by:%s\n", stack.c_str()); fflush(stdout); }
+                break;
+            }
+        // 0.5.512: a flag trigger's touch fields (+760 time, +764, +804 the
+        // toucher): who writes them, each distinct chain once (the host's
+        // touch and a bot's compared: does a bot's go on into the script?)
+        for (const Range& r : g_touches)
+            if (at >= r.from && at < r.to)
+            {
+                const std::string stack = StackText(info->ContextRecord);
+                static std::vector<std::string> seenTouch;
+                bool fresh = true; for (const std::string& s : seenTouch) if (s == stack) fresh = false;
+                if (fresh && seenTouch.size() < 40)
+                {
+                    seenTouch.push_back(stack);
+                    printf("flagtrap: a flag trigger's touch field +%u written by:%s\n", unsigned(at - (r.from - 760)), stack.c_str()); fflush(stdout);
+                }
+                break;
+            }
+        for (const Range& r : g_touch496)
+            if (at >= r.from && at < r.to)
+            {
+                const std::string stack = StackText(info->ContextRecord);
+                static std::vector<std::string> seen496;
+                bool fresh = true; for (const std::string& s : seen496) if (s == stack) fresh = false;
+                if (fresh && seen496.size() < 40)
+                {
+                    seen496.push_back(stack);
+                    printf("flagtrap: a flag trigger's +496 written by:%s\n", stack.c_str()); fflush(stdout);
+                }
+                break;
+            }
+        DWORD old; VirtualProtect(reinterpret_cast<void*>(page), 4096, PAGE_READWRITE, &old);
+        t_relock = page; t_relockProt = PAGE_READONLY;
+        info->ContextRecord->EFlags |= 0x100;   // one instruction, then EXCEPTION_SINGLE_STEP locks it again
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    void Arm(uint8_t* base, const std::vector<uint32_t>& models, const std::vector<uint32_t>& triggers = {})
+    {
+        if (!g_pages.empty() || models.empty()) return;
+        for (uint32_t e : triggers)
+        {
+            const uintptr_t from = reinterpret_cast<uintptr_t>(base + e + 760);
+            g_touches.push_back({ from, from + 48 });
+            const uintptr_t page = from & ~uintptr_t(4095);
+            bool have = false; for (uintptr_t p : g_pages) if (p == page) have = true;
+            if (!have) g_pages.push_back(page);
+            // 0.5.531: +496 too (set at the host's capture touch, never at a
+            // bot carrier's)
+            const uintptr_t f496 = reinterpret_cast<uintptr_t>(base + e + 496);
+            g_touch496.push_back({ f496, f496 + 4 });
+            const uintptr_t page496 = f496 & ~uintptr_t(4095);
+            have = false; for (uintptr_t p : g_pages) if (p == page496) have = true;
+            if (!have) g_pages.push_back(page496);
+        }
+        const HANDLE process = GetCurrentProcess();
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        g_symbols = SymInitialize(process, nullptr, TRUE) != FALSE || GetLastError() == ERROR_INVALID_PARAMETER;
+        { char b[sizeof(SYMBOL_INFO) + 64] = {}; auto* s = reinterpret_cast<SYMBOL_INFO*>(b); s->SizeOfStruct = sizeof(SYMBOL_INFO); s->MaxNameLen = 63; DWORD64 d;
+          SymFromAddr(process, reinterpret_cast<DWORD64>(&Arm), &d, s); }   // the PDB loaded now, not inside the first trap
+        AddVectoredExceptionHandler(1, Handler);
+        for (uint32_t e : models)
+        {
+            const uintptr_t from = reinterpret_cast<uintptr_t>(base + e + 336);
+            g_origins.push_back({ from, from + 12 });
+            const uintptr_t page = from & ~uintptr_t(4095);
+            bool have = false; for (uintptr_t p : g_pages) if (p == page) have = true;
+            if (!have) g_pages.push_back(page);
+        }
+        for (uintptr_t p : g_pages) { DWORD old; VirtualProtect(reinterpret_cast<void*>(p), 4096, PAGE_READONLY, &old); }
+        printf("flagtrap: armed on %zu flag models (%zu pages)\n", models.size(), g_pages.size()); fflush(stdout);
+    }
+}
+// 0.5.488: the unattended CTF test's probe (COD3_BIG_MODE set only), for what
+// the game checks on a flag take that the bots fail: 487's bots pressed use
+// at the real enemy flag 812 times and fired its trigger 78 times, never
+// given it; the user takes it at once. 25 s after the sides are known: every
+// word where ALL living bots (5 or more) agree and the host differs, in the
+// entity (1 KB), the player record (+512, 8 KB) and the session player (1
+// KB). 30 s: the host (god) put 30 from the enemy flag and X tapped every
+// 300 ms for 10 s, as the control: does a player take it in this test?
+static void CtfTakeProbe(PPCContext& ctx, uint8_t* base)
+{
+    // 0.5.538: only with COD3_CTF_PROBE=1 (the user plays in the unattended
+    // test's matches: its teleports of the host and pad taps broke his game)
+    const char* mode = getenv("COD3_CTF_PROBE");
+    if (!mode || !mode[0] || g_ctfOwn[1] < 0 || g_obj.count != 2) return;
+    static uint32_t knownAt = 0, stage = 0, lastTap = 0;
+    const uint32_t now = GetTickCount();
+    if (!knownAt) knownAt = now;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    if (!list) return;
+    const uint32_t hostE = Guest::Read32(base, list + 4);
+    const uint32_t hostR = hostE ? Guest::Read32(base, hostE + 512) : 0;
+    if (!hostR) return;
+    if (stage == 0 && now - knownAt > 25000)
+    {
+        stage = 1;
+        // 0.5.491's search for script method names found none (the scripts are
+        // compiled in): removed
+        FlagTrap::Arm(base, g_flagModels, g_flagTriggers);   // 0.5.493; 0.5.512 the triggers' touch fields too
+        // 0.5.515: 514: bot 22 (side 2) at the enemy flag touched trigger 111
+        // 23 times and its twin 112 (same place) never; the host's take had
+        // both of its flag's triggers record him. The engine's touch loop
+        // (sub_8256F6B0) matches the toucher's +324 (contents) against a mask:
+        // +324 of the host, of each bot by side, and of the four flag
+        // triggers (with +320 and +328 beside it)
+        {
+            std::string players;
+            for (uint32_t o = 0; o < ActiveSlots() && o < MaxClients; o++)
+            {
+                const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+                if (!e || (o != 0 && !g_bot[o])) continue;
+                char t[64]; snprintf(t, sizeof(t), " %s%u(side %u):%08X", o == 0 ? "HOST" : "", o, Side(base, e), Guest::Read32(base, e + 324)); players += t;
+            }
+            std::string trigs;
+            for (uint32_t f : g_flagTriggers)
+            {
+                char t[96]; snprintf(t, sizeof(t), " %08X: +320 %08X +324 %08X +328 %08X @%.0f %.0f", f, Guest::Read32(base, f + 320), Guest::Read32(base, f + 324), Guest::Read32(base, f + 328), ReadFloat(base, f + 336), ReadFloat(base, f + 340)); trigs += t;
+            }
+            printf("ctfprobe: contents +324:%s\nctfprobe: flag triggers:%s\n", players.c_str(), trigs.c_str()); fflush(stdout);
+        }
+        // 0.5.508: every bot's side again, the way the game's own menu does it
+        // in a session game (sub_8239FB10's other branch): the session's side
+        // change sub_823EA4E0(mode object, entity, side 1/2, 0, 0), now that
+        // the bots have session players (at join they had none: "session
+        // 00000000"). In the local mode, the callback (handle, 1, 1) instead.
+        {
+            const uint32_t modeObject = Guest::Read32(base, 0x82BCCAC0);
+            const bool session = modeObject && Guest::Read32(base, modeObject) != 0;
+            int done = 0;
+            for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+            {
+                if (!g_bot[o]) continue;
+                const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+                const uint32_t s = e ? Side(base, e) : 0;
+                if (s < 1 || s > 2) continue;
+                if (session) Call(ctx, base, 0x823EA4E0, modeObject, e, s, 0, 0);
+                else
+                {
+                    const uint32_t scratch = (ctx.r1.u32 - 0x200) & ~0xFu;
+                    Guest::Write32(base, scratch, Guest::Read32(base, e + 484));
+                    const uint32_t object = Guest::Read32(base, 0x82BCBF64);
+                    const uint32_t callback = object ? Guest::Read32(base, object + 3320) : 0;
+                    if (callback) Call(ctx, base, callback, scratch, 1, 1);
+                }
+                done++;
+            }
+            printf("ctfprobe: %d bots' sides set again through the %s (mode object %08X, session player of bot 1: %08X)\n", done,
+                   session ? "session's side change (sub_823EA4E0)" : "script's side callback (local mode)", modeObject, SessionPlayer(base, 1)); fflush(stdout);
+        }
+        // 0.5.504: 503's read watch saw the script read almost nothing of a
+        // player's own memory: its fields (team, pers, ...) live in the script's
+        // variables. Those of the host and of a bot of each side, by name: a
+        // player's script handle is his index in the entity table (0x82BD1FC0,
+        // 8 bytes each) with 0x4000 (the kit hook's handles: 0x4005 ...); his
+        // variables sub_821DE680(handle), a field sub_821DE958(vars, hash), the
+        // hash of a name sub_820E10E0 (as weapons are found by name).
+        {
+            auto call = [&](uint32_t fn, uint32_t r3, uint32_t r4 = 0, uint32_t r5 = 0) {
+                PPCContext c = ctx;
+                c.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+                c.r3.u64 = r3; c.r4.u64 = r4; c.r5.u64 = r5; c.lr = 0;
+                Guest::Lookup(fn)(c, base);
+                return c.r3.u32;
+            };
+            static uint32_t text = 0;
+            if (!text) text = Guest::AllocatePhysical(0x40);
+            auto hashOf = [&](const char* name) { memset(base + text, 0, 0x40); memcpy(base + text, name, strlen(name) + 1); return call(0x820E10E0, text); };
+            auto handleOf = [&](uint32_t slot) -> uint32_t {
+                const uint32_t e = Guest::Read32(base, list + 4 * (slot + 1));
+                for (uint32_t i = 0; e && i < 4096; i++) if (Guest::Read32(base, 0x82BD1FC0 + 8 * i) == e) return 0x4000u | i;
+                return 0;
+            };
+            uint32_t who[3] = { 0, 0, 0 };
+            for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+            {
+                if (!g_bot[o]) continue;
+                const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+                const uint32_t s = e ? Side(base, e) : 0;
+                if (s >= 1 && s <= 2 && !who[s]) who[s] = o;
+            }
+            const char* names[] = { "team", "pers", "sessionteam", "sessionstate", "pteam", "class", "curclass", "isflagcarrier", "carryflag", "carryobject",
+                                    "hasflag", "flag", "carrying", "canpickup", "usingobject", "spawned", "spawntime", "lastspawntime", "health", "name",
+                                    "statusicon", "isbot", "bot", "ingame", "connected", "alive", "isalive", "touchtriggers", "pickupflag", "isplayer" };
+            const uint32_t slots[3] = { 0, who[1], who[2] };
+            uint32_t vars[3] = {};
+            for (int p = 0; p < 3; p++) { const uint32_t h = (p == 0 || slots[p]) ? handleOf(slots[p]) : 0; vars[p] = h ? call(0x821DE680, h) : 0;
+                printf("scriptfields: %s slot %u: handle %08X vars %08X%s\n", p == 0 ? "host" : "bot", slots[p], h, vars[p], p == 0 ? "" : ""); }
+            auto field = [&](int p, uint32_t hash) -> std::string {
+                if (!vars[p]) return "-";
+                const uint32_t at = call(0x821DE958, vars[p], hash);
+                if (!at) return "missing";
+                char t[40]; snprintf(t, sizeof(t), "%08X %08X", Guest::Read32(base, at), Guest::Read32(base, at + 4)); return t;
+            };
+            {
+                char line[256]; snprintf(line, sizeof(line), "scriptfields: known 14D6461A (ability): host %s | bot1 %s | bot2 %s", field(0, 0x14D6461A).c_str(), field(1, 0x14D6461A).c_str(), field(2, 0x14D6461A).c_str());
+                printf("%s\n", line);
+            }
+            for (const char* n : names)
+            {
+                const uint32_t h = hashOf(n);
+                const std::string a = field(0, h), b = field(1, h), c = field(2, h);
+                if (a == "missing" && b == "missing" && c == "missing") continue;
+                printf("scriptfields: %-14s %08X: host %s | bot side1 %s | bot side2 %s\n", n, h, a.c_str(), b.c_str(), c.c_str());
+            }
+            // 0.5.505: 504 found "spawntime" for all three (the hash matches the
+            // field names); the other 29 names are not CoD3's. Every field then,
+            // without names: the variables' words dumped (+0..+0x200) for the
+            // layout, and every (hash, value) pair a lookup finds: a hash is
+            // taken as real when sub_821DE958 finds it in that player's table.
+            for (int p = 0; p < 3; p++)
+            {
+                if (!vars[p]) continue;
+                std::string raw;
+                for (uint32_t w = 0; w < 0x200; w += 4) { char t[12]; snprintf(t, sizeof(t), " %08X", Guest::Read32(base, vars[p] + w)); raw += t; }
+                printf("scriptfields: %s raw%s\n", p == 0 ? "host" : p == 1 ? "bot1" : "bot2", raw.c_str());
+            }
+            // 0.5.509: the table's layout, from the lookup itself (sub_821DE958):
+            // +0 the count, +8 a POINTER to the entries, 8 bytes each (hash,
+            // value); it returns the entry + 4. (505 looked for the pairs at
+            // +8 itself and found none.)
+            std::map<uint32_t, uint32_t> pairs[3];
+            for (int p = 0; p < 3; p++)
+            {
+                if (!vars[p]) continue;
+                const uint32_t count = std::min<uint32_t>(Guest::Read32(base, vars[p]), 400);
+                const uint32_t entries = Guest::Read32(base, vars[p] + 8);
+                if (entries < 0x40000000u || entries >= 0xA0000000u) continue;
+                for (uint32_t i = 0; i < count; i++) pairs[p][Guest::Read32(base, entries + 8 * i)] = Guest::Read32(base, entries + 8 * i + 4);
+            }
+            for (int p = 0; p < 2; p++)
+            {
+                std::string all;
+                for (const auto& kv : pairs[p]) { char t[24]; snprintf(t, sizeof(t), " %08X=%08X", kv.first, kv.second); all += t; }
+                printf("scriptfields: %s all %zu:%s\n", p == 0 ? "host" : "bot1", pairs[p].size(), all.c_str());
+            }
+            std::string onlyHost, differ, onlyBots;
+            for (const auto& kv : pairs[0])
+            {
+                const bool in1 = pairs[1].count(kv.first) != 0, in2 = pairs[2].count(kv.first) != 0;
+                char t[64];
+                if (!in1 && !in2) { snprintf(t, sizeof(t), " %08X=%08X", kv.first, kv.second); onlyHost += t; }
+                else if ((in1 && pairs[1][kv.first] != kv.second) && (in2 && pairs[2][kv.first] != kv.second))
+                { snprintf(t, sizeof(t), " %08X(%08X/%08X/%08X)", kv.first, kv.second, pairs[1][kv.first], pairs[2][kv.first]); differ += t; }
+            }
+            for (const auto& kv : pairs[1]) if (!pairs[0].count(kv.first)) { char t[32]; snprintf(t, sizeof(t), " %08X=%08X", kv.first, kv.second); onlyBots += t; }
+            printf("scriptfields: %zu/%zu/%zu fields found; ONLY THE HOST:%s\nscriptfields: DIFFER (host/bot1/bot2):%s\nscriptfields: ONLY BOT1:%s\n",
+                   pairs[0].size(), pairs[1].size(), pairs[2].size(), onlyHost.empty() ? " none" : onlyHost.c_str(), differ.empty() ? " none" : differ.c_str(), onlyBots.empty() ? " none" : onlyBots.c_str());
+            fflush(stdout);
+        }
+        struct Area { const char* name; uint32_t size; };
+        const Area areas[3] = { { "entity", 1024 }, { "record", 8192 }, { "session", 1024 } };
+        std::vector<uint32_t> bots;
+        for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+        {
+            if (!g_bot[o]) continue;
+            const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+            const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+            if (r && int32_t(Guest::Read32(base, r + 304)) > 0) bots.push_back(o);
+        }
+        if (bots.size() < 5) { stage = 0; return; }
+        for (int a = 0; a < 3; a++)
+        {
+            auto at = [&](uint32_t slot) -> uint32_t {
+                const uint32_t e = Guest::Read32(base, list + 4 * (slot + 1));
+                return a == 0 ? e : a == 1 ? (e ? Guest::Read32(base, e + 512) : 0) : SessionPlayer(base, slot);
+            };
+            const uint32_t h = at(0);
+            if (!h) continue;
+            std::string out; int found = 0;
+            for (uint32_t off = 0; off < areas[a].size && found < 160; off += 4)
+            {
+                uint32_t common = 0; bool agree = true;
+                for (size_t i = 0; i < bots.size() && agree; i++)
+                {
+                    const uint32_t p = at(bots[i]);
+                    if (!p) { agree = false; break; }
+                    const uint32_t v = Guest::Read32(base, p + off);
+                    if (i == 0) common = v; else if (v != common) agree = false;
+                }
+                const uint32_t hv = Guest::Read32(base, h + off);
+                if (!agree || hv == common) continue;
+                char t[40]; snprintf(t, sizeof(t), " +%u %08X/%08X", off, hv, common); out += t; found++;
+            }
+            printf("ctfprobe: %s, host/all %zu bots:%s\n", areas[a].name, bots.size(), out.empty() ? " none" : out.c_str()); fflush(stdout);
+        }
+    }
+    // 0.5.489: 488's diff (host vs all 22 bots) left four candidates for what
+    // the take checks (the host, god, took the flag at once tapping X from 30
+    // out): session +624 (host 1, bots 0), session +636 (host -1, bots 0),
+    // record +776 (host 1, bots 0), record +1488 (host 1.0f, bots 0). Each
+    // second the bots are given ONE of them by slot % 5 (group 0 nothing, the
+    // control); the TAKEN line's slot tells the group (logged as "group").
+    // 0.5.492: that experiment took nothing; 491 found no script method names
+    // (CoD3's scripts are compiled in). The test of the theory instead (the
+    // take asks the LOCAL pad): from 60 s to 190 s, while any bot is pressing
+    // use at the enemy flag, the local pad's X is tapped too (the host far
+    // off in his spawn); a bot's take then says the check reads the pad.
+    if (stage >= 1 && now - knownAt > 60000 && now - knownAt < 190000)
+    {
+        bool pressing = false;
+        for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients && !pressing; o++) if (g_bot[o] && g_flagUseMode[o]) pressing = true;
+        g_ctfPadAssist = pressing;
+        if (pressing && now - lastTap > 300) { lastTap = now; Input::PressButton("x"); }
+    }
+    else g_ctfPadAssist = false;
+    // 0.5.510: 509's script tables: the host has 15 fields, a bot 8, and the
+    // bots' 1C4A56B2 is FEFEFF00 (never set; the host's is 1, his side) and
+    // their 14D6461A FEFEFEFE (the host 0): the script's player set-up never
+    // ran fully for them. Each second, every bot's 1C4A56B2 set (side 1: 1;
+    // side 2: 2 for even slots, 1 for odd, to learn whether it is the team
+    // or a yes) and 14D6461A to 0. A bot's take then logs his slot.
+    // 0.5.522: 521's bot capture asks (his side, 1) ran the flag handler,
+    // which did not score. The host's own capture, watched: carrying a flag
+    // 5 s, he is put 20 from his own flag; the flagcode wrappers log what his
+    // client's capture calls; Callbacks +3428 (the message handler's other
+    // callback) printed too
+    {
+        static uint32_t hostSince = 0; static bool hostMoved = false, said3428 = false;
+        if (!said3428) { said3428 = true; const uint32_t object = Guest::Read32(base, 0x82BCBF64); printf("ctfprobe: Callbacks +3420 %08X, +3424 %08X, +3428 %08X\n", object ? Guest::Read32(base, object + 3420) : 0, object ? Guest::Read32(base, object + 3424) : 0, object ? Guest::Read32(base, object + 3428) : 0); fflush(stdout); }
+        const bool hostCarries = g_flagCarrier[0] == 0 || g_flagCarrier[1] == 0;
+        if (!hostCarries) { hostSince = 0; hostMoved = false; }
+        else
+        {
+            if (!hostSince) hostSince = now;
+            const uint32_t s = Side(base, hostE);
+            if (!hostMoved && now - hostSince > 5000 && s >= 1 && s <= 2 && g_ctfOwn[s] >= 0 && g_ctfOwn[s] <= 1)   // 0.5.530: on again
+            {
+                hostMoved = true;
+                const float* home = g_obj.at[g_ctfOwn[s]];
+                static uint32_t position = 0;
+                if (!position) position = Guest::AllocatePhysical(0x20);
+                auto writeF = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+                writeF(position, home[0] + 20.0f); writeF(position + 4, home[1]); writeF(position + 8, home[2] + 1.0f);
+                PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+                place.r3.u64 = hostE; place.r4.u64 = position; place.lr = 0;
+                Guest::Lookup(0x8255E118)(place, base);
+                printf("ctfprobe: HOST CAPTURE TEST: the host (side %u, carrying) put 20 from his own flag at %.0f %.0f\n", s, home[0], home[1]); fflush(stdout);
+            }
+        }
+    }
+    // 0.5.521: the capture tried apart from the pathing: a bot carrying a flag
+    // 20 s is put 20 from his own flag (unattended test only), where
+    // BotFlagClaim asks to CAPTURE. 520's carriers took flags but wandered.
+    {
+        static uint32_t carryingSince[MaxClients] = {};
+        static bool moved[MaxClients] = {};
+        for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+        {
+            if (!g_bot[o] || !BotCarries(o)) { carryingSince[o] = 0; moved[o] = false; continue; }
+            if (!carryingSince[o]) carryingSince[o] = now;
+            if (true || moved[o] || now - carryingSince[o] < 20000) continue;   // 0.5.534: off: 533's bots captured; now they must walk home
+            const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+            const uint32_t s = e ? Side(base, e) : 0;
+            if (s < 1 || s > 2 || g_ctfOwn[s] < 0 || g_ctfOwn[s] > 1) continue;
+            const float* home = g_obj.at[g_ctfOwn[s]];
+            static uint32_t position = 0;
+            if (!position) position = Guest::AllocatePhysical(0x20);
+            auto writeF = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+            writeF(position, home[0] + 20.0f); writeF(position + 4, home[1]); writeF(position + 8, home[2] + 1.0f);
+            PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+            place.r3.u64 = e; place.r4.u64 = position; place.lr = 0;
+            Guest::Lookup(0x8255E118)(place, base);
+            moved[o] = true;
+            printf("ctfprobe: CAPTURE TEST: carrier slot %u (side %u) put 20 from his own flag at %.0f %.0f\n", o, s, home[0], home[1]); fflush(stdout);
+            // 0.5.528: is a script thread waiting on his home triggers (+496,
+            // set while one waits: the host's capture had it, 526's bot not)?
+            for (uint32_t f : g_flagTriggers)
+                if (hypotf(ReadFloat(base, f + 336) - home[0], ReadFloat(base, f + 340) - home[1]) < 100.0f)
+                { printf("ctfprobe: CAPTURE TEST: his home trigger %08X: +496 %08X (0: no script thread waiting)\n", f, Guest::Read32(base, f + 496)); fflush(stdout); }
+        }
+    }
+    if (stage >= 1)
+    {
+        static uint32_t fixAt = 0;
+        if (now - fixAt >= 1000)
+        {
+            fixAt = now;
+            int fixed = 0;
+            for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+            {
+                if (!g_bot[o]) continue;
+                const uint32_t e = Guest::Read32(base, list + 4 * (o + 1));
+                const uint32_t s = e ? Side(base, e) : 0;
+                if (s < 1 || s > 2) continue;
+                uint32_t h = 0;
+                for (uint32_t i = 0; i < 4096 && !h; i++) if (Guest::Read32(base, 0x82BD1FC0 + 8 * i) == e) h = 0x4000u | i;
+                const uint32_t table = h ? Call(ctx, base, 0x821DE680, h) : 0;
+                if (!table) continue;
+                const uint32_t want = s;   // 0.5.511: his side (510's split taught nothing: no take either way)
+                // 0.5.511: the 7 fields only the host has, added: a new entries
+                // array (guest memory of the port's) with the bot's own entries
+                // and the host's missing ones (the host's values; 7654A134, a
+                // time, the bot's spawn time), the table pointed at it, count up
+                static uint32_t grown[MaxClients] = {};
+                const uint32_t hostTable = Call(ctx, base, 0x821DE680, 0x4001u);
+                if (grown[o] != table && hostTable)
+                {
+                    const uint32_t count = std::min<uint32_t>(Guest::Read32(base, table), 64), entries = Guest::Read32(base, table + 8);
+                    const uint32_t hCount = std::min<uint32_t>(Guest::Read32(base, hostTable), 64), hEntries = Guest::Read32(base, hostTable + 8);
+                    if (entries >= 0x40000000u && entries < 0xA0000000u && hEntries >= 0x40000000u && hEntries < 0xA0000000u)
+                    {
+                        const uint32_t fresh = Guest::AllocatePhysical(8 * 96);
+                        uint32_t n = 0;
+                        for (uint32_t i = 0; i < count; i++) { Guest::Write32(base, fresh + 8 * n, Guest::Read32(base, entries + 8 * i)); Guest::Write32(base, fresh + 8 * n + 4, Guest::Read32(base, entries + 8 * i + 4)); n++; }
+                        uint32_t spawn = 0;
+                        if (const uint32_t at = Call(ctx, base, 0x821DE958, table, 0xF922BE58u)) spawn = Guest::Read32(base, at);
+                        for (uint32_t j = 0; j < hCount; j++)
+                        {
+                            const uint32_t hash = Guest::Read32(base, hEntries + 8 * j);
+                            bool have = false;
+                            for (uint32_t i = 0; i < n; i++) if (Guest::Read32(base, fresh + 8 * i) == hash) have = true;
+                            if (have) continue;
+                            Guest::Write32(base, fresh + 8 * n, hash);
+                            Guest::Write32(base, fresh + 8 * n + 4, hash == 0x7654A134u ? spawn : Guest::Read32(base, hEntries + 8 * j + 4));
+                            n++;
+                        }
+                        Guest::Write32(base, table + 8, fresh);
+                        Guest::Write32(base, table, n);
+                        grown[o] = table;
+                        static int toldGrow = 0;
+                        if (toldGrow++ < 4) { printf("ctfprobe: bot slot %u's script table grown %u -> %u fields (the host's missing ones added)\n", o, count, n); fflush(stdout); }
+                    }
+                }
+                if (const uint32_t at = Call(ctx, base, 0x821DE958, table, 0x1C4A56B2u)) { Guest::Write32(base, at, want); fixed++; }
+                if (const uint32_t at = Call(ctx, base, 0x821DE958, table, 0x14D6461Au)) Guest::Write32(base, at, 0);
+            }
+            static bool told = false;
+            if (!told && fixed) { told = true; printf("ctfprobe: %d bots' script field 1C4A56B2 set (side 1: 1; side 2: 2 even slots, 1 odd) and 14D6461A to 0, every second\n", fixed); fflush(stdout); }
+        }
+    }
+    // 0.5.496: (494/495's pad scans caught mostly the reload X starts.) Now
+    // the player's own memory is read-watched while the script interpreter
+    // runs: up to three bots, 3 s each, while pressing use at the enemy flag
+    // (60-190 s), then the host during his take (205.5-212.5 s). "vmread:"
+    // lines: who, region, offset, value, the reading function.
+    {
+        auto unwatch = [&]() {
+            FlagTrap::g_readOn = false;
+            for (uintptr_t q : FlagTrap::g_readPages) { DWORD old; VirtualProtect(reinterpret_cast<void*>(q), 4096, PAGE_READWRITE, &old); }
+            FlagTrap::g_readPages.clear(); FlagTrap::g_ranges.clear();
+        };
+        auto watch = [&](uint32_t slot, const char* who) {
+            unwatch();
+            if (!FlagTrap::g_vmFrom)
+            {
+                char buffer[sizeof(SYMBOL_INFO) + 128] = {};
+                auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO); symbol->MaxNameLen = 127;
+                // 0.5.502: the interpreter's native code from the game's function
+                // table (Guest::Lookup); 128 KB from there (its offsets seen go
+                // to +0x1d34). 496's lookup by name found nothing.
+                (void)symbol;
+                if (const uintptr_t fn = reinterpret_cast<uintptr_t>(Guest::Lookup(0x82204A08))) { FlagTrap::g_vmFrom = fn; FlagTrap::g_vmTo = fn + 0x20000; }
+                for (const char* name : { "sub_82204A08" })
+                    if (!FlagTrap::g_vmFrom && SymFromName(GetCurrentProcess(), name, symbol) && symbol->Size)
+                    { FlagTrap::g_vmFrom = uintptr_t(symbol->Address); FlagTrap::g_vmTo = uintptr_t(symbol->Address + symbol->Size); break; }
+                printf("ctfprobe: interpreter code %llx-%llx\n", (unsigned long long)FlagTrap::g_vmFrom, (unsigned long long)FlagTrap::g_vmTo); fflush(stdout);
+            }
+            const uint32_t e = Guest::Read32(base, list + 4 * (slot + 1));
+            const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+            const uint32_t s = SessionPlayer(base, slot);
+            auto add = [&](uint32_t guest, uint32_t size, const char* region) {
+                if (!guest) return;
+                const uintptr_t from = reinterpret_cast<uintptr_t>(base + guest);
+                FlagTrap::g_ranges.push_back({ from, from + size, who, region });
+                for (uintptr_t q = from & ~uintptr_t(4095); q < from + size; q += 4096)
+                {
+                    bool have = false; for (uintptr_t x : FlagTrap::g_readPages) if (x == q) have = true;
+                    bool flagPage = false; for (uintptr_t x : FlagTrap::g_pages) if (x == q) flagPage = true;
+                    if (!have && !flagPage) FlagTrap::g_readPages.push_back(q);
+                }
+            };
+            add(e, 1024, "entity"); add(r, 8192, "record"); add(s, 1024, "session");
+            FlagTrap::g_readOn = true;
+            for (uintptr_t q : FlagTrap::g_readPages) { DWORD old; VirtualProtect(reinterpret_cast<void*>(q), 4096, PAGE_NOACCESS, &old); }
+            printf("ctfprobe: watching %s (slot %u) script reads: %zu pages\n", who, slot, FlagTrap::g_readPages.size()); fflush(stdout);
+        };
+        // 0.5.502: the windows on again (the interpreter's range now from the
+        // function table): up to three bots, 3 s each, while pressing at the
+        // enemy flag (60-190 s); then the host put 18 from the enemy flag and
+        // watched 7 s (200-207 s), his take the comparison
+        static uint32_t watchedAt = 0, botsWatched = 0;
+        if (watchedAt && now - watchedAt > 3000 && FlagTrap::g_readOn && stage < 2) { unwatch(); watchedAt = 0; printf("ctfprobe: bot watch off\n"); fflush(stdout); }
+        if (!watchedAt && stage >= 1 && botsWatched < 3 && now - knownAt > 60000 && now - knownAt < 190000)
+            for (uint32_t o = 1; o < ActiveSlots() && o < MaxClients; o++)
+                if (g_bot[o] && g_flagUseMode[o]) { watch(o, "bot"); watchedAt = now; botsWatched++; break; }
+        auto putNear = [&](uint32_t entity, int flag) {
+            const uint32_t r = Guest::Read32(base, entity + 512);
+            const float px = ReadFloat(base, r), py = ReadFloat(base, r + 4);
+            const float dx = g_obj.at[flag][0] - px, dy = g_obj.at[flag][1] - py, dl = fmaxf(1.0f, hypotf(dx, dy));
+            static uint32_t position = 0;
+            if (!position) position = Guest::AllocatePhysical(0x20);
+            auto writeF = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+            writeF(position, g_obj.at[flag][0] - dx / dl * 18.0f); writeF(position + 4, g_obj.at[flag][1] - dy / dl * 18.0f); writeF(position + 8, g_obj.at[flag][2] + 1.0f);
+            PPCContext place = ctx;
+            place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+            place.r3.u64 = entity; place.r4.u64 = position; place.lr = 0;
+            Guest::Lookup(0x8255E118)(place, base);
+        };
+        // 0.5.525: the host on the enemy flag early (35 s), no read watch; the
+        // host capture test above then puts him, carrying, by his own flag
+        // 0.5.528: the host parked 150 from his OWN flag at 5 s (in his spawn
+        // by the enemy flag he took it by standing there, muddling the bots')
+        if (false && stage >= 1 && stage < 5 && now - knownAt > 5000)   // 0.5.530: off again: the host captures for the trap
+        {
+            stage = 5;
+            const uint32_t side = Side(base, hostE);
+            if (side >= 1 && side <= 2 && g_ctfOwn[side] >= 0 && g_ctfOwn[side] <= 1)
+            {
+                const float* home = g_obj.at[g_ctfOwn[side]];
+                static uint32_t parkPos = 0;
+                if (!parkPos) parkPos = Guest::AllocatePhysical(0x20);
+                auto writeP = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+                writeP(parkPos, home[0] + 150.0f); writeP(parkPos + 4, home[1]); writeP(parkPos + 8, home[2] + 1.0f);
+                PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+                place.r3.u64 = hostE; place.r4.u64 = parkPos; place.lr = 0;
+                Guest::Lookup(0x8255E118)(place, base);
+                printf("ctfprobe: the host parked by his own flag (out of the bots' way)\n"); fflush(stdout);
+            }
+        }
+        if (stage == 1 && now - knownAt > 35000)   // 0.5.530: on again: the host's capture traced
+        {
+            stage = 2;
+            const uint32_t side = Side(base, hostE);
+            if (side >= 1 && side <= 2)
+            {
+                if (watchedAt) { unwatch(); watchedAt = 0; }
+                putNear(hostE, g_ctfOwn[3 - side]);
+                printf("ctfprobe: the host put 18 from the enemy flag (to take it, then capture)\n"); fflush(stdout);
+            }
+        }
+        if (stage == 2 && now - knownAt > 42000) { stage = 4; printf("ctfprobe: the host %s\n", (g_flagCarrier[0] == 0 || g_flagCarrier[1] == 0) ? "HAS a flag" : "has no flag"); fflush(stdout); }
+    }
+}
+// 0.5.641: THE PRE-MATCH COUNTDOWN (user: "if we added a pre match timer would
+// be perfect ... make the auto balance teams re arrange anybody so teams stay
+// balanced in case any players spawn out of place or on the wrong side it can
+// correct it before the game starts"). On the machine that runs the server:
+// from the level's first server frame (0.5.647; 0.5.641 to 646: from the first
+// moment this machine's player was alive) in a level (the
+// level's time, 0x82C2826C, gone back = a new level), COD3_PREMATCH seconds
+// (10; 0 off, at most 30) in which every player's moves and buttons are
+// cleared before Pmove (the look stays), the bots' brains rest as a posed
+// bot's do (still, not firing: no stuck tests), and the player's own unstick
+// waits. One second in, the sides are counted (connected players, the bots by
+// their given side, the rest by their team): while one has two or more over
+// the other, a bot of the larger is given the smaller and respawned at its
+// side's spawn (players are not moved). A big count in the middle of the
+// screen, then GO!. Not on a joining machine yet (no count shown there).
+namespace Prematch
+{
+    std::atomic<bool> g_frozen{ false };
+    std::atomic<int> g_msLeft{ -1 };
+    std::atomic<uint64_t> g_goUntil{ 0 };
+    uint32_t g_lastLevel = 0, g_startLevel = 0;
+    bool g_started = false, g_balanced = false, g_done = false;
+    int Seconds()
+    {
+        static const int v = [] {
+            const char* t = getenv("COD3_PREMATCH");
+            return t && *t ? std::clamp(atoi(t), 0, 30) : 10;
+        }();
+        return v;
+    }
+    bool Frozen() { return g_frozen.load(std::memory_order_relaxed); }
+    void Balance(PPCContext& ctx, uint8_t* base)
+    {
+        const uint32_t entities = Guest::Read32(base, EntityList);
+        const uint32_t clients = Clients(base);
+        if (!entities || !clients) return;
+        auto sideOf = [&](uint32_t slot) -> uint32_t {
+            if (Guest::Read32(base, clients + slot * ClientSize) == 0) return 0;
+            const uint32_t entity = Guest::Read32(base, entities + 4 * (slot + 1));
+            if (!entity) return 0;
+            return g_bot[slot] ? g_botSide[slot] : Side(base, entity);
+        };
+        uint32_t count[3] = {};
+        for (uint32_t slot = 0; slot < ActiveSlots(); slot++) { const uint32_t s = sideOf(slot); if (s == 1 || s == 2) count[s]++; }
+        printf("prematch: sides before the start: allies %u, axis %u\n", count[1], count[2]); fflush(stdout);
+        for (int moves = 0; moves < 16; moves++)
+        {
+            const uint32_t big = count[1] >= count[2] ? 1u : 2u, small = 3u - big;
+            if (count[big] < count[small] + 2) break;
+            int pick = -1;
+            for (int slot = int(ActiveSlots()) - 1; slot >= int(FirstBotSlot()); slot--)
+                if (g_bot[slot] && sideOf(uint32_t(slot)) == big) { pick = slot; break; }
+            if (pick < 0) { printf("prematch: sides %u to %u and no bot on the larger to move (players are not moved)\n", count[1], count[2]); fflush(stdout); break; }
+            const uint32_t entity = Guest::Read32(base, entities + 4 * (uint32_t(pick) + 1));
+            g_botSide[pick] = small;
+            PickSide(ctx, base, entity, small);
+            Respawn(ctx, base, entity, small == 1);
+            count[big]--; count[small]++;
+            printf("prematch: bot slot %d moved from side %u to side %u (now allies %u, axis %u)\n", pick, big, small, count[1], count[2]); fflush(stdout);
+        }
+    }
+    // each server frame (SV_Frame's hook, so only where the server runs)
+    void ServerFrame(PPCContext& ctx, uint8_t* base)
+    {
+        if (Seconds() == 0) return;
+        const uint32_t level = Guest::Read32(base, 0x82C2826C);
+        if (level < g_lastLevel)
+        {
+            g_started = g_balanced = g_done = false;
+            g_frozen.store(false); g_msLeft.store(-1);
+        }
+        g_lastLevel = level;
+        if (g_done) return;
+        // 0.5.647 (user: "the prematch timer needs to start the moment the game
+        // timer starts ... even if im still in the menus and havent picked my
+        // weapon yet"): from the level's first server frame, when its clock
+        // starts (644's log: it waited for your spawn, 15 s in)
+        if (!g_started)
+        {
+            if (level == 0) return;
+            g_started = true; g_startLevel = level;
+            printf("prematch: the countdown starts with the match (%d s, level time %u)\n", Seconds(), level); fflush(stdout);
+        }
+        const int into = int(level - g_startLevel), left = Seconds() * 1000 - into;
+        if (left > 0)
+        {
+            g_frozen.store(true); g_msLeft.store(left);
+            // the sides balanced 2 s before GO, once the players and bots have
+            // joined (at the start of a level they still come in)
+            if (!g_balanced && into >= std::max(1000, Seconds() * 1000 - 2000)) { g_balanced = true; Balance(ctx, base); }
+            return;
+        }
+        g_frozen.store(false); g_msLeft.store(-1); g_done = true;
+        g_goUntil.store(GetTickCount64() + 1200);
+        for (uint32_t slot = 0; slot < MaxClients; slot++) g_tactical[slot].progress.Reset();   // standing still was not being stuck
+        printf("prematch: GO (level time %u)\n", level); fflush(stdout);
+    }
+    bool HudActive() { return g_msLeft.load() > 0 || GetTickCount64() < g_goUntil.load(); }
+    void HudDraw(int width, int height)
+    {
+        ImDrawList* draw = ImGui::GetForegroundDrawList();
+        ImFont* font = ImGui::GetFont();
+        const float scale = height / 1080.0f;
+        const int left = g_msLeft.load();
+        const ImU32 gold = IM_COL32(240, 200, 90, 255), white = IM_COL32(255, 255, 255, 245), shadow = IM_COL32(0, 0, 0, 190);
+        auto centred = [&](const char* text, float size, float y, ImU32 colour) {
+            const ImVec2 extent = font->CalcTextSizeA(size, FLT_MAX, 0.0f, text);
+            const ImVec2 at(width * 0.5f - extent.x * 0.5f, y);
+            draw->AddText(font, size, ImVec2(at.x + 3.0f * scale, at.y + 3.0f * scale), shadow, text);
+            draw->AddText(font, size, at, colour, text);
+        };
+        if (left > 0)
+        {
+            char number[8];
+            snprintf(number, sizeof number, "%d", (left + 999) / 1000);
+            centred("MATCH BEGINS IN", 44.0f * scale, height * 0.30f, white);
+            centred(number, 150.0f * scale, height * 0.30f + 52.0f * scale, gold);
+        }
+        else centred("GO!", 150.0f * scale, height * 0.30f + 20.0f * scale, gold);
+    }
+}
+bool BotsPrematchFrozen() { return Prematch::Frozen(); }   // 0.5.641
+
+// 0.5.541: the player caught in the scenery (user: a knife lunge sometimes
+// lands him "in an area where im stuck"). Every quarter second his spot is
+// sampled; spots where he walked normally (moved, not falling, not on a
+// ladder) are kept. Move held 2 s with under 4 units of movement: he is put
+// at the newest kept spot at least 48 away and 3 s old. Not on a ladder (0x10
+// of the movement flags +44), prone (0x1), or with flag bits never seen while
+// he walked (a mounted gun). Settings: unstick. The knife is not touched.
+static void PlayerUnstick(PPCContext& ctx, uint8_t* base)
+{
+    struct Spot { uint32_t at; float x, y, z; };
+    static std::vector<Spot> good;
+    static uint32_t sampleAt = 0, heldSince = 0, cooldown = 0, walkFlags = 0, lastEntity = 0;
+    static float anchor[3] = {}, last[3] = {};
+    const uint32_t now = GetTickCount();
+    if (now - sampleAt < 250) return;
+    sampleAt = now;
+    const uint32_t list = Guest::Read32(base, EntityList);
+    const uint32_t entity = list ? Guest::Read32(base, list + 4) : 0;
+    const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+    if (!Settings::Get().unstick || !record || g_bot[0] || int32_t(Guest::Read32(base, record + 304)) <= 0 ||
+        Guest::Read32(base, record + 1924) != 3 || entity != lastEntity || Prematch::Frozen())   // 0.5.641: held still by the countdown
+    {
+        good.clear(); heldSince = 0; lastEntity = entity;
+        return;
+    }
+    const float p[3] = { ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) };
+    const float step = hypotf(p[0] - last[0], p[1] - last[1]), dz = p[2] - last[2];
+    if (step > 400.0f || fabsf(dz) > 400.0f) good.clear();   // a spawn or a teleport
+    memcpy(last, p, sizeof last);
+    const uint32_t flags = Guest::Read32(base, record + 44);
+    const uint32_t command = NewestCommand(base, 0);
+    const int f = int8_t(Guest::Read8(base, command + 24)), r = int8_t(Guest::Read8(base, command + 25));
+    const bool held = abs(f) > 20 || abs(r) > 20;
+    const bool odd = (flags & 0x11u) != 0;
+    if (!odd && step > 20.0f && step < 150.0f && dz > -30.0f && dz < 30.0f)
+    {
+        walkFlags |= flags & ~0x100u;
+        good.push_back({ now, p[0], p[1], p[2] });
+        if (good.size() > 60) good.erase(good.begin());
+    }
+    if (!held || odd) { heldSince = 0; return; }
+    if (!heldSince || fabsf(p[0] - anchor[0]) + fabsf(p[1] - anchor[1]) + fabsf(p[2] - anchor[2]) > 4.0f)
+    {
+        heldSince = now; memcpy(anchor, p, sizeof anchor);
+        return;
+    }
+    if (now - heldSince < 2000 || now < cooldown) return;
+    heldSince = 0;
+    const uint32_t unusual = flags & ~(walkFlags | 0x100u | 0x2u);
+    if (unusual)
+    {
+        printf("unstick: held still with movement flags %08X (bits %08X never seen walking): left alone (a mounted gun?)\n", flags, unusual); fflush(stdout);
+        cooldown = now + 5000;
+        return;
+    }
+    const Spot* to = nullptr;
+    for (auto it = good.rbegin(); it != good.rend() && !to; ++it)
+        if (now - it->at >= 3000 && hypotf(it->x - p[0], it->y - p[1]) >= 48.0f) to = &*it;
+    if (!to)
+    {
+        printf("unstick: stuck at %.0f %.0f %.0f (flags %08X) but no earlier good spot\n", p[0], p[1], p[2], flags); fflush(stdout);
+        cooldown = now + 5000;
+        return;
+    }
+    static uint32_t position = 0;
+    if (!position) position = Guest::AllocatePhysical(0x20);
+    auto put = [&](uint32_t at, float v) { uint32_t w; memcpy(&w, &v, 4); Guest::Write32(base, at, w); };
+    put(position, to->x); put(position + 4, to->y); put(position + 8, to->z + 1.0f);
+    PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+    place.r3.u64 = entity; place.r4.u64 = position; place.lr = 0;
+    Guest::Lookup(0x8255E118)(place, base);
+    for (int k = 0; k < 3; k++) put(record + 16 + 4 * k, 0.0f);
+    printf("unstick: player stuck at %.0f %.0f %.0f (flags %08X, move %d %d) for 2 s: put back at %.0f %.0f %.0f (%u ms ago)\n",
+           p[0], p[1], p[2], flags, f, r, to->x, to->y, to->z, now - to->at); fflush(stdout);
+    good.clear();
+    cooldown = now + 5000;
+}
+
+static void CtfSpawnSides(PPCContext& ctx, uint8_t* base)
+{
+    static std::string ownFor;
+    static bool alive[MaxClients] = {};
+    const std::string key = g_obj.mode + Kernel::CurrentMap();
+    const bool ctf = g_obj.valid && g_obj.count == 2 && GetTickCount() - g_obj.when < 10000 && g_obj.mode.find("ctf") != std::string::npos;
+    if (!ctf) return;
+    // 0.5.480: each side's own flag from where the game really spawns it (its
+    // last 16 spawns, before any move), not g_spawns: 475-479 had side 1
+    // "spawning by" 2112 462 from g_spawns while the game spawned it about
+    // -500 -800, so the flags were swapped, players moved to the ENEMY flag
+    // (user: "spawns at the enemy flag") and bots pressed use on their own.
+    // Re-decided on every spawn, so a side switch at half time follows.
+    // 0.5.545: votes[side][flag]: evidence that the side owns that flag
+    // (CtfSpawnSides' block below says what counts)
+    static uint32_t votes[3][2] = {};
+    if (ownFor != key) { ownFor = key; g_ctfOwn[1] = g_ctfOwn[2] = -1; memset(votes, 0, sizeof votes); }
+    FlagEntityWatch(base, key);   // 0.5.481
+    BotTrail(base, 0);            // 0.5.536: the host's trail too: his runs to the enemy flag become routes
+    CtfTakeProbe(ctx, base);      // 0.5.488: unattended tests only
+    // 0.5.485's ScriptVarsCompare read text, not a variable table (entity +484
+    // is not a script handle for players): not called.
+    (void)&ScriptVarsCompare;
+    // 0.5.487: which flag each side owns, PROVEN by takes, kept in
+    // ctf-flags.txt (the game folder) as "<map> <x> <y>": side 1's own flag.
+    // The match-start guess was wrong in 486's unattended test (side 1 given
+    // 2112 462; every user game proved side 1 owns -1792 -91: the user took
+    // 2112 462 as side 1 in 481, -1792 -91 as side 2 in 482), so bots pressed
+    // use on their own flag. Rouen seeded with that proof.
+    // 0.5.543: OFF. Takes were credited to the host's side as read, which is
+    // flipped (541: read 1, his bots' take proved 2; 542: read 2, proved 1),
+    // so the file flipped too and teams were put by the enemy flag. The game
+    // spawns each side by its OWN flag (541 and 542: every bot take was of the
+    // flag far from his side's spawns): the sides come from the bots' spawns.
+    // 0.5.545: (the file stays off; the host's own takes vote below)
+    if (false)
+    {
+        static std::string provenFor; static bool loaded = false;
+        static std::map<std::string, std::array<float, 2>> proven;
+        if (!loaded)
+        {
+            loaded = true;
+            proven["rouen"] = { -1792.0f, -91.0f };
+            if (FILE* f = fopen("ctf-flags.txt", "r"))
+            {
+                char name[64]; float x, y;
+                while (fscanf(f, "%63s %f %f", name, &x, &y) == 3) proven[name] = { x, y };
+                fclose(f);
+            }
+        }
+        const std::string map = Kernel::CurrentMap();
+        // a take by a side proves the other flag is that side's own
+        if (g_ctfProvenSide >= 1 && g_ctfProvenSide <= 2 && g_ctfProvenFlag >= 0 && g_ctfProvenFlag <= 1)
+        {
+            const int side1Own = g_ctfProvenSide == 1 ? 1 - g_ctfProvenFlag : g_ctfProvenFlag;
+            const std::array<float, 2> at = { g_obj.at[side1Own][0], g_obj.at[side1Own][1] };
+            const auto old = proven.find(map);
+            if (old == proven.end() || hypotf(old->second[0] - at[0], old->second[1] - at[1]) > 50.0f)
+            {
+                proven[map] = at;
+                if (FILE* f = fopen("ctf-flags.txt", "w")) { for (const auto& kv : proven) fprintf(f, "%s %.0f %.0f\n", kv.first.c_str(), kv.second[0], kv.second[1]); fclose(f); }
+                printf("bots: ctf: proven by a take on %s: side 1 owns the flag at %.0f %.0f (saved)\n", map.c_str(), at[0], at[1]); fflush(stdout);
+            }
+            g_ctfProvenSide = 0; g_ctfProvenFlag = -1;
+        }
+        const auto it = proven.find(map);
+        if (it != proven.end() && g_obj.count == 2)
+        {
+            const int own1 = hypotf(g_obj.at[0][0] - it->second[0], g_obj.at[0][1] - it->second[1]) <= hypotf(g_obj.at[1][0] - it->second[0], g_obj.at[1][1] - it->second[1]) ? 0 : 1;
+            if (g_ctfOwn[1] != own1)
+            {
+                const bool first = g_ctfOwn[1] < 0;
+                g_ctfOwn[1] = own1; g_ctfOwn[2] = 1 - own1;
+                printf("bots: ctf sides (proven for %s): side 1 owns the flag at %.0f %.0f; side 2 the one at %.0f %.0f%s\n", map.c_str(),
+                       g_obj.at[own1][0], g_obj.at[own1][1], g_obj.at[1 - own1][0], g_obj.at[1 - own1][1], first ? "" : " (the guess was wrong: put right)"); fflush(stdout);
+                if (provenFor != key) { provenFor = key; g_ctfSweepDue = true; }
+            }
+        }
+    }
+    const uint32_t entities = Guest::Read32(base, EntityList);
+    if (!entities) return;
+    // 0.5.545: which flag each side owns, from what the GAME does. Every match
+    // of 541-544 agrees (the user: "the bots who were supposed to be my
+    // teammates are still killing me"; 544 had put him on side 2, his team
+    // read 1, and side 1 bots 4 and 11, his team, killed him):
+    //   the host's team read is right (541 1, 542 2, 543 2 then 1, 544 1);
+    //   the game spawns the host by his OWN flag (read 1 by -1792 -91 in 541,
+    //   543 and 544; read 2 by 2112 462 in 542 and 543) and he takes the far
+    //   one (541: read 1 took 2112 462; 542: read 2 took -1792 -91);
+    //   the port's own bot spawns (Respawn) put every bot by the ENEMY flag
+    //   (side 1 by 2112 462 35 of 35, side 2 by -1792 -91 36 of 36 in
+    //   542-543); bot takes prove nothing (the port makes them, by g_ctfOwn).
+    // So: a bot's spawn votes for the OTHER flag (1 each); the host's spawn for
+    // the one he is by (3); a take of his for the other one (8, consumed
+    // below). Sides: a bot's is the one he was given; the host's his read.
+    auto sideOf = [&](uint32_t o, uint32_t e) -> uint32_t {
+        if (o < MaxClients && g_bot[o]) return BotSide(base, o);
+        return Side(base, e);   // the host or a joiner: his own team read
+    };
+    auto decide = [&]() {
+        int own[3] = { -1, -1, -1 };
+        for (int s = 1; s <= 2; s++)
+            if (votes[s][0] + votes[s][1] >= 2 && votes[s][0] != votes[s][1]) own[s] = votes[s][0] > votes[s][1] ? 0 : 1;
+        if (own[1] < 0 && own[2] >= 0) own[1] = 1 - own[2];
+        if (own[2] < 0 && own[1] >= 0) own[2] = 1 - own[1];
+        if (own[1] < 0 || own[1] == own[2] || own[1] == g_ctfOwn[1]) return false;
+        g_ctfOwn[1] = own[1]; g_ctfOwn[2] = own[2];
+        printf("bots: ctf sides (votes for flag 0 / flag 1: side 1 %u / %u, side 2 %u / %u): side 1 owns the flag at %.0f %.0f; side 2 the one at %.0f %.0f\n",
+               votes[1][0], votes[1][1], votes[2][0], votes[2][1], g_obj.at[own[1]][0], g_obj.at[own[1]][1], g_obj.at[own[2]][0], g_obj.at[own[2]][1]);
+        fflush(stdout);
+        return true;
+    };
+    auto trim = [&](uint32_t s) { if (votes[s][0] + votes[s][1] > 24) { votes[s][0] /= 2; votes[s][1] /= 2; } };   // the newest count most
+    // the host's take (FlagEntityWatch: a player's, the flag's own weapon on him)
+    if (g_ctfProvenSide >= 1 && g_ctfProvenSide <= 2 && g_ctfProvenFlag >= 0 && g_ctfProvenFlag <= 1)
+    {
+        votes[g_ctfProvenSide][1 - g_ctfProvenFlag] += 8; trim(g_ctfProvenSide);
+        printf("bots: ctf: a player of side %u took flag %d: side %u owns the other\n", g_ctfProvenSide, g_ctfProvenFlag, g_ctfProvenSide); fflush(stdout);
+        decide();
+    }
+    g_ctfProvenSide = 0; g_ctfProvenFlag = -1;
+    struct Body { float p[3]; uint32_t side; bool bot; };
+    std::vector<Body> living;
+    for (uint32_t o = 0; o < ActiveSlots() && o < MaxClients; o++)
+    {
+        const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+        const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+        if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0) continue;
+        living.push_back({ { ReadFloat(base, r), ReadFloat(base, r + 4), ReadFloat(base, r + 8) }, sideOf(o, e), g_bot[o] });
+    }
+    // the start: the living bots where they were spawned vote at once, and
+    // once the sides are known everyone not by his flag is moved (sweep)
+    static bool sweep = false;
+    if (g_ctfOwn[1] < 0)
+    {
+        for (uint32_t o = 0; o < ActiveSlots() && o < MaxClients; o++)
+        {
+            if (!g_bot[o]) continue;
+            const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+            const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+            if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0 || (g_portMovedAt[o] && GetTickCount() - g_portMovedAt[o] < 600000)) continue;
+            const float bx = ReadFloat(base, r), by = ReadFloat(base, r + 4);
+            const float d0 = hypotf(g_obj.at[0][0] - bx, g_obj.at[0][1] - by), d1 = hypotf(g_obj.at[1][0] - bx, g_obj.at[1][1] - by);
+            const uint32_t s = BotSide(base, o);
+            if ((s == 1 || s == 2) && fminf(d0, d1) < 0.7f * fmaxf(d0, d1)) votes[s][d0 < d1 ? 1 : 0]++;   // the OTHER flag
+        }
+        if (decide()) sweep = true;
+        else { votes[1][0] = votes[1][1] = votes[2][0] = votes[2][1] = 0; }   // from the spawns as they come
+    }
+    // 0.5.569: COD3_CTF_CARRIERTEST=1 (BENCH-CTF-CARRY.bat only, never in a
+    // played game): every 60 s with both flags at home, one living attacker of
+    // each side by turns is put 40 from the enemy flag, so his own pickup takes
+    // it and the carry home is what the test measures (567: 3 takes in 10 min,
+    // too few to tell whether a carrier gets home)
+    {
+        static const bool carrierTest = []() { const char* t = getenv("COD3_CTF_CARRIERTEST"); return t && t[0] == '1'; }();
+        static uint32_t nextAt = 0; static int turn = 0;
+        const uint32_t tnow = GetTickCount();
+        if (carrierTest && g_ctfOwn[1] >= 0 && g_ctfOwn[2] >= 0)
+        {
+            if (!nextAt) nextAt = tnow + 30000;
+            if (tnow >= nextAt && g_flagCarrier[0] < 0 && g_flagCarrier[1] < 0 && !g_flagDropped[0] && !g_flagDropped[1])
+            {
+                nextAt = tnow + 60000;
+                const uint32_t s = 1u + uint32_t(turn++ % 2);
+                // 0.5.571: three, as an assault comes (the regroup's wave): the
+                // taker 40 from the flag, two more 150 out either side of the way
+                // home. 570's lone carriers took it 10 of 10 times and died 0.3 to
+                // 1.4 s later, in the enemy's base, alone.
+                int placed = 0;
+                const float* ef = g_obj.at[g_ctfOwn[3 - s]];
+                const float* of = g_obj.at[g_ctfOwn[s]];
+                const float hx = of[0] - ef[0], hy = of[1] - ef[1], hl = std::max(1.0f, hypotf(hx, hy));
+                // 0.5.572: the escorts' places are learnt-map spots (where players
+                // have stood) 100-400 from the flag, at its height, on the home
+                // side, 80 apart: 571's places worked out by offsets (150 home,
+                // 120 aside) never had ground at the flag's height (no escort was
+                // put, 7 tests of 7)
+                std::vector<BotNavigation::Point> escortAt;
+                // 0.5.574: all three 500-800 out (the wave comes in and fights
+                // for the flag; the taker is not put on it)
+                for (const int32_t c : g_mapKnow.NearestList({ ef[0], ef[1], ef[2] }, 800.0f, 400))
+                {
+                    const BotNavigation::Point p = g_mapKnow.At(c);
+                    const float d = hypotf(p.x - ef[0], p.y - ef[1]);
+                    if (d < 500.0f || d > 800.0f || fabsf(p.z - ef[2]) > 120.0f || ((p.x - ef[0]) * hx + (p.y - ef[1]) * hy) < 0.0f) continue;
+                    bool apart = true;
+                    for (const auto& q : escortAt) if (hypotf(q.x - p.x, q.y - p.y) < 80.0f) apart = false;
+                    if (apart) escortAt.push_back(p);
+                    if (escortAt.size() >= 3) break;
+                }
+                for (uint32_t o = 0; o < ActiveSlots() && o < MaxClients && placed < 3; o++)
+                {
+                    if (!g_bot[o] || !g_ctfAttacker[o] || BotSide(base, o) != s) continue;
+                    const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+                    const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+                    if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0 || Guest::Read32(base, r + 1924) != 3) continue;
+                    if (size_t(placed) >= escortAt.size()) break;   // no more places
+                    const float px = escortAt[size_t(placed)].x, py = escortAt[size_t(placed)].y, pz = escortAt[size_t(placed)].z + 8.0f;
+                    static uint32_t at = 0;
+                    if (!at) at = Guest::AllocatePhysical(0x20);
+                    auto put = [&](uint32_t a, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, a, w); };
+                    put(at, px); put(at + 4, py); put(at + 8, pz);
+                    PPCContext place = ctx; place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+                    place.r3.u64 = e; place.r4.u64 = at; place.lr = 0;
+                    Guest::Lookup(0x8255E118)(place, base);
+                    for (int k = 0; k < 3; k++) put(r + 16 + 4 * k, 0.0f);
+                    g_portMovedAt[o] = tnow;
+                    printf("carriertest: slot %u (side %u) put for the assault at %.0f %.0f, %.0f from the enemy flag\n", o, s, px, py, hypotf(px - ef[0], py - ef[1])); fflush(stdout);
+                    placed++;
+                }
+                if (placed < 3) { printf("carriertest: only %d put (%zu escort places found by the flag)\n", placed, escortAt.size()); fflush(stdout); }
+            }
+        }
+    }
+    const bool sweepNow = sweep;
+    sweep = false;
+    for (uint32_t slot = 0; slot < ActiveSlots() && slot < MaxClients; slot++)
+    {
+        const uint32_t entity = Guest::Read32(base, entities + 4 * (slot + 1));
+        const uint32_t record = entity ? Guest::Read32(base, entity + 512) : 0;
+        const bool now = record && int32_t(Guest::Read32(base, record + 304)) > 0 && Guest::Read32(base, record + 1924) == 3;
+        // 0.5.558: or put somewhere else by the game while alive: 557's
+        // self-test had each bot spawned "the game's way" a second time at the
+        // start AFTER the move here (slot 4: moved at line 10954, spawned again
+        // at 11894), by the enemy's end. A living bot (not carrying a flag)
+        // that jumps over 1000 in a frame and lands nearer the enemy's flag
+        // than his own counts as a spawn. The port's own moves never do that
+        // (a carrier's and a stuck bot's go toward home or along his way).
+        static float lastAt[MaxClients][2] = {};
+        static bool lastKnown[MaxClients] = {};
+        bool jumped = false;
+        if (record)
+        {
+            const float jx = ReadFloat(base, record), jy = ReadFloat(base, record + 4);
+            // (0.5.570: not when this port moved him itself in the last 2 s:
+            // 569's carrier test had every bot it put by the enemy flag taken
+            // for a game re-spawn and sent home)
+            const bool portMoved = slot < MaxClients && g_portMovedAt[slot] && GetTickCount() - g_portMovedAt[slot] < 2000;
+            if (now && alive[slot] && lastKnown[slot] && g_bot[slot] && !BotCarries(slot) && !portMoved && std::isfinite(jx) && hypotf(jx - lastAt[slot][0], jy - lastAt[slot][1]) > 1000.0f)
+            {
+                const uint32_t js = BotSide(base, slot);
+                if ((js == 1 || js == 2) && g_ctfOwn[js] >= 0 && g_ctfOwn[3 - js] >= 0)
+                {
+                    const float* jo = g_obj.at[g_ctfOwn[js]]; const float* je = g_obj.at[g_ctfOwn[3 - js]];
+                    if (hypotf(je[0] - jx, je[1] - jy) < hypotf(jo[0] - jx, jo[1] - jy))
+                    {
+                        jumped = true;
+                        printf("bots: ctf: slot %u put at %.0f %.0f by the game while alive (from %.0f %.0f), by the enemy's end: taken as a spawn\n", slot, jx, jy, lastAt[slot][0], lastAt[slot][1]);
+                        fflush(stdout);
+                    }
+                }
+            }
+            lastAt[slot][0] = jx; lastAt[slot][1] = jy; lastKnown[slot] = now;
+        }
+        const bool spawned = now && (!alive[slot] || sweepNow || jumped);   // 0.5.483: or the start sweep
+        alive[slot] = now;
+        if (!spawned) continue;
+        // 0.5.544: stood up by a medic, not spawned: left where he lay (543's
+        // slot 13 was revived and then moved across the map as if spawned)
+        if (g_bot[slot] && g_revivedAt[slot] && GetTickCount() - g_revivedAt[slot] < 3000) continue;
+        const float x = ReadFloat(base, record), y = ReadFloat(base, record + 4);
+        const float d0 = hypotf(g_obj.at[0][0] - x, g_obj.at[0][1] - y), d1 = hypotf(g_obj.at[1][0] - x, g_obj.at[1][1] - y);
+        const int nearFlag = d0 < 0.7f * d1 ? 0 : d1 < 0.7f * d0 ? 1 : -1;   // the flag he was spawned by
+        const uint32_t side = sideOf(slot, entity);
+        if (side < 1 || side > 2) continue;
+        // his spawn votes (not the sweep: he may stand anywhere then)
+        if (!sweepNow && nearFlag >= 0)
+        {
+            if (g_bot[slot]) votes[side][1 - nearFlag] += 1;   // the port spawns bots by the enemy flag
+            else if (slot == 0)
+            {
+                votes[side][nearFlag] += 3;                       // the game spawns the host by his own
+                printf("bots: ctf: the host (side %u, his team read) spawned at %.0f %.0f, by the flag at %.0f %.0f\n", side, x, y, g_obj.at[nearFlag][0], g_obj.at[nearFlag][1]);
+                fflush(stdout);
+            }
+            trim(side);
+            decide();
+        }
+        if (g_ctfOwn[side] < 0 || g_ctfOwn[3 - side] < 0) continue;   // 0.5.480: not known yet: leave him where the game put him
+        const float* own = g_obj.at[g_ctfOwn[side]];
+        if (slot == 0 && !g_bot[0] && nearFlag >= 0 && nearFlag != g_ctfOwn[side] && !sweepNow)
+        {
+            // the game spawned the host by the other flag than the votes say
+            // is his: never seen in 541-544; the game is left to it
+            printf("bots: ctf: the host (side %u) spawned by the flag at %.0f %.0f, not his side's: left where the game put him\n", side, g_obj.at[nearFlag][0], g_obj.at[nearFlag][1]);
+            fflush(stdout);
+            continue;
+        }
+        if (hypotf(own[0] - x, own[1] - y) <= 500.0f) continue;   // 0.5.539: 500 (was 900): every spawn by his flag
+        // 0.5.480: the map's spawn points only (g_spawns' learnt places
+        // dropped: user, 479: spawns "stacked/stuck")
+        std::vector<std::array<float, 3>> spots;
+        // 0.5.539: AT his flag (user: "teams are supposed to spawn on their own
+        // flag or near"; 538 put them 1000-1400 out, Rouen's spawn points
+        // there, a median 1250 from the flag all match): a ring 160-360 round
+        // it, each spot's ground found by a trace (within 120 of the flag's
+        // height), worked out once a map a flag; the map's spawn points within
+        // 700 too; the old 1400 ones only when there is none nearer
+        {
+            static std::string ringFor[2];
+            static std::vector<std::array<float, 3>> ring[2];
+            const int k = g_ctfOwn[side];
+            if (k >= 0 && k <= 1 && ringFor[k] != key)
+            {
+                ringFor[k] = key; ring[k].clear();
+                for (int r = 0; r < 3; r++)
+                    for (int a = 0; a < 12; a++)
+                    {
+                        const float ang = float(a) * 0.5235988f + float(r) * 0.26f, rad = 160.0f + 100.0f * float(r);
+                        const float x = own[0] + cosf(ang) * rad, y = own[1] + sinf(ang) * rad;
+                        float z = 0;
+                        // 0.5.540: and in sight of the flag at chest height, ground
+                        // to ground (user fell outside the map: a ring spot past
+                        // the map's edge had ground under it)
+                        if (BotsGroundZ(ctx, base, entity, x, y, own[2] + 150.0f, z) && fabsf(z - own[2]) < 120.0f &&
+                            BotsLineClear(ctx, base, entity, own[0], own[1], own[2] + 48.0f, x, y, z + 48.0f) &&
+                            BotsLineClear(ctx, base, entity, own[0], own[1], own[2] + 20.0f, x, y, z + 20.0f)) ring[k].push_back({ x, y, z });
+                    }
+                // 0.5.542: a cramped flag (541: side 1's at -1792 -91 had 1
+                // spot, every one of his side put on it) gets the places players
+                // have run (ctf-routes.txt, either side's) 150 to 650 from it,
+                // within 60 of its height, 90 apart, up to 10 more
+                if (ring[k].size() < 6)
+                {
+                    const std::string map = Kernel::CurrentMap();
+                    LoadCtfRoutes(map);
+                    for (const char* s : { "1", "2" })
+                    {
+                        const auto it = g_ctfRoutes.find(map + s);
+                        if (it == g_ctfRoutes.end()) continue;
+                        for (const auto& route : it->second)
+                            for (const auto& p : route)
+                            {
+                                const float d = hypotf(p.x - own[0], p.y - own[1]);
+                                if (d < 150.0f || d > 650.0f || fabsf(p.z - own[2]) > 60.0f || ring[k].size() >= 16) continue;
+                                float gz = 0;   // standing there, not mid-jump
+                                if (!BotsGroundZ(ctx, base, entity, p.x, p.y, p.z + 40.0f, gz) || fabsf(gz - p.z) > 20.0f) continue;
+                                bool apart = true;
+                                for (const auto& q : ring[k]) if (hypotf(q[0] - p.x, q[1] - p.y) < 90.0f) apart = false;
+                                if (apart) ring[k].push_back({ p.x, p.y, gz });
+                            }
+                    }
+                }
+                printf("bots: ctf: %zu spawn spots round the flag at %.0f %.0f\n", ring[k].size(), own[0], own[1]); fflush(stdout);
+            }
+            if (k >= 0 && k <= 1) spots = ring[k];
+        }
+        for (int pass = 0; pass < 2 && (pass == 0 || spots.empty()); pass++)
+        for (uint32_t i = 0; i < 4096; i++)
+        {
+            const uint32_t e = Guest::Read32(base, 0x82BD1FC0 + 8 * i);
+            if (e < 0x40000000u || e >= 0xA0000000u) continue;
+            const uint32_t cls = Guest::Read32(base, e + 548);
+            if (cls < 0x40000000u || cls >= 0xA0000000u) continue;
+            char name[40] = {};
+            for (int c = 0; c < 39; c++) { const char ch = char(Guest::Read8(base, cls + 12 + c)); if (!ch) break; name[c] = char(tolower(static_cast<unsigned char>(ch))); }
+            if (!strstr(name, "spawn") || strstr(name, "intermission")) continue;
+            const std::array<float, 3> p = { ReadFloat(base, e + 336), ReadFloat(base, e + 340), ReadFloat(base, e + 344) };
+            if (!std::isfinite(p[0]) || fabsf(p[0]) > 60000.0f || hypotf(p[0] - own[0], p[1] - own[1]) > (pass == 0 ? 700.0f : 1400.0f)) continue;
+            spots.push_back(p);
+        }
+        float bestScore = -1e30f; std::array<float, 3> to = {};
+        uint32_t jitter = GetTickCount() * 2654435761u + slot * 40503u;
+        for (const auto& p : spots)
+        {
+            float room = 300.0f; bool threat = false;
+            for (const Body& b : living)
+            {
+                const float d = hypotf(b.p[0] - p[0], b.p[1] - p[1]);
+                if (fabsf(b.p[2] - p[2]) < 100.0f) room = std::min(room, d);
+                if (b.side != side && d < 900.0f) threat = true;
+            }
+            jitter = jitter * 1103515245u + 12345u;
+            // 0.5.483: near his flag first (482 moved the user from 1627 1418
+            // to 914 423, farther from it: room counted, nearness not)
+            const float toFlag = hypotf(p[0] - own[0], p[1] - own[1]);
+            const float score = room - (threat ? 1000.0f : 0.0f) - (room < 64.0f ? 2000.0f : 0.0f) - 0.25f * toFlag - (toFlag > 900.0f ? 400.0f : 0.0f) + float((jitter >> 16) % 60);   // 0.5.480: never on top of someone if there is a free one
+            if (score > bestScore) { bestScore = score; to = p; }
+        }
+        if (spots.empty()) continue;
+        const size_t pickSize = spots.size();
+        static uint32_t position = 0;
+        if (!position) position = Guest::AllocatePhysical(0x20);
+        auto writeF = [&](uint32_t at, float f) { uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, at, w); };
+        writeF(position, to[0]); writeF(position + 4, to[1]); writeF(position + 8, to[2] + 1.0f);
+        PPCContext place = ctx;
+        place.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+        place.r3.u64 = entity; place.r4.u64 = position; place.lr = 0;
+        Guest::Lookup(0x8255E118)(place, base);
+        for (int k = 0; k < 3; k++) writeF(record + 16 + 4 * k, 0.0f);
+        if (slot < MaxClients) g_portMovedAt[slot] = GetTickCount();   // 0.5.484
+        living.push_back({ { to[0], to[1], to[2] }, side });
+        static int told = 0;
+        if (told++ < 80) { printf("bots: ctf: slot %u (side %u%s) spawned at %.0f %.0f away from his flag: moved to %.0f %.0f by it (%zu spots)\n", slot, side, slot < MaxClients && g_bot[slot] ? "" : ", a player", x, y, to[0], to[1], pickSize); fflush(stdout); }
+        static uint32_t moves = 0, movesTold = 0;
+        if (++moves % 25 == 0 && moves != movesTold) { movesTold = moves; printf("bots: ctf: %u spawns moved to their own flag so far\n", moves); fflush(stdout); }
+    }
+}
 static bool PoseHolds(uint32_t slot) { return g_poseOn.load() && g_bot[slot]; }
 
 static void FeedBots(PPCContext& ctx, uint8_t* base)
@@ -5806,18 +9976,116 @@ static void FeedBots(PPCContext& ctx, uint8_t* base)
         // below); otherwise the sticks do, for trying things by hand.
         const bool brain = lx == 0 && ly == 0 && rx == 0 && ry == 0;
         BotOrders orders = {};
-        if (brain && PoseHolds(slot)) orders = {};   // 0.5.206: posed: still, not firing (PoseFrame steers his view)
-        else if (brain) { orders = Think(ctx, base, slot, serverTime); BotExtras(base, slot, orders);
+        int8_t legsThink[2] = {}, legsFeel[2] = {};   // 0.5.546: his legs after Think and after the feelers (ctftrace)
+        if (brain && (PoseHolds(slot) || Prematch::Frozen())) orders = {};   // 0.5.206: posed: still, not firing (PoseFrame steers his view); 0.5.641: the countdown too
+        else if (brain) { g_why[slot] = "early"; orders = Think(ctx, base, slot, serverTime); BotExtras(base, slot, orders);
+                     legsThink[0] = orders.forward; legsThink[1] = orders.right;
                      orders.buttons = (orders.buttons & ~StanceButton) | BotStanceControl(base, slot, orders);
+                     if (!BotCarries(slot)) {                           // 0.5.483: a flag carrier does none of these
                      BotSeats(ctx, base, slot, orders, serverTime);   // 0.5.197: mounted guns, vehicles
                      if (!BotRevive(ctx, base, slot, orders, serverTime))   // 0.5.216: medics revive
                          BotDispense(ctx, base, slot, orders);           // 0.5.199: ammo and health packs
-                     BotLayMine(ctx, base, slot, orders);                // 0.5.277: mines near the flag
+                     BotLayMine(ctx, base, slot, orders); }              // 0.5.277: mines near the flag
                      BotRifleGrenades(ctx, base, slot, serverTime);      // 0.5.329: rifle grenades given and taken out
                      BotRusher2(ctx, base, slot, orders, serverTime);    // 0.5.329: Rusher 2's guns and artillery
+                     BotTrail(base, slot);                               // 0.5.522: his own way, to walk back carrying
                      BotFeelers(ctx, base, slot, orders, serverTime);    // 0.5.219: feel ahead for walls
-                     BotKitProbe(base, slot); }
+                     legsFeel[0] = orders.forward; legsFeel[1] = orders.right;
+                     CarrierHome(base, slot, orders);                    // 0.5.483: a flag carrier's legs go home (0.5.535: after the feelers: his trail is walkable; they turned him about)
+                     AttackerRoute(base, slot, orders);                  // 0.5.536: attackers along a saved route
+                     BotFlagUse(base, slot, orders);                     // 0.5.474: CTF's flag taken with use
+                     BotFlagClaim(ctx, base, slot);                      // 0.5.517: and asked for, as a client does
+                     CarrierUnstick(ctx, base, slot);                    // 0.5.519: a carrier always gets home
+                     BotKitProbe(base, slot);
+                     // 0.5.546: CTF trace, every 3 s a bot with a CTF errand:
+                     // where he is, how far the enemy flag is, his errand, which
+                     // way out of Think he took, his goal, and his legs after
+                     // Think, after the feelers and in the end (the saved route
+                     // takes them after the feelers), so a slow attacker's cause
+                     // shows (0.5.545: attackers crawled 1000 in 2.5 min)
+                     if (g_ctfDoing[slot])
+                     {
+                         static uint32_t tracedAt[MaxClients] = {};
+                         const uint32_t tnow = GetTickCount();
+                         const uint32_t tl = Guest::Read32(base, EntityList);
+                         const uint32_t te = tl ? Guest::Read32(base, tl + 4 * (slot + 1)) : 0;
+                         const uint32_t tr = te ? Guest::Read32(base, te + 512) : 0;
+                         const uint32_t ts = BotSide(base, slot);
+                         if (tr && int32_t(Guest::Read32(base, tr + 304)) > 0 && tnow - tracedAt[slot] >= 3000 && (ts == 1 || ts == 2) && g_ctfOwn[3 - ts] >= 0 && g_ctfOwn[3 - ts] <= 1)
+                         {
+                             tracedAt[slot] = tnow;
+                             const float tx = ReadFloat(base, tr), ty = ReadFloat(base, tr + 4);
+                             const float* ef = g_obj.at[g_ctfOwn[3 - ts]];
+                             // 0.5.547: his view, his real speed, and how far off his
+                             // goal the final legs push him (forward along the view,
+                             // right to its right: the world way is the view less the
+                             // legs' own angle) and off where he really moves
+                             const float viewDeg = ReadFloat(base, tr + 208);
+                             const float vx = ReadFloat(base, tr + 16), vy = ReadFloat(base, tr + 20);
+                             const float speed = hypotf(vx, vy);
+                             const float goalDeg = atan2f(g_steer[slot][1] - ty, g_steer[slot][0] - tx) * 57.29578f;
+                             const bool legsOn = orders.forward != 0 || orders.right != 0;
+                             const float legsDeg = viewDeg + atan2f(-float(orders.right), float(orders.forward)) * 57.29578f;
+                             const float legsOff = legsOn ? fabsf(AngleDifference(legsDeg, goalDeg)) : -1.0f;
+                             const float moveOff = speed > 20.0f ? fabsf(AngleDifference(atan2f(vy, vx) * 57.29578f, goalDeg)) : -1.0f;
+                             // 0.5.548: TacticalMove's step: where, how far off the
+                             // goal's way, how it was chosen, an escape or wander on
+                             const BotTacticalState& tst = g_tactical[slot];
+                             const float stepOff = tst.haveStep ? fabsf(AngleDifference(atan2f(tst.step.y - ty, tst.step.x - tx) * 57.29578f, goalDeg)) : -1.0f;
+                             printf("ctftrace: slot %u side %u at %.0f %.0f, enemy flag %.0f away: %s; think %s; goal %.0f %.0f (%.0f away)%s; legs think %d %d, feelers %d %d, final %d %d%s%s; view %.0f, speed %.0f, legs %.0f off the goal, moving %.0f off it; step %s %.0f off the goal (%.0f away, %s)%s%s, stalled %u, strikes %u%s%s; route: %s\n",
+                                    slot, ts, tx, ty, hypotf(ef[0] - tx, ef[1] - ty), g_ctfDoing[slot], g_why[slot] ? g_why[slot] : "?",
+                                    g_steer[slot][0], g_steer[slot][1], hypotf(g_steer[slot][0] - tx, g_steer[slot][1] - ty), g_steerValid[slot] ? "" : " (no goal)",
+                                    legsThink[0], legsThink[1], legsFeel[0], legsFeel[1], orders.forward, orders.right,
+                                    orders.wantsFire ? ", firing" : "", (orders.buttons & SprintButton) ? ", sprinting" : "",
+                                    viewDeg, speed, legsOff, moveOff,
+                                    tst.haveStep ? "on" : "none", stepOff, tst.haveStep ? hypotf(tst.step.x - tx, tst.step.y - ty) : 0.0f, tst.stepWhy,
+                                    serverTime < tst.escapeUntil ? ", escaping" : "", serverTime < tst.wanderUntil ? ", wandering" : "", tst.stalledSamples, tst.progress.strikes,
+                                    tst.blockWhy[0] ? "; direct blocked: " : "", tst.blockWhy, g_pickInfo[slot]);
+                             fflush(stdout);
+                         }
+                     } }
         else g_yaw[slot] += float(rx) / 32768.0f * 3.0f;
+        // 0.5.484: no moving unless alive and playing (+1924 == 3): user, 483:
+        // bots "stuck in a tpose or a down animation ... sliding around the
+        // map"; a dead or downed body driven by orders would slide. Each 1 s a
+        // bot whose place changes while not playing, or that slides 150+ a
+        // second with no legs ordered, is logged, with when the port last
+        // moved him (CTF spawns, g_portMovedAt)
+        {
+            const uint32_t list = Guest::Read32(base, EntityList);
+            const uint32_t self = list ? Guest::Read32(base, list + 4 * (slot + 1)) : 0;
+            const uint32_t rec = self ? Guest::Read32(base, self + 512) : 0;
+            const int32_t hp = rec ? int32_t(Guest::Read32(base, rec + 304)) : 0;
+            const uint32_t state = rec ? Guest::Read32(base, rec + 1924) : 0;
+            const bool playing = rec && hp > 0 && state == 3;
+            if (!playing) { orders.forward = orders.right = 0; orders.up = 0; orders.buttons &= ~(SprintButton | UseButtons); orders.wantsFire = false; }
+            // 0.5.485: and his velocity held at 0 while dead or down: 484's
+            // "SLIDES" were 140 of 150 dead or downed bots (health <= 0, state
+            // 4 or 5) gliding 50 to 300 a second with no orders, the port's
+            // teleports long past (user: bodies "sliding around the map", T-poses)
+            if (rec && !playing && hp <= 0)
+                for (int k = 0; k < 3; k++) Guest::Write32(base, rec + 16 + 4 * k, 0);
+            static float lastAt[MaxClients][2] = {};
+            static uint32_t lastLook[MaxClients] = {}, slideTold = 0;
+            static bool legs[MaxClients] = {};
+            legs[slot] = legs[slot] || orders.forward != 0 || orders.right != 0;
+            const uint32_t tick = GetTickCount();
+            if (rec && tick - lastLook[slot] >= 1000)
+            {
+                const float x = ReadFloat(base, rec), y = ReadFloat(base, rec + 4);
+                const float moved = hypotf(x - lastAt[slot][0], y - lastAt[slot][1]);
+                if (lastLook[slot] && moved > 40.0f && moved < 3000.0f && (!playing || (!legs[slot] && moved > 150.0f)) && slideTold < 150)
+                {
+                    slideTold++;
+                    printf("bots: slot %u SLIDES %.0f in 1 s (%s; health %d, state %u; legs %s; the port last moved him %d ms ago)\n", slot, moved,
+                           playing ? "playing" : "not playing", hp, state, legs[slot] ? "on" : "off", g_portMovedAt[slot] ? int(tick - g_portMovedAt[slot]) : -1);
+                    fflush(stdout);
+                }
+                lastAt[slot][0] = x; lastAt[slot][1] = y; lastLook[slot] = tick; legs[slot] = false;
+            }
+        }
+        // 0.5.497: the unattended test's bot trial: frozen, X (0x40) alone
+        if (int(slot) == g_ctfTrialBot && GetTickCount() < g_ctfTrialUntil) { orders = {}; orders.buttons = 0x40u; }
         if(brain) {
             static uint32_t mobilityAt[MaxClients]={};
             if(serverTime-mobilityAt[slot]>=5000) {
@@ -5840,6 +10108,16 @@ static void FeedBots(PPCContext& ctx, uint8_t* base)
         memset(base + command, 0, CommandSize);
         Guest::Write32(base, command + 0, serverTime);
         if (brain && g_throwQuiet[slot]) { orders.buttons &= ~(StanceButton | SprintButton | 1u); orders.wantsFire = false; g_throwQuiet[slot]--; }   // 0.5.220
+        // 0.5.531: holding a flag, no fire, melee, grenade, smoke, aim, reload
+        // or use in his command, whatever wanted them (530: a carrier's melee
+        // charge fired the flag through his own command and dropped it)
+        if (brain)
+            if (const uint32_t carryEntity = Guest::Read32(base, Guest::Read32(base, EntityList) + 4 * (slot + 1)), carryRecord = carryEntity ? Guest::Read32(base, carryEntity + 512) : 0;
+                carryRecord && OwnedFlagWeapon(base, carryRecord))
+            {
+                orders.buttons &= ~(1u | MeleeButton | GrenadeButton | SmokeButton | 0x8u | ReloadButton | UseButtons);
+                orders.wantsFire = false;
+            }
         Guest::Write32(base, command + 4, brain ? orders.buttons : (buttons & 0x00FF));
         g_firing[slot] = ((brain ? orders.buttons : buttons) & 1) != 0 || (brain && orders.wantsFire);
         // 0.5.207: Justin: "it may say the bot is throwing grenades and
@@ -5943,11 +10221,21 @@ static void FeedBots(PPCContext& ctx, uint8_t* base)
             // grenade for the whole throw; the server takes a bot's command
             // weapon only for a normal switch. So the weapon in hand is set to
             // the grenade as the throw starts, as the host's shows.
+            // (0.5.752-757: a smoke-kind throw's 40 commands were traced here, to find
+            // why bots' smokes and flares did not go: see BotNadeWeapon and the smoke throw)
             if (brain && g_throwFrames[slot] && g_throwWeapon[slot])
             {
                 weapon = g_throwWeapon[slot]; g_throwFrames[slot]--;
                 if (record) Guest::Write32(base, record + 164, g_throwWeapon[slot]);
             }
+            // 0.5.526: a flag carrier asks for the flag (the game's take gives
+            // him mp_flag_allies/_axis and switches to it; his command still
+            // named his gun, so he switched back: no flag in his hands to see,
+            // and dying he dropped his gun, the flag left hidden for ever, the
+            // user: "it doesnt actually show their model holding a flag ...
+            // when they die ... its either invisible")
+            if (record)
+                if (const uint32_t flagWeapon = OwnedFlagWeapon(base, record)) weapon = flagWeapon;
             Guest::Write32(base, command + 8, weapon);
             // Trace after command +8 has been populated. Before 0.5.209 this
             // sampled the cleared command word, hiding the selected weapon.
@@ -6204,6 +10492,185 @@ static std::string BotsCvar(PPCContext& ctx, uint8_t* base, const char* name)
 // (sub_821DE680 on the entity's handle: +0 the count, +8 pairs of hash and
 // value). Each 2 s in a War match, every flag's table is logged when it
 // changed, so a capture shows which variable is the flag's owner.
+// 0.5.463: Capture the Flag, Single Capture the Flag and Headquarters, for the
+// bots (Justin: "make sure they can play and learn other games modes"). Every
+// 2 s in any mode but War, Battle and Team Battle, the entity table (0x82BD1FC0)
+// is read for entities whose class name (+548, its text at +12) has "flag",
+// "ctf", "hq" or "radio" in it, and where they are (+336). The first time in a
+// map every class name seen is logged, and each objective found.
+static void WatchObjectives(PPCContext& ctx, uint8_t* base)
+{
+    static uint32_t last = 0;
+    const uint32_t now = GetTickCount();
+    if (now - last < 2000) return;
+    last = now;
+    const std::string gametype = BotsCvar(ctx, base, "mp_gametype");
+    if (gametype.empty() || gametype == "war" || gametype == "dm" || gametype == "tdm") { g_obj.valid = false; g_obj.mode = gametype; return; }
+    static std::string loggedFor;
+    const std::string map = Kernel::CurrentMap();
+    const bool tell = loggedFor != gametype + map;
+    if (tell) loggedFor = gametype + map;
+    // 0.5.483: which CTF settings exist (user: a dropped flag home after 6 s;
+    // 482's lay 13 minutes): the time limit shows the probe works
+    if (tell && gametype.find("ctf") != std::string::npos)
+    {
+        std::string have;
+        for (const char* name : { "scr_ctf_timelimit", "scr_ctf_scorelimit", "scr_ctf_returntime", "scr_ctf_flagreturntime", "scr_ctf_returndelay",
+                                  "ctf_returntime", "ctf_flagreturntime", "scr_flagreturntime", "scr_ctf_idleflagreturntime", "scr_ctf_flagautoreturn" })
+        {
+            const std::string v = BotsCvar(ctx, base, name);
+            have += std::string(" ") + name + "=" + v;
+        }
+        printf("objectives: ctf settings:%s\n", have.c_str()); fflush(stdout);
+    }
+    ObjectiveGoals found;
+    found.mode = gametype;
+    std::string classes;
+    static uint32_t propIdx[24]; static float propAt[24][3], propNow[24][3]; static uint32_t propTold[24]; static int propCount = 0;   // 0.5.474/476
+    static std::string propsFor;
+    for (uint32_t i = 0; i < 4096; i++)
+    {
+        const uint32_t e = Guest::Read32(base, 0x82BD1FC0 + 8 * i);
+        if (e < 0x40000000u || e >= 0xA0000000u) continue;
+        const uint32_t cls = Guest::Read32(base, e + 548);
+        if (cls < 0x40000000u || cls >= 0xA0000000u) continue;
+        char name[32] = {};
+        for (int c = 0; c < 31; c++) { const char ch = char(Guest::Read8(base, cls + 12 + c)); if (!ch) break; name[c] = char(tolower(static_cast<unsigned char>(ch))); }
+        if (tell && classes.find(std::string(" ") + name + " ") == std::string::npos && classes.size() < 1500) classes += std::string(" ") + name + " ";
+        // 0.5.464: 463's CTF on Rouen took the spawn points (spawn_ctf_allies_primary
+        // ...): the only other names there were script_model and
+        // trigger_multiple, the flags' touch areas: those, in the flag modes
+        const bool flagMode = gametype.find("ctf") != std::string::npos;
+        // 0.5.472: a script_model's model by name (+540 points at the model; its
+        // name the text there, or at the pointer it holds), to tell the flags:
+        // 0.5.471's CTF took the trigger_multiples, whose origin is 0 0 0 (a
+        // brush trigger's place is its bounds), and sent the bots to the map's
+        // middle (Justin: "on ctf they didnt ever pick up a flag"); its listing
+        // was used up on the map before
+        char modelName[48] = {};
+        if (strcmp(name, "script_model") == 0)
+        {
+            const uint32_t model = Guest::Read32(base, e + 540);
+            for (uint32_t at : { model, model >= 0x40000000u && model < 0xA0000000u ? Guest::Read32(base, model) : 0u })
+            {
+                if (at < 0x40000000u || at >= 0xA0000000u || modelName[0]) continue;
+                char text[48] = {};
+                bool printable = true;
+                for (int c = 0; c < 47; c++) { const char ch = char(Guest::Read8(base, at + c)); if (!ch) break; if (ch < 32 || ch > 126) { printable = false; break; } text[c] = char(tolower(static_cast<unsigned char>(ch))); }
+                if (printable && strlen(text) >= 3) memcpy(modelName, text, sizeof(text));
+            }
+        }
+        // 0.5.474: the props (the flags among them) followed: one that leaves
+        // where it was first seen (by 100 or more) is logged, so a log shows a
+        // flag taken (it goes with its carrier) or brought back
+        if (flagMode && strcmp(name, "script_model") == 0)
+        {
+            if (propsFor != gametype + map) { propsFor = gametype + map; propCount = 0; }
+            const float p[3] = { ReadFloat(base, e + 336), ReadFloat(base, e + 340), ReadFloat(base, e + 344) };
+            int k = 0;
+            while (k < propCount && propIdx[k] != i) k++;
+            if (k < propCount) memcpy(propNow[k], p, sizeof(p));
+            if (k == propCount && propCount < 24) { propIdx[k] = i; memcpy(propAt[k], p, sizeof(p)); memcpy(propNow[k], p, sizeof(p)); propTold[k] = 0; propCount++; }
+            else if (k < propCount && hypotf(p[0] - propAt[k][0], p[1] - propAt[k][1]) >= 100.0f && now - propTold[k] > 5000)
+            {
+                propTold[k] = now;
+                printf("objectives: prop %u moved from %.0f %.0f to %.0f %.0f %.0f\n", i, propAt[k][0], propAt[k][1], p[0], p[1], p[2]); fflush(stdout);
+            }
+        }
+        if (tell && (strcmp(name, "script_model") == 0 || strcmp(name, "trigger_multiple") == 0))
+        {
+            static int listed = 0;
+            static std::string listedFor;
+            if (listedFor != loggedFor) { listedFor = loggedFor; listed = 0; }   // 0.5.472: a list per map and mode
+            if (listed++ < 80) { printf("objectives: %s %u at %.0f %.0f %.0f, model \"%s\"\n", name, i, ReadFloat(base, e + 336), ReadFloat(base, e + 340), ReadFloat(base, e + 344), modelName); fflush(stdout); }
+        }
+        if (strncmp(name, "spawn", 5) == 0) continue;
+        // 0.5.473: 472's model names came back empty on Rouen, so nothing was
+        // taken (no goal: the bots wandered). The flags there are the placed
+        // trigger_multiples (two at each base: -1792 -91 and 2112 462; the
+        // rest sit at 0 0 0), so a trigger_multiple off 0 0 0 is an objective,
+        // one per place (those within 150 are the same)
+        const bool objective = strstr(name, "flag") || strstr(name, "hq") || strstr(name, "radio") ||
+                               strcmp(name, "trigger_multiple") == 0 ||
+                               (flagMode && strstr(modelName, "flag")) || (!flagMode && (strstr(modelName, "radio") || strstr(modelName, "hq")));
+        if (!objective) continue;
+        if (ReadFloat(base, e + 336) == 0.0f && ReadFloat(base, e + 340) == 0.0f) continue;   // 0.5.472: never the map's 0 0 0 (a brush trigger)
+        if (found.count >= 8) continue;
+        for (int k = 0; k < 3; k++) found.at[found.count][k] = ReadFloat(base, e + 336 + 4 * k);
+        if (!std::isfinite(found.at[found.count][0]) || fabsf(found.at[found.count][0]) > 60000.0f) continue;
+        bool same = false;
+        for (int k = 0; k < found.count && !same; k++) same = hypotf(found.at[k][0] - found.at[found.count][0], found.at[k][1] - found.at[found.count][1]) < 150.0f;
+        if (same) continue;
+        memcpy(found.name[found.count], flagMode ? "flag" : name, flagMode ? 5 : sizeof(name));
+        found.count++;
+    }
+    // 0.5.476: a flag off its base. 475's flag (prop 49) lay at -71 284 after
+    // its carrier fell, and no one went for it: now a prop that stood within
+    // 150 of an objective and is 100 or more from there marks that flag out,
+    // at the prop's place
+    for (int k = 0; k < found.count && gametype.find("ctf") != std::string::npos; k++)
+        for (int j = 0; j < propCount; j++)
+            if (hypotf(propAt[j][0] - found.at[k][0], propAt[j][1] - found.at[k][1]) < 150.0f &&
+                hypotf(propNow[j][0] - propAt[j][0], propNow[j][1] - propAt[j][1]) >= 100.0f)
+            { found.out[k] = true; memcpy(found.live[k], propNow[j], sizeof(found.live[k])); }
+    // 0.5.503: in CTF the two bases are kept once found (per map): a taken
+    // flag's triggers move off and a dropped one adds its own, so the count
+    // left 2 and every CTF part (sides, spawn moves, the bots' flag goals,
+    // FlagEntityWatch) stopped till both were home (502: the host's dropped
+    // flag lay out 130 s, no one went for it). The flags' state comes from
+    // FlagEntityWatch (the models).
+    if (gametype.find("ctf") != std::string::npos)
+    {
+        static std::string basesFor;
+        static float bases[2][3];
+        static bool have = false;
+        if (basesFor != gametype + map) { basesFor = gametype + map; have = false; }
+        if (!have && found.count == 2) { have = true; memcpy(bases, found.at, sizeof(bases)); printf("objectives: ctf bases kept: %.0f %.0f and %.0f %.0f\n", bases[0][0], bases[0][1], bases[1][0], bases[1][1]); fflush(stdout); }
+        if (have && found.count != 2)
+        {
+            static int told = 0;
+            if (told++ < 20) { printf("objectives: ctf: %d flag places seen (a flag out): the two bases kept\n", found.count); fflush(stdout); }
+            found.count = 2;
+            for (int k = 0; k < 2; k++) { memcpy(found.at[k], bases[k], sizeof(bases[k])); memcpy(found.name[k], "flag", 5); found.out[k] = false; }
+        }
+        else if (have) memcpy(found.at, bases, sizeof(bases));   // the same order every time
+    }
+    found.valid = found.count > 0;
+    found.when = now;
+    if (tell)
+    {
+        printf("objectives: mode \"%s\" on %s, class names:%s\n", gametype.c_str(), map.c_str(), classes.c_str());
+        for (int k = 0; k < found.count; k++) printf("objectives: %s at %.0f %.0f %.0f\n", found.name[k], found.at[k][0], found.at[k][1], found.at[k][2]);
+        fflush(stdout);
+    }
+    g_obj = found;
+}
+// 0.5.471: War at a glance, every 10 s: the flag in play and how many of each
+// side are on it (within 150) and near it (within 450), so a log shows
+// whether the bots hold it, contest it or never reach it.
+static void WarReadout(uint8_t* base)
+{
+    static uint32_t last = 0;
+    const uint32_t now = GetTickCount();
+    if (now - last < 10000 || !g_war.valid || now - g_war.when > 10000) return;
+    last = now;
+    const uint32_t entities = Guest::Read32(base, EntityList);
+    int on[3] = {}, nearBy[3] = {};
+    for (uint32_t i = 0; entities && i < ActiveSlots(); i++)
+    {
+        const uint32_t e = Guest::Read32(base, entities + 4 * (i + 1));
+        const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+        if (!r || int32_t(Guest::Read32(base, r + 304)) <= 0) continue;
+        const uint32_t s = Side(base, e);
+        if (s < 1 || s > 2) continue;
+        const float d = hypotf(ReadFloat(base, r) - g_war.at[0], ReadFloat(base, r + 4) - g_war.at[1]);
+        if (d < 150.0f) on[s]++;
+        if (d < 450.0f) nearBy[s]++;
+    }
+    printf("war: flag %u in play at %.0f %.0f: side 1 %d on it, %d near; side 2 %d on it, %d near%s\n", g_war.index, g_war.at[0], g_war.at[1],
+           on[1], nearBy[1], on[2], nearBy[2], on[1] && on[2] ? " (contested)" : on[1] || on[2] ? " (one side on it)" : "");
+    fflush(stdout);
+}
 static void WatchWar(PPCContext& ctx, uint8_t* base)
 {
     static uint32_t last = 0;
@@ -6641,6 +11108,18 @@ bool BotsIsBotEntity(uint8_t* base, uint32_t entity)
     return false;
 }
 bool BotsThisMachineHostsBots(uint8_t* base) { return ThisMachineHosts(base); }
+// 0.5.738: whether a movement record (an entity's +512) is one of this
+// machine's bots' (mp_fixes.cpp: the mantle assist, kept for bots only).
+bool BotsIsBotRecord(uint8_t* base, uint32_t record)
+{
+    const uint32_t entities = Guest::Read32(base, EntityList);
+    for (uint32_t slot = 0; record && entities && slot < ActiveSlots() && slot < MaxClients; slot++)
+    {
+        const uint32_t ent = Guest::Read32(base, entities + 4 * (slot + 1));
+        if (ent && Guest::Read32(base, ent + 512) == record) return g_bot[slot];
+    }
+    return false;
+}
 
 // The host: the roster, every second, while it has bots (and once more
 // with none after the last goes, so the others know).
@@ -7007,9 +11486,54 @@ static std::filesystem::path LookoutFile(const std::string& map)
     file.replace_extension(".lookouts.txt");
     return file;
 }
+// 0.5.585: each flag's ways out (g_flagTrails), a line each: its spots' x y z
+static std::filesystem::path FlagTrailsFile(const std::string& map)
+{
+    std::filesystem::path file = MapKnowledgeFile(map);
+    return file.replace_filename(file.stem().string() + "-ctf-ways.txt");
+}
+static void SaveFlagTrails()
+{
+    if (g_mapKnowName.empty() || !g_trailsChanged) return;
+    if (FILE* f = fopen(FlagTrailsFile(g_mapKnowName).string().c_str(), "wb"))
+    {
+        int count = 0;
+        for (int k = 0; k < 2; k++)
+            for (const auto& way : g_flagTrails[k])
+            {
+                if (way.size() < 3) continue;
+                for (const auto& p : way) fprintf(f, "%.0f %.0f %.0f ", p.x, p.y, p.z);
+                fprintf(f, "\n"); count++;
+            }
+        fclose(f);
+        g_trailsChanged = false;
+        printf("bots: ctf ways out for %s saved (%d)\n", g_mapKnowName.c_str(), count); fflush(stdout);
+    }
+}
+static void LoadFlagTrails(const std::string& map)
+{
+    for (auto& flag : g_flagTrails) for (auto& way : flag) way.clear();
+    g_flagTrailNext[0] = g_flagTrailNext[1] = 0;
+    g_trailsLoaded.clear(); g_trailsChanged = false;
+    if (map.empty()) return;
+    if (FILE* f = fopen(FlagTrailsFile(map).string().c_str(), "rb"))
+    {
+        char line[8192];
+        while (fgets(line, sizeof(line), f))
+        {
+            std::vector<BotNavigation::Point> way;
+            const char* at = line; float x, y, z; int used;
+            while (sscanf(at, "%f %f %f %n", &x, &y, &z, &used) == 3) { way.push_back({ x, y, z }); at += used; }
+            if (way.size() >= 3) g_trailsLoaded.push_back(std::move(way));
+        }
+        fclose(f);
+        printf("bots: ctf ways out for %s read (%zu)\n", map.c_str(), g_trailsLoaded.size()); fflush(stdout);
+    }
+}
 static void SaveMapKnowledge(const char* why)
 {
     SaveLookouts(g_mapKnowName);   // 0.5.282
+    SaveFlagTrails();               // 0.5.585
     if (g_mapKnowName.empty() || g_mapKnow.changes == 0) return;
     std::error_code ec;
     const std::filesystem::path file = MapKnowledgeFile(g_mapKnowName);
@@ -7037,6 +11561,7 @@ static void MapKnowledgeTick(uint8_t* base)
         g_mapKnow.Clear();
         g_mapKnowName = map;
         LoadLookouts(map);   // 0.5.282
+        LoadFlagTrails(map);   // 0.5.585
         for (auto& e : g_explore) e = {};
         g_mgSpotCount = 0;
         for (auto& sp : g_spawns) sp = {};   // 0.5.202
@@ -7073,8 +11598,63 @@ static void MapKnowledgeTick(uint8_t* base)
         const BotNavigation::Point feet = record ? BotNavigation::Point{ ReadFloat(base, record), ReadFloat(base, record + 4), ReadFloat(base, record + 8) }
                                                  : BotNavigation::Point{ NAN, NAN, NAN };
         // Riding in a vehicle or on a mounted gun is not walking.
-        const bool walking = living && !InVehicle(base, entity) && !(Guest::Read32(base, record + 240) & 0x100000u);
+        // 0.5.577: nor falling fast (through the world: 575's map had spots at
+        // z -29388..-13524 under the flag at -1792 -91), nor just put somewhere
+        // by this port (its teleports are not ways a player walked)
+        const bool falling = record && fabsf(ReadFloat(base, record + 24)) > 300.0f;
+        const bool portMoved = slot < MaxClients && g_portMovedAt[slot] && GetTickCount() - g_portMovedAt[slot] < 1500;
+        const bool walking = living && !falling && !portMoved && !InVehicle(base, entity) && !(Guest::Read32(base, record + 240) & 0x100000u);
         g_mapKnow.Observe(int(slot), feet, now, walking);
+        // 0.5.582: a player walking out from a flag at home (its base): his
+        // trail kept once he is 650 out. 581's self-test: side 2's attackers
+        // within 300 of the flag at -1792 -91 had their route run down to the
+        // flag itself outside the building's east wall (x -1540) and went
+        // straight at it into the wall; side 1's bots walk out of it each life.
+        if (slot == 0 && g_obj.count >= 2 && !g_trailsLoaded.empty())
+        {
+            int put = 0;
+            for (auto& way : g_trailsLoaded)
+                for (int f = 0; f < 2; f++)
+                    if (hypotf(way.front().x - g_obj.at[f][0], way.front().y - g_obj.at[f][1]) < 350.0f)
+                    { g_flagTrails[f][g_flagTrailNext[f]++ % 16] = std::move(way); put++; break; }
+            printf("bots: ctf ways out read in: %d put to their flags (%d and %d)\n", put, std::min(g_flagTrailNext[0], 16), std::min(g_flagTrailNext[1], 16)); fflush(stdout);
+            g_trailsLoaded.clear();
+        }
+        if (slot < MaxClients && g_obj.count >= 2)
+        {
+            static std::vector<BotNavigation::Point> trail[MaxClients];
+            static uint8_t trailFlag[MaxClients] = {};   // flag + 1, 0 none
+            if (!walking) { trail[slot].clear(); trailFlag[slot] = 0; }
+            else if (trailFlag[slot] == 0)
+            {
+                for (int f = 0; f < 2; f++)
+                    if (g_flagCarrier[f] < 0 && !g_flagDropped[f] && hypotf(feet.x - g_obj.at[f][0], feet.y - g_obj.at[f][1]) < 300.0f)
+                    { trailFlag[slot] = uint8_t(f + 1); trail[slot].assign(1, feet); break; }
+            }
+            else
+            {
+                const int f = trailFlag[slot] - 1;
+                const float d = hypotf(feet.x - g_obj.at[f][0], feet.y - g_obj.at[f][1]);
+                if (g_flagCarrier[f] >= 0 || g_flagDropped[f] || trail[slot].size() > 40) { trail[slot].clear(); trailFlag[slot] = 0; }
+                else if (d < 300.0f) trail[slot].assign(1, feet);   // still by it: the trail starts from here (0.5.585: 300, was 200)
+                else
+                {
+                    const BotNavigation::Point& last = trail[slot].back();
+                    if (hypotf(feet.x - last.x, feet.y - last.y) > 30.0f) trail[slot].push_back(feet);
+                    if (d > 650.0f)
+                    {
+                        if (trail[slot].size() >= 3)
+                        {
+                            g_flagTrails[f][g_flagTrailNext[f]++ % 16] = trail[slot];
+                            g_trailsChanged = true;
+                            static int told = 0;
+                            if (told++ < 30) { printf("bots: a way out of flag %d's base kept: %zu spots, from %.0f %.0f %.0f to %.0f %.0f %.0f\n", f, trail[slot].size(), trail[slot].front().x, trail[slot].front().y, trail[slot].front().z, feet.x, feet.y, feet.z); fflush(stdout); }
+                        }
+                        trail[slot].clear(); trailFlag[slot] = 0;
+                    }
+                }
+            }
+        }
         if (alive[slot] && !living && record)
         {
             g_mapKnow.Death(lastFeet[slot]);
@@ -7607,6 +12187,15 @@ namespace PhotoTour
         {
             if (now - g_at < 4000) return;   // textures stream in
             PlanViews(map);
+            // 0.5.734: COD3_PHOTO_SKY="pitch yaw" turns every view that way
+            // (the sky's sun sprite at the worldspawn sundirection: Seelow
+            // Night's orange dot at -55 340).
+            if (const char* sky = getenv("COD3_PHOTO_SKY"))
+            {
+                float pitch = 0, yaw = 0;
+                if (sscanf(sky, "%f %f", &pitch, &yaw) == 2)
+                    for (View& v : g_views) { v.pitch = pitch; v.yaw = yaw; }
+            }
             g_stage = 2; g_at = now; g_shot = false;
             if (g_views.empty()) { g_map++; g_stage = 0; g_at = 0; }
             return;
@@ -7620,6 +12209,7 @@ namespace PhotoTour
             if (!g_shot && now - g_at >= 3500)
             {
                 Overlay::RequestScreenshot(); g_shot = true;
+                if (getenv("COD3_SHOTS_DRAWS")) Render::LogNextFrame();   // 0.5.734: its draws pictured too
                 const time_t clock = time(nullptr); struct tm local{}; localtime_s(&local, &clock);
                 printf("photo tour: %s view %zu at %.0f %.0f %.0f yaw %.0f: screenshot %02d%02d%02d\n", map.c_str(), g_view + 1, v.x, v.y, v.z, v.yaw, local.tm_hour, local.tm_min, local.tm_sec);
                 fflush(stdout);
@@ -7671,7 +12261,7 @@ namespace BigTest
             g_stage = 2;
             MpCapProbeWrite("big test done");
             printf("big test: done (%zu maps); cap-probe.csv written; ending the game\n", g_maps.size()); fflush(stdout);
-            std::thread([] { Sleep(3000); TerminateProcess(GetCurrentProcess(), 0); }).detach();
+            std::thread([] { Net::PublicShutdown(); Sleep(3000); TerminateProcess(GetCurrentProcess(), 0); }).detach();   // (0.5.428: off the public list first)
             return;
         }
         const std::string& map = g_maps[g_map];
@@ -7683,8 +12273,30 @@ namespace BigTest
                 if (Guest::Read32(base, LocalState(k)) != 0) Guest::Write32(base, LocalState(k), 0);
         if (g_stage == 0)
         {
-            if (!g_at) { Kernel::QueueConsoleCommand("devmap " + map); g_at = now; printf("big test: loading %s\n", map.c_str()); fflush(stdout); return; }
+            if (!g_at)
+            {
+                // 0.5.486: COD3_BIG_MODE=ctf (or any mode) set before the map
+                // loads, for unattended CTF tests (CTF-TEST.bat)
+                if (const char* mode = getenv("COD3_BIG_MODE"); mode && mode[0])
+                {
+                    Kernel::QueueConsoleCommand(std::string("set mp_gametype ") + mode);
+                    Kernel::QueueConsoleCommand(std::string("set g_gametype ") + mode);
+                    printf("big test: game mode %s\n", mode); fflush(stdout);
+                }
+                Kernel::QueueConsoleCommand("devmap " + map); g_at = now; printf("big test: loading %s\n", map.c_str()); fflush(stdout); return;
+            }
             if (now - g_at > 120000) { printf("big test: %s did not load in 2 minutes: skipped\n", map.c_str()); fflush(stdout); g_map++; g_at = 0; return; }
+            // 0.5.729: a devmap can be lost (put on the title's command buffer
+            // while the title runs it: seelow14bots ran both sets, not the
+            // devmap, and opened no file): no map archive opened in 15 s ->
+            // devmap again (every 15 s, the 2-minute limit still counting).
+            static uint32_t resentAt = 0;
+            if (Kernel::CurrentMap() != map && now - g_at > 15000 && now - std::max(g_at, resentAt) > 15000)
+            {
+                resentAt = now;
+                Kernel::QueueConsoleCommand("devmap " + map);
+                printf("big test: %s: no map archive opened yet: devmap sent again\n", map.c_str()); fflush(stdout);
+            }
             static uint32_t pressedAt = 0;
             const bool alive = record && int32_t(Guest::Read32(base, record + 304)) > 0 && Guest::Read32(base, record + 1924) == 3;
             if (g_mapKnowName == map && !alive && now - g_at > 10000 && now - pressedAt > 1500) { pressedAt = now; Input::PressButton("a"); }
@@ -7757,6 +12369,24 @@ namespace BigTest
                     uint32_t word;
                     auto put = [&](uint32_t at, float f) { memcpy(&word, &f, 4); Guest::Write32(base, at, word); };
                     put(record, v.x); put(record + 4, v.y); put(record + 8, v.z);
+                    // 0.5.702: COD3_BENCH_LOOKAT=x,y,z,distance: the view does not hold
+                    // the yaw it is given, so the place follows the view instead: every
+                    // frame that distance back from the point along the way he faces
+                    // (the eye 60 above the origin), the point in the middle of the picture
+                    static const std::vector<float> lookAt = [] {
+                        std::vector<float> out;
+                        if (const char* t = getenv("COD3_BENCH_LOOKAT"))
+                            for (const char* p = t; *p;) { char* e = nullptr; out.push_back(strtof(p, &e)); if (e == p) break; p = (*e == ',') ? e + 1 : e; }
+                        return out;
+                    }();
+                    if (lookAt.size() >= 4)
+                    {
+                        const float pitch = ReadFloat(base, record + 204) * 0.01745329252f, yaw = ReadFloat(base, record + 208) * 0.01745329252f;
+                        const float fx = std::cos(pitch) * std::cos(yaw), fy = std::cos(pitch) * std::sin(yaw), fz = -std::sin(pitch);
+                        put(record, lookAt[0] - fx * lookAt[3]); put(record + 4, lookAt[1] - fy * lookAt[3]); put(record + 8, lookAt[2] - fz * lookAt[3] - 60.0f);
+                        static uint32_t toldLook = 0;
+                        if (now - toldLook >= 3000) { toldLook = now; printf("bench: looking at %.0f %.0f %.0f from %.0f %.0f %.0f (pitch %.1f yaw %.1f)\n", lookAt[0], lookAt[1], lookAt[2], lookAt[0] - fx * lookAt[3], lookAt[1] - fy * lookAt[3], lookAt[2] - fz * lookAt[3] - 60.0f, pitch * 57.29578f, yaw * 57.29578f); fflush(stdout); }
+                    }
                     put(record + 16, 0.0f); put(record + 20, 0.0f); put(record + 24, 0.0f);
                     static uint32_t turnedAt = 0;
                     const uint32_t local = Guest::Read32(base, 0x82A2A1C8);
@@ -7935,6 +12565,7 @@ uint32_t KillcamRigModelsOk(uint8_t* base, uint32_t rig)
     return n;
 }
 bool KillcamReplayingNow() { return Killcam::Replaying(); }
+int BotsNumberOfClient(int client) { return (client >= 0 && client < int(MaxClients)) ? g_botNumber[client] : 0; }   // 0.5.490: spectator.cpp's names
 
 namespace VehicleProbe
 {
@@ -8040,13 +12671,47 @@ PPC_FUNC(sub_##addr) \
 VEHUSE_STEP(823DCF70, "sender in the roster", 2)
 VEHUSE_STEP(823DD068, "player by number", 2)
 VEHUSE_STEP(823DD390, "vehicle entry usable", 1)
-VEHUSE_STEP(8255EFE0, "vehicle vs player", 3)
+// 0.5.840: logged outside the seat request too (no request was ever sent for a Sherman on Seelow:
+// sherman3), with the vehicle's kind
+extern "C" PPC_FUNC(__imp__sub_8255EFE0);
+PPC_FUNC(sub_8255EFE0)
+{
+    const uint32_t a3 = ctx.r3.u32, a4 = ctx.r4.u32, a5 = ctx.r5.u32;
+    __imp__sub_8255EFE0(ctx, base);
+    if (VehicleUse::On())
+    {
+        static int told = 0;
+        if (told++ < 300) { printf("vehuse:   vehicle vs player (8255EFE0)%s r3 %08X r4 %08X r5 %08X -> %08X\n", VehicleUse::g_in ? " [in request]" : "", a3, a4, a5, ctx.r3.u32); fflush(stdout); }
+    }
+}
 VEHUSE_STEP(823D9338, "seat check", 3)
 VEHUSE_STEP(82585540, "SEAT HIM", 3)
 #undef VEHUSE_STEP
 
+// 0.5.735: the host's own player, once a second of real time, in every game:
+// "where: x y z | velocity x y z". FeedBots' "bots: host 0
+// record" line follows the commands' clock and stopped after the first ~80 s of
+// the user's plays, so their falls under Seelow and stuck places could not be
+// found from the log (tools: route the "where:" lines against the map's ground).
+static void LogHostWhere(uint8_t* base)
+{
+    static auto next = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next) return;
+    next = now + std::chrono::seconds(1);
+    const uint32_t entities = Guest::Read32(base, EntityList);
+    const uint32_t host = entities ? Guest::Read32(base, entities + 4) : 0;
+    const uint32_t ps = host ? Guest::Read32(base, host + 512) : 0;
+    if (!ps) return;
+    printf("where: %.1f %.1f %.1f | velocity %.1f %.1f %.1f\n",
+           ReadFloat(base, ps), ReadFloat(base, ps + 4), ReadFloat(base, ps + 8),
+           ReadFloat(base, ps + 16), ReadFloat(base, ps + 20), ReadFloat(base, ps + 24));
+    fflush(stdout);
+}
+
 PPC_FUNC(sub_82535810)
 {
+    LogHostWhere(base);
     GunPointersCheck(base, "between server frames (the client's frame, menus, drawing)");
     KeepHostCurrent(base, "before the server frame");
     static uint64_t botsNs = 0, serverNs = 0, frames = 0, otherNs = 0;
@@ -8060,7 +12725,14 @@ PPC_FUNC(sub_82535810)
     WatchHostView(ctx, base);
     HostDeathCapture(base);   // 0.5.226
     WatchWar(ctx, base);   // 0.5.149
+    WatchObjectives(ctx, base);   // 0.5.463
+    WarReadout(base);   // 0.5.471
     GunPointersCheck(base, "WatchWar");
+    {
+        static bool registered = false;   // 0.5.641
+        if (!registered) { registered = true; Overlay::SetMatchHud(Prematch::HudActive, Prematch::HudDraw); }
+        Prematch::ServerFrame(ctx, base);
+    }
     __imp__sub_82535810(ctx, base);
     {
         // 0.5.369: what the killcam's recorder costs each server frame
@@ -8164,6 +12836,8 @@ PPC_FUNC(sub_82535810)
     MirrorHostBots(ctx, base);  // 0.5.194: a joiner puts the host's bots in its game
     PlayerLimitProbe(base);     // 0.5.197: is the space after the player states free?
     MapKnowledgeTick(base);     // 0.5.197: the bots learn the map
+    CtfSpawnSides(ctx, base);   // 0.5.475: CTF's sides spawn by their own flag
+    PlayerUnstick(ctx, base);   // 0.5.541: the player caught in the scenery is put back
     KeepHostCurrent(base, "after the server frame");
     // bot_session: log the session's players; 2 also gives each bot one and
     // spawns him again, this time the game's own way.
@@ -8384,6 +13058,13 @@ PPC_FUNC(sub_824B4270)
         printf("\n");
         fflush(stdout);
     }
+    // 0.5.641: the pre-match countdown: no moving, jumping, firing or throwing
+    // for anyone (the command's buttons +8, its forward, right and up +28..+30)
+    if (Prematch::Frozen())
+    {
+        Guest::Write32(base, pm + 8, 0);
+        Guest::Write8(base, pm + 28, 0); Guest::Write8(base, pm + 29, 0); Guest::Write8(base, pm + 30, 0);
+    }
     __imp__sub_824B4270(ctx, base);
     if (say)
     {
@@ -8593,6 +13274,16 @@ PPC_FUNC(sub_82462C68)
         g_kcMode = mode;
         g_kcModeAt = GetTickCount();
     }
+}
+// 0.5.703: a line through the world for the flamethrower (mp_fixes.cpp): how
+// far along from -> to it runs before something solid (1: all the way, or
+// no answer), the ignored entity's own body left out
+float BotsFlameTrace(PPCContext& ctx, uint8_t* base, uint32_t ignored, const float from[3], const float to[3])
+{
+    using namespace BotNavigation;
+    const Hit h = BotTrace(ctx, base, ignored, ignored, { from[0], from[1], from[2] }, { to[0], to[1], to[2] }, false);
+    if (!h.valid || !std::isfinite(h.fraction)) return 1.0f;
+    return std::clamp(h.fraction, 0.0f, 1.0f);
 }
 extern "C" PPC_FUNC(__imp__sub_824674E0);
 PPC_FUNC(sub_824674E0)
@@ -8810,7 +13501,7 @@ namespace KillcamStudy
             const bool alive = own && int32_t(Guest::Read32(base, own + 776)) > 0;
             const uint32_t now = GetTickCount();
             if (!alive) g_aliveSince = 0; else if (!g_aliveSince) g_aliveSince = now;
-            if (!g_doneKillcam && Killcam::Replaying() && GetTickCount64() - Killcam::g_playStart > 1000) { g_which = 2; g_left = 6; printf("killcam study: measuring during a killcam (6 scopes)\n"); fflush(stdout); }
+            if (!g_doneKillcam && Killcam::Replaying() && Killcam::Ms() - Killcam::g_playStart > 1000) { g_which = 2; g_left = 6; printf("killcam study: measuring during a killcam (6 scopes)\n"); fflush(stdout); }
             else if (!g_doneLive && alive && g_bots >= 4 && now - g_aliveSince > 30000) { g_which = 1; g_left = 6; printf("killcam study: measuring normal play (6 scopes)\n"); fflush(stdout); }
             else return false;
         }
@@ -8894,9 +13585,11 @@ PPC_FUNC(sub_8246C748)   // 0.5.328: CG_DrawActiveFrame: the killcam's swap
 {
     const bool mine = !Killcam::g_swapped && !Killcam::g_listAt;   // 0.5.335: not inside the other swap
     if (mine) Killcam::SwapIn(base);
+    const bool spec = mine && !Killcam::g_swapped && Spectator::SwapIn(base);   // 0.5.490: following from his eyes
     const bool study = KillcamStudy::Begin(base);   // 0.5.345
     __imp__sub_8246C748(ctx,base);
     if (study) KillcamStudy::End();
+    if (spec) Spectator::SwapOut(base);
     if (mine) Killcam::SwapOut(base);
 }
 // 0.5.335: 334's log: the killer turned his aim onto you (3 deg off, 360
@@ -9029,10 +13722,12 @@ PPC_FUNC(sub_82448A18)
 {
     const bool mine = !Killcam::g_swapped && !Killcam::g_listAt;
     if (mine) Killcam::SwapIn(base);
+    const bool spec = mine && !Killcam::g_swapped && Spectator::SwapIn(base);   // 0.5.490
     if (Killcam::Replaying()) { static int told = 0; if ((told < 3 && told++ < 3)) { printf("killcam: scene entry 82448A18 (%s)\n", mine ? "swapped here" : "already swapped"); fflush(stdout); } }
     const bool study = KillcamStudy::Begin(base);   // 0.5.345
     __imp__sub_82448A18(ctx,base);
     if (study) KillcamStudy::End();
+    if (spec) Spectator::SwapOut(base);
     if (mine) Killcam::SwapOut(base);
 }
 // 0.5.336: 335 still did not draw you, and nothing says whether the scene
@@ -9044,6 +13739,7 @@ PPC_FUNC(sub_8246BED8)
 {
     const bool mine = !Killcam::g_swapped && !Killcam::g_listAt;
     if (mine) Killcam::SwapIn(base);
+    const bool spec = mine && !Killcam::g_swapped && Spectator::SwapIn(base);   // 0.5.490
     if (Killcam::Replaying())
     {
         static uint64_t toldFor = 0;
@@ -9073,19 +13769,21 @@ PPC_FUNC(sub_8246BED8)
             fflush(stdout);
         }
     }
+    if (spec) Spectator::SwapOut(base);
     if (mine) Killcam::SwapOut(base);
 }
 extern "C" PPC_FUNC(__imp__sub_82451ED0);
 PPC_FUNC(sub_82451ED0)
 {
     __imp__sub_82451ED0(ctx,base);
-    if (ctx.r3.u32) Killcam::PatchSnapshot(base,ctx.r3.u32);
+    if (ctx.r3.u32) { Killcam::PatchSnapshot(base,ctx.r3.u32); Spectator::PatchSnapshot(base,ctx.r3.u32); }   // 0.5.490
 }
 extern "C" PPC_FUNC(__imp__sub_82464D38);
 PPC_FUNC(sub_82464D38)
 {
     __imp__sub_82464D38(ctx,base);
     Killcam::PatchWeapon(base);
+    Spectator::PatchWeapon(base);   // 0.5.490
 }
 // 0.5.341: the events cgame plays during the replay (CG_EntityEvent
 // sub_8246BC18, r3 the entity, r4 the event), counted, the first named
@@ -9132,8 +13830,22 @@ PPC_FUNC(sub_823A3690)
 PPC_FUNC(sub_82463150)
 {
     const uint32_t camera=ctx.r3.u32;
-    if (camera && Guest::Read32(base,camera+480)==0) Killcam::Apply(base,camera,g_kcMode);
+    if (camera && Guest::Read32(base,camera+480)==0) { Killcam::Apply(base,camera,g_kcMode); Spectator::ApplyCamera(base,camera); }   // 0.5.490: the free and behind cameras
     __imp__sub_82463150(ctx,base);
+    // 0.5.703: the view as drawn, for the flames drawn in the world (flamethrower.cpp):
+    // the local view block's origin (+4960) and axes (+4976: forward, left, up),
+    // just made from its angles above, and the camera's fov
+    if (camera && Guest::Read32(base,camera+480)==0)
+    {
+        const uint32_t view=0x82C7D490u;
+        float eye[3],axes[9];
+        for (int k=0;k<3;k++) eye[k]=ReadFloat(base,view+4960+4*k);
+        for (int k=0;k<9;k++) axes[k]=ReadFloat(base,view+4976+4*k);
+        Flame::Camera(eye,axes,ReadFloat(base,camera+96));
+        Flare::Camera(eye,axes,ReadFloat(base,camera+96));   // 0.5.739
+        static int told=0;
+        if (told<3) { told++; printf("flamethrower: view at %.0f %.0f %.0f, forward %.2f %.2f %.2f, left %.2f %.2f %.2f, angles %.1f %.1f, fov %.1f\n",eye[0],eye[1],eye[2],axes[0],axes[1],axes[2],axes[3],axes[4],axes[5],ReadFloat(base,view+5024),ReadFloat(base,view+5028),ReadFloat(base,camera+96)); fflush(stdout); }
+    }
     static uint32_t logged=0;
     const uint32_t now=GetTickCount();
     if (!camera || Guest::Read32(base,camera+480)!=0 || now-logged<2000) return;
@@ -9573,11 +14285,26 @@ PPC_FUNC(sub_82593608)
     __imp__sub_82593608(ctx, base);
     g_thinkSlot = thinking;
 }
+bool MpFixesFlameOverheated(uint8_t* base, uint32_t entity);   // mp_fixes.cpp (0.5.720)
 extern "C" PPC_FUNC(__imp__sub_82593518);
 PPC_FUNC(sub_82593518)
 {
     const uint32_t handle = ctx.r3.u32;
     const uint32_t entity = handle ? Guest::Read32(base, 0x82BD1FC0 + 8 * (handle & 0x3FFF)) : 0;
+    // 0.5.720: an overheated M2 (World at War's overheating) fires no more: the
+    // fire bit (1) off in the player's newest command, the one this think runs on
+    if (entity && MpFixesFlameOverheated(base, entity))
+    {
+        const uint32_t entities = Guest::Read32(base, EntityList);
+        for (uint32_t c = 0; entities && c < MaxClients; c++)
+            if (Guest::Read32(base, entities + 4 * (c + 1)) == entity)
+            {
+                const uint32_t player = Players + PlayerSize * c;
+                const uint32_t command = player + Ring + CommandSize * (Guest::Read32(base, player + Newest) & 63u);
+                Guest::Write32(base, command + 4, Guest::Read32(base, command + 4) & ~1u);
+                break;
+            }
+    }
     if (!IsBotEntity(base, entity)) { __imp__sub_82593518(ctx, base); return; }
     const uint32_t slot = BotSlot(base, entity);
     KeepFov keep(base);
@@ -10061,9 +14788,11 @@ PPC_FUNC(sub_82587268)
         fflush(stdout);
     }
     const uint32_t queue = Guest::Read32(base, 0x82A87860);
-    printf("bots: death queue BEFORE: object %08X count %u entries %08X\n", queue, Guest::Read32(base, queue), Guest::Read32(base, queue + 4)); fflush(stdout);
+    static int queueShown = 0;   // 0.5.436: the first 40 deaths only
+    const bool showQueue = queueShown < 40 && queueShown++ < 40;
+    if (showQueue) { printf("bots: death queue BEFORE: object %08X count %u entries %08X\n", queue, Guest::Read32(base, queue), Guest::Read32(base, queue + 4)); fflush(stdout); }
     __imp__sub_82587268(ctx, base);
-    printf("bots: death queue AFTER: object %08X count %u entries %08X\n", Guest::Read32(base, 0x82A87860), Guest::Read32(base, queue), Guest::Read32(base, queue + 4)); fflush(stdout);
+    if (showQueue) { printf("bots: death queue AFTER: object %08X count %u entries %08X\n", Guest::Read32(base, 0x82A87860), Guest::Read32(base, queue), Guest::Read32(base, queue + 4)); fflush(stdout); }
 }
 
 // 0.5.176: kill-crash evidence. This is the eight-entry native error queue,
@@ -10073,12 +14802,31 @@ PPC_FUNC(sub_8210DCF8)
 {
     const uint32_t queue = ctx.r3.u32, format = ctx.r5.u32, caller = uint32_t(ctx.lr);
     const uint32_t count = Guest::Read32(base, queue), severity = ctx.r4.u32;
-    char message[193] = {};
-    if (format >= 0x40000000u && format < 0xA0000000u)
-        for (size_t i = 0; i < sizeof(message) - 1; ++i) { const uint8_t c = Guest::Read8(base, format + uint32_t(i)); if (!c) break; message[i] = (c >= 32 && c < 127) ? char(c) : ' '; }
-    printf("bots: native error enqueue: object %08X count %u severity %u caller %08X format %08X [%s] args %08X %08X %08X\n", queue, count, severity, caller, format, message, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32); fflush(stdout);
+    // 0.5.436: the first 40, then a count every 10 s. A 0.5.435 internet game
+    // with bots logged "apsMemory : pool is empty" 2700 times a second: 64 MB
+    // of log in 80 s, and the start of the game (the join) was lost.
+    static std::atomic<uint32_t> calls{ 0 }, unshown{ 0 };
+    static std::atomic<uint64_t> shownAt{ 0 };
+    const bool show = calls.fetch_add(1) < 40;
+    if (show)
+    {
+        char message[193] = {};
+        if (format >= 0x40000000u && format < 0xA0000000u)
+            for (size_t i = 0; i < sizeof(message) - 1; ++i) { const uint8_t c = Guest::Read8(base, format + uint32_t(i)); if (!c) break; message[i] = (c >= 32 && c < 127) ? char(c) : ' '; }
+        printf("bots: native error enqueue: object %08X count %u severity %u caller %08X format %08X [%s] args %08X %08X %08X\n", queue, count, severity, caller, format, message, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32); fflush(stdout);
+    }
+    else
+    {
+        unshown.fetch_add(1);
+        const uint64_t now = GetTickCount64();
+        uint64_t last = shownAt.load();
+        if (now - last >= 10000 && shownAt.compare_exchange_strong(last, now))
+        {
+            printf("bots: native error enqueue: %u more not shown (the last: caller %08X format %08X args %08X %08X %08X)\n", unshown.exchange(0), caller, format, ctx.r6.u32, ctx.r7.u32, ctx.r8.u32); fflush(stdout);
+        }
+    }
     __imp__sub_8210DCF8(ctx, base);
-    printf("bots: native error enqueued: count %u entries %08X\n", Guest::Read32(base, queue), Guest::Read32(base, queue + 4)); fflush(stdout);
+    if (show) { printf("bots: native error enqueued: count %u entries %08X\n", Guest::Read32(base, queue), Guest::Read32(base, queue + 4)); fflush(stdout); }
 }
 extern "C" PPC_FUNC(__imp__sub_824309F0);
 PPC_FUNC(sub_824309F0)
@@ -10197,6 +14945,17 @@ bool BotsKitMills(uint8_t* base,uint32_t entity)
     return false;
 }
 
+// 0.5.753: his kit's smokes are World at War's signal flares (bot_kits.txt "flare")
+bool BotsKitFlare(uint8_t* base,uint32_t entity)
+{
+    const uint32_t entities=Guest::Read32(base,EntityList);
+    if(!entity || !entities)return false;
+    for(uint32_t slot=FirstBotSlot();slot<ActiveSlots();++slot)
+        if(g_bot[slot] && g_botLoadoutAssigned[slot] && Guest::Read32(base,entities+4*(slot+1))==entity)
+            return g_botKit[slot].flare;
+    return false;
+}
+
 // 0.5.198: his kit's grenades (-1: the class's own count).
 bool BotsKitGrenades(uint8_t* base,uint32_t entity,int& frags,int& smokes,bool& american)
 {
@@ -10232,6 +14991,17 @@ bool BotsGroundZ(PPCContext& ctx, uint8_t* base, uint32_t ignore, float x, float
     if (!ignore) return false;
     const BotNavigation::Hit hit = BotTrace(ctx, base, ignore, ignore, {x, y, top}, {x, y, top - 12000.0f}, false);
     if (!hit.valid || hit.fraction >= 1.0f) return false;
+    z = hit.end.z;
+    return std::isfinite(z);
+}
+// 0.5.608: the map's sky over x, y: a line up from `from` to the first thing it
+// meets (the sky's brush, or a roof if `from` is under one); false if it starts
+// in something solid or meets nothing within `reach` (the UAV plane's ceiling)
+bool BotsSkyZ(PPCContext& ctx, uint8_t* base, uint32_t ignore, float x, float y, float from, float reach, float& z)
+{
+    if (!ignore) return false;
+    const BotNavigation::Hit hit = BotTrace(ctx, base, ignore, ignore, {x, y, from}, {x, y, from + reach}, false);
+    if (!hit.valid || hit.solid || hit.fraction <= 0.0f || hit.fraction >= 1.0f) return false;
     z = hit.end.z;
     return std::isfinite(z);
 }

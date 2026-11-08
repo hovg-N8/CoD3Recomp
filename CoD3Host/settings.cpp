@@ -155,12 +155,33 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
             else if (key == "texture_filter") v.textureFilter = atoi(value.c_str());
             else if (key == "anisotropy") v.anisotropy = atoi(value.c_str());
             else if (key == "vsync") v.vsync = atoi(value.c_str()) != 0;
+            else if (key == "post_look") v.postLook = std::clamp(atoi(value.c_str()), 0, 6);
+            else if (key == "film_smooth") v.filmSmooth = atoi(value.c_str()) != 0;
+            else if (key == "film_sharpen") v.filmSharpen = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_exposure") v.postExposure = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_shadows") v.postShadows = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_clarity") v.postClarity = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_surface") v.postSurface = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_look_night") v.postLookNight = std::clamp(atoi(value.c_str()), 0, 2);
+            else if (key == "post_occlusion") v.postOcclusion = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "fill_screen") v.fillScreen = atoi(value.c_str()) != 0;
+            else if (key == "shadow_detail") v.shadowDetail = std::clamp(atoi(value.c_str()), 1, 4);
+            else if (key == "film_remastered") v.filmRemastered = atoi(value.c_str()) != 0;
+            else if (key == "film_shadows") v.filmShadows = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "film_clean") v.filmClean = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_sharpen") v.postSharpen = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_bloom") v.postBloom = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_saturation") v.postSaturation = std::clamp(atoi(value.c_str()), 0, 200);
+            else if (key == "post_contrast") v.postContrast = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_vignette") v.postVignette = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_grain") v.postGrain = std::clamp(atoi(value.c_str()), 0, 100);
+            else if (key == "post_warmth") v.postWarmth = std::clamp(atoi(value.c_str()), -50, 50);
             else if (key == "unlock_frame_rate") v.unlockFrameRate = atoi(value.c_str()) != 0;
             else if (key == "frame_cap") v.frameCap = std::clamp(atoi(value.c_str()), 0, 1000);
             else if (key == "antialiasing") v.antialiasing = atoi(value.c_str());
             else if (key == "texture_quality") v.textureQuality = atoi(value.c_str());
             else if (key == "fov") v.fov = atoi(value.c_str());
-            else if (key == "brightness") v.brightness = std::clamp(atoi(value.c_str()), 50, 150);
+            else if (key == "brightness") v.brightness = std::clamp(atoi(value.c_str()), 50, 200);
             else if (key == "model_detail") v.modelDetail = atoi(value.c_str());
             else if (key == "fog") v.fog = atoi(value.c_str()) != 0;
             else if (key == "draw_distance") v.drawDistance = atoi(value.c_str());
@@ -219,6 +240,8 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
             else if (key == "bounces") v.bounces = atoi(value.c_str()) != 0;
             else if (key == "quick_landing") v.quickLanding = atoi(value.c_str()) != 0;
             else if (key == "quick_sprint") v.quickSprint = atoi(value.c_str()) != 0;
+            else if (key == "unstick") v.unstick = atoi(value.c_str()) != 0;
+            else if (key == "mantle_assist") v.mantleAssist = atoi(value.c_str()) != 0;
             else if (key == "custom_primary") v.customPrimary = atoi(value.c_str());
             else if (key == "active_class") v.activeClass = atoi(value.c_str());
             else if (key == "two_grenades") v.twoGrenades = atoi(value.c_str()) != 0;
@@ -248,6 +271,7 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
             else if (key == "max_players") v.maxPlayers = atoi(value.c_str()) >= 32 ? 32 : 24;
             else if (key == "binoculars") v.binoculars = atoi(value.c_str()) != 0;
             else if (key == "killstreak_artillery") v.killstreakArtillery = atoi(value.c_str()) != 0;
+            else if (key == "return_point") v.returnPoint = atoi(value.c_str()) != 0;   // 0.5.454
             else if (key == "killstreak_kills" || key == "killstreak_artillery_kills") v.killstreakKills = std::clamp(atoi(value.c_str()), 1, 30);
             else if (key == "killstreak_uav_kills") v.killstreakUav = std::clamp(atoi(value.c_str()), 1, 30);
             else if (key == "killstreak_typhoon_kills") v.killstreakTyphoon = std::clamp(atoi(value.c_str()), 1, 30);
@@ -272,15 +296,21 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
                     else if (field == "base") v.classBase[n] = atoi(value.c_str());
                     else if (field == "grenade_type") v.classGrenadeType[n] = atoi(value.c_str());
                     else if (field == "grenades") v.classGrenades[n] = atoi(value.c_str());
+                    else if (field == "special") v.classSpecial[n] = atoi(value.c_str());   // 0.5.739
                 }
             }
             else if (key == "direct_mouse") v.directMouse = atoi(value.c_str()) != 0;
             else if (key == "toggle_sprint") v.toggleSprint = atoi(value.c_str()) != 0;
+            else if (key == "button_prompts") v.buttonPrompts = std::clamp(atoi(value.c_str()), 0, 2);   // 0.5.478
             else if (key == "shell_shock_blur") v.shellShockBlur = atoi(value.c_str()) != 0;
             else if (key == "melee_lunge") v.meleeLunge = atoi(value.c_str()) != 0;
             else if (key == "controller") v.controller = atoi(value.c_str()) != 0;
             else if (key == "player_name") { strncpy(v.playerName, value.c_str(), sizeof(v.playerName) - 1); v.playerName[sizeof(v.playerName) - 1] = 0; }
             else if (key == "lan_address") { strncpy(v.lanAddress, value.c_str(), sizeof(v.lanAddress) - 1); v.lanAddress[sizeof(v.lanAddress) - 1] = 0; }
+            else if (key == "game_port") v.gamePort = atoi(value.c_str());   // 0.5.427
+            else if (key == "public_server") v.publicServer = atoi(value.c_str()) != 0;   // 0.5.427
+            else if (key == "server_name") { strncpy(v.serverName, value.c_str(), sizeof(v.serverName) - 1); v.serverName[sizeof(v.serverName) - 1] = 0; }
+            else if (key == "master_server") { strncpy(v.masterServer, value.c_str(), sizeof(v.masterServer) - 1); v.masterServer[sizeof(v.masterServer) - 1] = 0; }
             else if (key == "system_link_peers") { strncpy(v.systemLinkPeers, value.c_str(), sizeof(v.systemLinkPeers) - 1); v.systemLinkPeers[sizeof(v.systemLinkPeers) - 1] = 0; }
             else if (key == "master_volume") v.masterVolume = atoi(value.c_str());
             else if (key == "native_volume") v.nativeVolume = atoi(value.c_str());
@@ -292,6 +322,7 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
             else if (key == "audio_channels") v.audioChannels = atoi(value.c_str());
             else if (key == "mouse_sensitivity") v.mouseSensitivity = float(atof(value.c_str()));
             else if (key == "raw_mouse") v.rawMouse = atoi(value.c_str()) != 0;
+            else if (key == "hide_cursor") v.hideCursor = atoi(value.c_str()) != 0;   // 0.5.600
             else if (key.compare(0, 4, "key_") == 0)
             {
                 for (int i = 0; i < ActionCount; i++)
@@ -319,11 +350,12 @@ void Settings::Load(const std::filesystem::path& exeDirectory)
     if (v.abilityRecharge < 10 || v.abilityRecharge > 100) v.abilityRecharge = 50;
     for (int i = 0; i < Values::CustomClasses; i++)
     {
-        if (v.classPrimary[i] < 0 || v.classPrimary[i] > 21) v.classPrimary[i] = 0;
-        if (v.classSidearm[i] < 0 || v.classSidearm[i] > 23) v.classSidearm[i] = 0;
+        if (v.classPrimary[i] < 0 || v.classPrimary[i] > 25) v.classPrimary[i] = 0;   // 0.5.681: 23 the flamethrower; 0.5.726: 24 the scoped Mosin; 0.5.810: 25 the dual Colts
+        if (v.classSidearm[i] < 0 || v.classSidearm[i] > 27) v.classSidearm[i] = 0;   // 0.5.810: 27 the dual Colts
         if (v.classBase[i] < 0 || v.classBase[i] > 7) v.classBase[i] = 0;
         if (v.classGrenadeType[i] < 0 || v.classGrenadeType[i] > 4) v.classGrenadeType[i] = 0;
         if (v.classGrenades[i] < 0 || v.classGrenades[i] > 4) v.classGrenades[i] = 0;
+        if (v.classSpecial[i] < 0 || v.classSpecial[i] > 1) v.classSpecial[i] = 0;
         if (!v.className[i][0]) snprintf(v.className[i], sizeof(v.className[i]), "CUSTOM %d", i + 1);
     }
     if (v.windowMode < 0 || v.windowMode > 1) v.windowMode = 0;
@@ -352,7 +384,12 @@ void Settings::Save()
         else snprintf(resolution, sizeof(resolution), "desktop");
         fprintf(file, "[graphics]\nrenderer = %d\nresolution = %s\nresolution_scale = %d\ntexture_filter = %d\nanisotropy = %d\nvsync = %d\nunlock_frame_rate = %d\nframe_cap = %d\nantialiasing = %d\ntexture_quality = %d\nfov = %d\nmodel_detail = %d\naim_depth_of_field = %d\nconsole_depth = %d\nnative_commands = %d\nwatch_writes = %d\nwindow_mode = %d\nfps_overlay = %d\nstats_overlay = %d\n",
             v.renderer, resolution, v.resolutionScale, v.textureFilter, v.anisotropy, v.vsync ? 1 : 0, v.unlockFrameRate ? 1 : 0, v.frameCap, v.antialiasing, v.textureQuality, v.fov, v.modelDetail, v.aimBlur ? 1 : 0, v.consoleDepth ? 1 : 0, v.nativeCommands ? 1 : 0, v.watchWrites ? 1 : 0, v.windowMode, v.fpsOverlay ? 1 : 0, v.statsOverlay ? 1 : 0);
+        fprintf(file, "return_point = %d\n", v.returnPoint ? 1 : 0);   // 0.5.454
         fprintf(file, "brightness = %d\n", v.brightness);
+        fprintf(file, "post_look = %d\npost_sharpen = %d\npost_bloom = %d\npost_saturation = %d\npost_contrast = %d\npost_vignette = %d\npost_grain = %d\npost_warmth = %d\n",
+                v.postLook, v.postSharpen, v.postBloom, v.postSaturation, v.postContrast, v.postVignette, v.postGrain, v.postWarmth);
+        fprintf(file, "post_exposure = %d\npost_shadows = %d\npost_clarity = %d\npost_surface = %d\n", v.postExposure, v.postShadows, v.postClarity, v.postSurface);
+        fprintf(file, "film_smooth = %d\nfilm_sharpen = %d\nfilm_clean = %d\npost_occlusion = %d\nfilm_remastered = %d\nfill_screen = %d\nshadow_detail = %d\npost_look_night = %d\nfilm_shadows = %d\n", v.filmSmooth ? 1 : 0, v.filmSharpen, v.filmClean, v.postOcclusion, v.filmRemastered ? 1 : 0, v.fillScreen ? 1 : 0, v.shadowDetail, v.postLookNight, v.filmShadows);
         fprintf(file, "fog = %d\ndraw_distance = %d\neffects = %d\ndynamic_lights = %d\n", v.fog ? 1 : 0, v.drawDistance, v.effects,
                 v.dynamicLights ? 1 : 0);
         fprintf(file, "sharp_shadows = %d\neffects_resolution = %d\nfoliage_coverage = %d\nfast_shadow_maps = %d\n", v.sharpShadows ? 1 : 0,
@@ -368,8 +405,13 @@ void Settings::Save()
                 v.hdrFlare, v.hdrHueCorrection, v.hdrConeResponse, v.hdrBloom, v.hdrTvRamp, v.hdrFilmUpgrade ? 1 : 0, v.hdrHudMatch ? 1 : 0);
         fprintf(file, "[game]\nplayer_name = %s\nlan_address = %s\nsystem_link_peers = %s\nmaster_volume = %d\naudio_channels = %d\naim_assist = %d\nbounces = %d\ncontroller = %d\nrumble = %d\nstick_deadzone = %d\nmouse_sensitivity = %.2f\nstick_vertical_scale = %d\nraw_mouse = %d\ndirect_mouse = %d\ntoggle_sprint = %d\nshell_shock_blur = %d\nmelee_lunge = %d\n", v.playerName, v.lanAddress, v.systemLinkPeers, v.masterVolume, v.audioChannels, v.aimAssist ? 1 : 0, v.bounces ? 1 : 0, v.controller ? 1 : 0, v.rumble ? 1 : 0, v.stickDeadzone, v.mouseSensitivity, v.stickVerticalScale, v.rawMouse ? 1 : 0, v.directMouse ? 1 : 0, v.toggleSprint ? 1 : 0, v.shellShockBlur ? 1 : 0, v.meleeLunge ? 1 : 0);
         fprintf(file, "max_players = %d\n", v.maxPlayers >= 32 ? 32 : 24);
+        fprintf(file, "button_prompts = %d\n", v.buttonPrompts);   // 0.5.478
+        fprintf(file, "hide_cursor = %d\n", v.hideCursor ? 1 : 0);   // 0.5.600
+        fprintf(file, "game_port = %d\npublic_server = %d\nserver_name = %s\nmaster_server = %s\n", v.gamePort, v.publicServer ? 1 : 0, v.serverName, v.masterServer);   // 0.5.427
         fprintf(file, "quick_landing = %d\nquick_sprint = %d\ncustom_primary = %d\n", v.quickLanding ? 1 : 0, v.quickSprint ? 1 : 0,
                 v.customPrimary);
+        fprintf(file, "unstick = %d\n", v.unstick ? 1 : 0);   // 0.5.541
+        fprintf(file, "mantle_assist = %d\n", v.mantleAssist ? 1 : 0);   // 0.5.738
         fprintf(file, "active_class = %d\ntwo_grenades = %d\nfaster_ads = %d\nfour_secondary = %d\n", v.activeClass, v.twoGrenades ? 1 : 0,
                 v.fasterAds ? 1 : 0, v.fourSecondary ? 1 : 0);
         fprintf(file, "texture_dump = %d\ntexture_replace = %d\n", v.textureDump ? 1 : 0, v.textureReplace ? 1 : 0);
@@ -382,9 +424,9 @@ void Settings::Save()
                 v.adsInAir ? 1 : 0, v.stenReload, v.fg42Reload, v.brenReload, v.g43Reload, v.fg42AdsFov, v.stenAdsFov, v.brenAdsFov, v.enfieldAdsFov);
         fprintf(file, "mg34_no_deploy = %d\n", v.mg34NoDeploy ? 1 : 0);
         for (int i = 0; i < Values::CustomClasses; i++)
-            fprintf(file, "class_%d_name = %s\nclass_%d_primary = %d\nclass_%d_sidearm = %d\nclass_%d_base = %d\nclass_%d_grenade_type = %d\nclass_%d_grenades = %d\n",
+            fprintf(file, "class_%d_name = %s\nclass_%d_primary = %d\nclass_%d_sidearm = %d\nclass_%d_base = %d\nclass_%d_grenade_type = %d\nclass_%d_grenades = %d\nclass_%d_special = %d\n",
                     i + 1, v.className[i], i + 1, v.classPrimary[i], i + 1, v.classSidearm[i], i + 1, v.classBase[i], i + 1,
-                    v.classGrenadeType[i], i + 1, v.classGrenades[i]);
+                    v.classGrenadeType[i], i + 1, v.classGrenades[i], i + 1, v.classSpecial[i]);
         fprintf(file, "[native_options]\n");
         fprintf(file, "native_volume = %d\ncontroller_horizontal = %d\ncontroller_vertical = %d\n",
                 v.nativeVolume, v.controllerHorizontal, v.controllerVertical);

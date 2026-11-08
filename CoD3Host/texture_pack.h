@@ -13,6 +13,7 @@
 // (it samples by the texture's corners, not its texels).
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -45,5 +46,11 @@ namespace TexturePack
 
     // 0.5.234: the map a per-map replacement goes with, lower case, as Load
     // compares it ("" in the menus).
+    // 0.5.653: a PNG file read as RGBA8 (the Webley's texture, render_prompts.cpp).
+    bool ReadPngFile(const std::filesystem::path& file, uint32_t& width, uint32_t& height, std::vector<uint8_t>& rgba);
     std::string CurrentMapKey();
+
+    // 0.5.432: whether that map has its own replacement for this key
+    // (textures\replace\maps\<map>\<key>.png).
+    bool HasMapReplacement(const std::string& key, const std::string& map);
 }

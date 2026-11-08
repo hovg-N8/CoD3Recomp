@@ -25,6 +25,7 @@
 #include "input.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 namespace
@@ -51,7 +52,8 @@ namespace
 extern "C" PPC_FUNC(__imp__sub_8246B138);
 PPC_FUNC(sub_8246B138)
 {
-    if (uint32_t(ctx.lr) == StepDownClipCall && Settings::Get().bounces)
+    static const bool off = getenv("COD3_NOBOUNCE") != nullptr;   // (co-op v40's tests: the game's own clip)
+    if (uint32_t(ctx.lr) == StepDownClipCall && Settings::Get().bounces && !off)
     {
         const uint32_t in = ctx.r3.u32, normalAt = ctx.r4.u32, out = ctx.r5.u32;
         const float v[3] = { ReadFloat(base, in), ReadFloat(base, in + 4), ReadFloat(base, in + 8) };

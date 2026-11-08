@@ -1,0 +1,37 @@
+Call of Duty 3 recompiled - setting up for multiplayer
+=======================================================
+
+This package already has the host's settings in it (CoD3Recomp.ini): the
+campaign guns, binoculars, killstreaks and the rest set the same way, the
+upscaled menu textures, and System Link pointed at the host.
+
+1. Unzip this folder anywhere you like (for example to your Desktop).
+
+2. You need your own copy of the game: the Xbox 360 disc image
+   "Call of Duty 3 (USA, Europe)" (.iso).
+
+3. Double-click CoD3.exe. The first time, it asks for the disc image:
+   pick your .iso and let it install (a few minutes). When the game
+   starts, it is installed - you can close it.
+
+4. Map packs (DLC): open the dlc-tool folder and run UNPACK-DLC.bat
+   (README-DLC.txt there says what it needs).
+
+5. Double-click CoD3MP.exe for multiplayer.
+
+6. Press F11 in the game for the settings. In the Multiplayer tab:
+   - Player name: what the others see (it says Friend - change it).
+   - System Link peers: already the host's address. Leave it unless the
+     host tells you otherwise.
+
+Connecting over the internet (Tailscale)
+----------------------------------------
+Install Tailscale from tailscale.com, sign in, and accept the host's
+invitation (they share their machine with you). Then start CoD3MP.
+
+The host makes the game: Multiplayer > System Link > Create game.
+You: Multiplayer > System Link, and pick the game from the list.
+
+Keys: mouse to aim, WASD to move, E use, F switch weapon / seat,
+B binoculars out, N away, F11 settings, F12 screenshot.
+A controller works too.

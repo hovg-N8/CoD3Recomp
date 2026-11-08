@@ -1,0 +1,36 @@
+Co-op v36 (Team Friend, 2026-10-20), on top of v35. Answers co-op test 7 (Justin hosting 0.5.314, friend joining).
+Only CoD3Host/coop.cpp changed (campaign program only, #ifndef COD3_MP). Diff: coop-v36-vs-v35.diff (72 lines).
+Messages are unchanged from v35, so v36 plays with a 0.5.314 that has v35. The cutscene fix (2) needs v36 on the HOST.
+
+What test 7 showed:
+ a. The joining PC ran 0.5.276 (CoD3.exe of Oct 19), the host 0.5.314. 0.5.276 only knows CWS1/CWG1; v35 sends
+    CWS2/CWG2. The joiner dropped every world part and grenade without a word (no "coop: world at" line in its
+    log): "I saw nothing from his side". The host dropped the joiner's CWG1 grenades too. The joiner's 36-byte
+    CWP1 was still taken, so the host saw the joiner's body walk. NOT a v35 netcode fault: both need one exe.
+ b. The mission ran about 80 s (host log [65s]..[145s]) before the host died and his game relaunched for the retry.
+    The joiner's 0.5.276 counted 1 shot in that time, so 1 shot was shown on the host.
+ c. Host death: his game came back at a checkpoint with no film. The joiner followed him into the mission (the
+    count in CWL1 went up, so "spmap") from its start, film included, and that film only ends on the host's CWF1,
+    which is sent when the host's own film ends. He had none, so the joining player sat in an unskippable film.
+
+What v36 does:
+ 1. Host: a joining copy that sends a CWP1 that is not 44 bytes, or a 28-byte CWG1, is an older build. Logged once
+    ("coop: players: the joining copy runs an older co-op build ...: both PCs need the same CoD3.exe") and an
+    on-screen notice every 30 s. (The joiner already warned about an older host, CWS1, in v35.)
+ 2. Host: while in a mission and alive, CWF1 (his film is over) with his count is sent every second. A joining copy
+    that starts again after the host's death or retry leaves its film at once. A film at a mission's start is not
+    affected: the host sends nothing until his own player is in.
+ 3. Joiner: after 15 s of film the joining player's own A ends it (logged "coop: film: skipped here (no word from
+    the host after N s)"). A safety net, so a lost CWF1 can never leave him stuck again. The notice says so.
+ 4. DIAGNOSTIC, off unless COD3_COOP_SHOTLOG=1: the weapon time (+52), buttons (+1352), pad trigger, +48 and +56
+    whenever one changes ("coop: shotlog").
+
+Shot detection checked (with 4), not changed: solo Forest, 0.05-0.4 s trigger taps: every shot counted (0->300).
+Solo Chambois with taps, aiming plus taps, and 1.5 s holds: 116 of 116 shots counted (0->150). The only rises not
+counted are 500/600/850/1000 (reload steps), as intended.
+
+Tested: two copies on one PC (Forest, 0.5.314 + v36, joiner 40 s after the host): film held for the joining copy,
+then over on both; "coop: world at" every 5 s, soldiers 1-36 units apart on average; the joiner's 6 shots shown on
+the host ("body: fired" x6); grenades thrown both ways ("in the air"). No "older co-op build" line (same exe).
+UNTESTED: a host death between two PCs (2 and 3), and the host's relaunch for a retry or the next mission (still open;
+the host's coop-relaunch.log of test 7 stops right after each relaunch, so it shows nothing of why).

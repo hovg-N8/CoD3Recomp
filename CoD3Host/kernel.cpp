@@ -1,5 +1,6 @@
 #include "log.h"
 #include "kernel.h"
+#include "net.h"   // 0.5.428: PublicShutdown
 #include "write_watch.h"
 #include <unordered_map>
 #include "scheduler.h"
@@ -1029,6 +1030,7 @@ void Kernel::Exit(int code)
         fflush(stdout);
         (void)getchar();
     }
+    Net::PublicShutdown();   // 0.5.428: off the public list first
     Log::Finish();
     ExitProcess(static_cast<UINT>(code));
 }

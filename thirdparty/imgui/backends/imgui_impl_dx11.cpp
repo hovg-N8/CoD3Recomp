@@ -84,6 +84,10 @@ static ImGui_ImplDX11_Data* ImGui_ImplDX11_GetBackendData()
     return ImGui::GetCurrentContext() ? (ImGui_ImplDX11_Data*)ImGui::GetIO().BackendRendererUserData : nullptr;
 }
 
+// CoD3 port (0.5.718): a depth-stencil state used instead of the backend's own
+// when set (the flamethrower's flame drawn only where the gun is not: overlay.cpp)
+ID3D11DepthStencilState* g_ImGuiDX11DepthStencilOverride = nullptr;
+
 // Functions
 static void ImGui_ImplDX11_SetupRenderState(ImDrawData* draw_data, ID3D11DeviceContext* device_ctx)
 {
@@ -138,7 +142,7 @@ static void ImGui_ImplDX11_SetupRenderState(ImDrawData* draw_data, ID3D11DeviceC
     // Setup render state
     const float blend_factor[4] = { 0.f, 0.f, 0.f, 0.f };
     device_ctx->OMSetBlendState(bd->pBlendState, blend_factor, 0xffffffff);
-    device_ctx->OMSetDepthStencilState(bd->pDepthStencilState, 0);
+    device_ctx->OMSetDepthStencilState(g_ImGuiDX11DepthStencilOverride ? g_ImGuiDX11DepthStencilOverride : bd->pDepthStencilState, 0);
     device_ctx->RSSetState(bd->pRasterizerState);
 }
 

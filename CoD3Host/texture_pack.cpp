@@ -570,3 +570,13 @@ bool TexturePack::Load(const std::string& key, ID3D11Device* device, ID3D11Devic
 }
 
 std::string TexturePack::CurrentMapKey() { return MapKey(); }
+bool TexturePack::ReadPngFile(const std::filesystem::path& file, uint32_t& width, uint32_t& height, std::vector<uint8_t>& rgba) { return ReadPng(file, width, height, rgba); }
+
+bool TexturePack::HasMapReplacement(const std::string& key, const std::string& map)
+{
+    if (key.empty() || map.empty() || !Settings::Get().textureReplace) return false;
+    std::lock_guard<std::mutex> lock(g_lock);
+    Scan();
+    const auto keys = g_mapReplacements.find(map);
+    return keys != g_mapReplacements.end() && keys->second.find(key) != keys->second.end();
+}

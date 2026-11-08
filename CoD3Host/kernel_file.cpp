@@ -6,6 +6,7 @@
 // the executable instead, so nothing ever modifies the installed copy.
 
 #include "kernel.h"
+#include "film_hd.h"
 #include "write_watch.h"
 #include <vector>
 #include "scheduler.h"
@@ -425,6 +426,8 @@ PPC_FUNC(__imp__NtCreateFile)
             return;
         }
         hostPath = found;
+        // A film: its remastered frames, if it has any (film_hd.cpp).
+        if (LooksLikeFilm(guestPath)) FilmHd::Opened(hostPath);
     }
     else
     {

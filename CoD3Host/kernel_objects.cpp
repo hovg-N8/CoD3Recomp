@@ -888,7 +888,23 @@ PPC_FUNC(__imp__NtWaitForSingleObjectEx)
         if (infinite)
         {
             if (Kernel::WaitDispatcherOn(lock, keys, keyCount, std::chrono::steady_clock::now() + std::chrono::seconds(3)) == std::cv_status::timeout)
+            {
                 ReportStalledWait("handle", handle, uint32_t(ctx.lr), SignalState(*object));
+                // 0.5.470: a mutant with no owner that does not read as free (its
+                // state is read from its body in guest memory, its owner kept
+                // here) can never be taken: 0.5.469's CTF on Rouen froze for good
+                // loading, the main thread and a worker on mutant 0x104, "free"
+                // (no owner) and not signalled. A mutant is free exactly when it
+                // has no owner: put right, and the waiter takes it from the top.
+                Object* again = Find(handle);
+                if (again != nullptr && again->type == ObjectType::Mutant && again->owner == 0 && SignalState(*again) <= 0)
+                {
+                    SetSignalState(*again, 1);
+                    again->recursion = 0;
+                    static int told = 0;
+                    if (told++ < 40) { printf("mutant repaired: 0x%08X had no owner and did not read as free (waited 3 s, from 0x%08X)\n", handle, uint32_t(ctx.lr)); fflush(stdout); }
+                }
+            }
         }
         else if (Kernel::WaitDispatcherOn(lock, keys, keyCount, deadline) == std::cv_status::timeout)
         {

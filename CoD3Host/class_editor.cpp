@@ -5,7 +5,8 @@
 //
 // What a custom class gives at one's own spawns (mp_fixes.cpp's kit hooks):
 // the base class (whose ability, items and grenade count the kit follows),
-// the main weapon, the sidearm, the grenades' kind and how many. The game's
+// the main weapon, the sidearm, the grenades' kind and how many, and the
+// special grenade (0.5.739: the smoke or World at War's signal flare). The game's
 // own kit menu still picks a class too; with a base class set, the custom
 // one's wins.
 
@@ -37,15 +38,16 @@ namespace
 
     const char* const Weapons[] = { "CLASS WEAPON", "M1 GARAND", "THOMPSON", "BAR", "SPRINGFIELD (SCOPED)", ".30 CAL MG", "BAZOOKA",
                                     "TRENCH GUN", "KAR98K", "MP40", "STG 44", "KAR98K (SCOPED)", "MG34", "PANZERSCHRECK",
-                                    "LEE-ENFIELD", "BREN", "STEN", "FG42", "FG42 (SCOPED)", "GEWEHR 43", "MG42", "LEE-ENFIELD (SCOPED)" };
+                                    "LEE-ENFIELD", "BREN", "STEN", "FG42", "FG42 (SCOPED)", "GEWEHR 43", "MG42", "LEE-ENFIELD (SCOPED)", "WEBLEY", "M2 FLAMETHROWER", "MOSIN-NAGANT (SCOPED)", "COLT .45 DUAL" };   // 0.5.653, 0.5.681, 0.5.726
     const char* const Bases[] = { "AS PICKED", "HEAVY ASSAULT", "LIGHT ASSAULT", "RIFLEMAN", "MEDIC", "SUPPORT", "ANTI-ARMOR", "SCOUT" };
     const char* const Sidearms[] = { "SIDE'S OWN", "COLT .45", "P38", "M1 GARAND", "THOMPSON", "BAR", "SPRINGFIELD (SCOPED)",
                                      ".30 CAL MG", "BAZOOKA", "TRENCH GUN", "KAR98K", "MP40", "STG 44", "KAR98K (SCOPED)", "MG34",
-                                     "PANZERSCHRECK", "LEE-ENFIELD", "BREN", "STEN", "FG42", "FG42 (SCOPED)", "GEWEHR 43", "MG42", "LEE-ENFIELD (SCOPED)" };
+                                     "PANZERSCHRECK", "LEE-ENFIELD", "BREN", "STEN", "FG42", "FG42 (SCOPED)", "GEWEHR 43", "MG42", "LEE-ENFIELD (SCOPED)", "WEBLEY", "M2 FLAMETHROWER", "MOSIN-NAGANT (SCOPED)", "COLT .45 DUAL" };   // 0.5.653, 0.5.681, 0.5.726
     const char* const GrenadeTypes[] = { "SIDE'S OWN", "FRAG (US)", "STICK (GERMAN)", "MILLS BOMB (BRITISH)", "STICKY BOMB (BRITISH)" };
     const char* const GrenadeCounts[] = { "USUAL", "1", "2", "3", "4" };
+    const char* const Specials[] = { "SMOKE", "SIGNAL FLARE (WAW)" };   // 0.5.739
 
-    enum Row { RowClass, RowBase, RowPrimary, RowSidearm, RowGrenadeType, RowGrenades, RowCount };
+    enum Row { RowClass, RowBase, RowPrimary, RowSidearm, RowGrenadeType, RowGrenades, RowSpecial, RowCount };
 
     int Wrap(int value, int count) { return (value % count + count) % count; }
 
@@ -61,6 +63,7 @@ namespace
             else if (g_row == RowSidearm) v.classSidearm[slot] = Wrap(v.classSidearm[slot] + step, int(sizeof(Sidearms) / sizeof(Sidearms[0])));
             else if (g_row == RowGrenadeType) v.classGrenadeType[slot] = Wrap(v.classGrenadeType[slot] + step, 5);
             else if (g_row == RowGrenades) v.classGrenades[slot] = Wrap(v.classGrenades[slot] + step, 5);
+            else if (g_row == RowSpecial) v.classSpecial[slot] = Wrap(v.classSpecial[slot] + step, 2);
         }
         Settings::Set(v);
     }
@@ -104,8 +107,9 @@ namespace
             values[RowSidearm] = Sidearms[v.classSidearm[slot] >= 0 && v.classSidearm[slot] < int(sizeof(Sidearms) / sizeof(Sidearms[0])) ? v.classSidearm[slot] : 0];
             values[RowGrenadeType] = GrenadeTypes[v.classGrenadeType[slot]];
             values[RowGrenades] = GrenadeCounts[v.classGrenades[slot]];
+            values[RowSpecial] = Specials[v.classSpecial[slot] == 1 ? 1 : 0];
         }
-        static const char* const labels[RowCount] = { "CLASS", "BASE CLASS", "MAIN WEAPON", "SECOND WEAPON", "GRENADE", "GRENADES" };
+        static const char* const labels[RowCount] = { "CLASS", "BASE CLASS", "MAIN WEAPON", "SECOND WEAPON", "GRENADE", "GRENADES", "SPECIAL" };
         for (int row = 0; row < RowCount; row++)
         {
             const float y = at.y + rowHeight * (row + 1.3f);

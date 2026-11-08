@@ -6,9 +6,12 @@
 
 #include "heap_trace.h"
 #include "kernel.h"
+#include "render.h"
 
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
+#include <cstring>
 
 // --- a destructor that runs twice ------------------------------------------------------------------
 //
@@ -55,6 +58,56 @@ PPC_FUNC(sub_823F04B0)
     HeapTrace::Destroying(ctx, base);
     __imp__sub_823F04B0(ctx, base);
 }
+
+// --- the view made for the screen's shape (a PC addition) -------------------------------------------
+//
+// The player's view setup stores, last, its field of view across and up and
+// down in degrees, in the client game's array of local players: campaign
+// sub_82443A98 at cg + 4464 / +4468 (cg 0x82A98D90, 5840 bytes a player, so
+// 0x82A99F00 for the first), multiplayer sub_8245CDC0 at cg + 4944 / +4948
+// (cg 0x82C7D290, 6368 a player); the player the view is for is the word
+// each reads first (0x82A2A1C8, 0x82BCBE9C). Found by their values (cg_fov
+// 65 gives 80.69 by 51.08), a write watch, and the same code in both. The
+// title makes the one across for 16:9 from the one up and down. Filling a
+// screen of another shape (render_d3d11.cpp), the one across is made again
+// for that shape from the one up and down, so the title itself draws, and
+// culls, the wider (or narrower) view, aiming and scopes included; the
+// renderer draws it into a target of the screen's shape.
+namespace
+{
+    void FovForScreen(uint8_t* base, uint32_t cg, uint32_t across, uint32_t players, uint32_t stride, uint32_t playerWord)
+    {
+        const float aspect = Render::FillAspect();
+        if (aspect <= 0.0f) return;
+        const uint32_t player = Guest::Read32(base, playerWord);
+        if (player >= players) return;
+        const uint32_t at = cg + across + player * stride;
+        auto readFloat = [&](uint32_t a) { const uint32_t v = Guest::Read32(base, a); float f; memcpy(&f, &v, 4); return f; };
+        const float upDown = readFloat(at + 4);
+        if (!(upDown > 1.0f && upDown < 170.0f)) return;
+        const float rad = 3.14159265f / 180.0f;
+        const float wide = 2.0f * std::atan(std::tan(upDown * 0.5f * rad) * aspect) / rad;
+        uint32_t v;
+        memcpy(&v, &wide, 4);
+        Guest::Write32(base, at, v);
+    }
+}
+
+#ifdef COD3_MP
+extern "C" PPC_FUNC(__imp__sub_8245CDC0);
+PPC_FUNC(sub_8245CDC0)
+{
+    __imp__sub_8245CDC0(ctx, base);
+    FovForScreen(base, 0x82C7D290u, 4944, 4, 6368, 0x82BCBE9Cu);
+}
+#else
+extern "C" PPC_FUNC(__imp__sub_82443A98);
+PPC_FUNC(sub_82443A98)
+{
+    __imp__sub_82443A98(ctx, base);
+    FovForScreen(base, 0x82A98D90u, 4464, 4, 5840, 0x82A2A1C8u);
+}
+#endif
 
 #ifndef COD3_MP   // missions and their films are single player's
 // --- the mission's film, skippable once the level has loaded (a PC addition) ---------------------

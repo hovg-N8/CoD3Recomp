@@ -202,6 +202,7 @@ namespace RenderState
         ID3D11Texture2D* colorTexture = nullptr;   // for the frame log's dump
         ID3D11Texture2D* depthTexture = nullptr;
         uint32_t targetCount = 0;
+        uint32_t samples = 1;          // the targets' samples a pixel
         uint32_t targetWidth = 0, targetHeight = 0;   // the viewport
         int32_t scissor[4] = {};       // left, top, right, bottom, host pixels
 
@@ -294,6 +295,14 @@ namespace RenderState
         uint8_t clearStencilValue = 0;
 
         bool bindingsLost = false;
+
+        // The scene's depth resolved whole (once a frame, after the solid
+        // world): the ambient occlusion drawn into its colour target first
+        // (render_post.cpp), from `source`. Reversed: the world's depth test
+        // is greater, its depth 1 near.
+        bool occlusion = false;
+        ID3D11RenderTargetView* occlusionTarget = nullptr;
+        bool depthReversed = false;
 
         // A depth copy also written into the title's memory, as the
         // console's resolve would (debug.txt depth_writeback): the tiled

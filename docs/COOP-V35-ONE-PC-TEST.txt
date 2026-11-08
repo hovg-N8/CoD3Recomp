@@ -1,0 +1,25 @@
+Co-op v35 one-PC test (Team Friend, 2026-10-20). Two copies of CoD3.exe (0.5.313 source + v35
+coop.cpp) on one PC (8 threads, RTX 2080 Ti), Forest, host started first, joiner 40 s later
+(COD3_SPINWAIT=0), host's mission by COD3_COOP_MAP through the lobby, scripted pads, ~9 min.
+UNTESTED between two PCs.
+
+Joiner, "coop: world at" every 5 s once in the mission (last run):
+  living soldiers 4-12 units from the host's on average, worst 22-80 (old logs: 2000-5000, worst
+  20000+); clock delay 103-110 ms, jitter 3-7 ms (localhost); 1 soldier put in place outright
+  (snap) in 5 minutes; 6 host deaths mirrored ("killed, as the host's was"); 6 soldiers made from
+  matching spawners for host soldiers with no partner; joiner's own extra soldiers let go: 8.
+  Story soldiers (Dixon, medic, Guzzo, Huxley) all paired, none hidden.
+  Grenades: the joiner's frag and smoke thrown on the host by the stand-in ("in the air", try 1);
+  the host's soldiers' grenades thrown on the joiner ("in the air", try 1); the stand-in's own
+  grenade hit him once: not sent. Sprint: on, out of breath after 4 s, back.
+  Remaining log noise: "spawner N made nobody" for one ally whose spawner was used up (3 tries).
+
+Bugs found and fixed in the earlier runs of the same day (all in the package's coop.cpp):
+  - the 800-unit pairing limit hid the story's own soldiers: they now pair at any distance and are
+    never hidden or let go;
+  - the scripts' delete leaves a living soldier be (the same ones were "let go" again and again):
+    he is now kept below the level until paired;
+  - a grenade thrown for the other copy could be seen as a new throw and sent back: never now.
+One-PC only: two copies starved each other to 0 fps at the menu (black screens) unless
+COD3_SPINWAIT=0 and the joiner started later; once the host also starved with that, so the last
+runs pinned the host to CPUs 0-3 and the joiner to 4-7. Not a two-PC problem.

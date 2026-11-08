@@ -56,6 +56,12 @@ namespace RenderResources
     // size, as the title has them, or at full size. Applied at the frame's edge.
     void RequestEffectsScale(double scale);   // 1 the title's half size, 1.5, 2 the frame's size
     float Scale();
+    // The width drawn wider than the height's scale by this much (the
+    // screen's shape over the frame's, render_d3d11.cpp's fill), 1 none.
+    void RequestWiden(float widen);
+    // The shadow maps (the title's square, power of two targets: its sun's
+    // 512 by 512) drawn this many times finer again, 1 .. 4.
+    void RequestShadowDetail(uint32_t times);
     // The MSAA samples the targets of a pitch are made with.
     uint32_t TargetSamples(uint32_t pitch);
 

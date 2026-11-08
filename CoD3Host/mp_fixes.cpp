@@ -13,6 +13,9 @@
 #include "tactical_point_input.h"
 #include "overlay.h"
 #include "render.h"
+#include "audio_out.h"   // 0.5.653: the Webley's CoD2 sounds
+#include "flamethrower.h" // 0.5.681: World at War's flamethrower
+#include "flare.h"        // 0.5.739: World at War's signal flare
 #include "render_stats.h"
 #include "render_commands.h"
 #include "render_commands.h"
@@ -37,6 +40,7 @@
 #include <vector>
 #include <string>
 #include <set>
+#include <sstream>
 #include <mutex>
 #include <chrono>
 #include <cmath>
@@ -416,6 +420,99 @@ PPC_FUNC(sub_8248ED40)
     Guest::Write32(base, record + 48, uint32_t(quick));
     static int said = 0;
     if ((said < 20 && said++ < 20)) { printf("moves: landing stun %d ms cut to %d\n", stun, quick); fflush(stdout); }
+}
+
+// 0.5.729: mantling on converted maps. World at War lets a player climb
+// ledges and low walls (19 to 60 units) where its map has mantle helper
+// brushes; CoD3 steps 18 units at most, so on Seelow players and bots stuck
+// at trench lips and walls WaW climbs. custom\mantle\<map>.txt (tools/waw/
+// seelow_mantle.py: WaW's own 292 helpers on Seelow) lists those volumes;
+// PM_StepSlideMove (sub_824A87E0) reads its step height (18) from
+// 0x82682774, and for a player whose feet are at one of the volumes it reads
+// WaW's mantle height for the length of that call. A map with no file (every
+// CoD3 map, Carentan) moves as before.
+namespace
+{
+    struct MantleBox { float lo[3], hi[3]; };
+    std::vector<MantleBox> g_mantle;
+    std::string g_mantleMap = "?";
+    std::mutex g_mantleLock;
+    constexpr uint32_t StepHeight = 0x82682774;
+    // 0.5.736: up to each helper's own height (its top over its foot, 20 to
+    // 127 on Seelow), not 62 for all: 51 of WaW's 292 are taller (trench
+    // walls 63 and 65 at 2700-2850 1440-1510, where the user jumped about a
+    // trench for 15 s). MantleHeight is now the most a helper may lift.
+    constexpr float MantleHeight = 130.0f, MantleReach = 32.0f, ConvertedStep = 28.0f;
+    void LoadMantle(const std::string& map)
+    {
+        g_mantleMap = map;
+        g_mantle.clear();
+        if (map.empty()) return;
+        char path[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        std::string file(path);
+        file = file.substr(0, file.find_last_of("\\/") + 1) + "custom\\mantle\\" + map + ".txt";
+        if (FILE* f = fopen(file.c_str(), "rb"))
+        {
+            char line[200]; size_t count = 0;
+            if (fgets(line, sizeof(line), f) && sscanf(line, "CoD3 mantle 1 %zu", &count) == 1)
+                while (g_mantle.size() < 4096 && fgets(line, sizeof(line), f))
+                {
+                    MantleBox b;
+                    if (sscanf(line, "%f %f %f %f %f %f", &b.lo[0], &b.lo[1], &b.lo[2], &b.hi[0], &b.hi[1], &b.hi[2]) == 6)
+                        g_mantle.push_back(b);
+                }
+            fclose(f);
+            printf("moves: %zu mantle volumes for %s\n", g_mantle.size(), map.c_str()); fflush(stdout);
+        }
+    }
+    // The feet within reach of a volume (sideways), at or below its top and
+    // no further than the most a helper lifts under it (a helper's own box
+    // stops short of the floor: the trench's ends 36 above it): the step that
+    // climbs it (its top over the feet, a little more), or 0 for none.
+    float AtMantle(const float* feet)
+    {
+        float step = 0.0f;
+        for (const MantleBox& b : g_mantle)
+            if (feet[0] > b.lo[0] - MantleReach && feet[0] < b.hi[0] + MantleReach &&
+                feet[1] > b.lo[1] - MantleReach && feet[1] < b.hi[1] + MantleReach &&
+                feet[2] < b.hi[2] + 1.0f && feet[2] > b.hi[2] - MantleHeight)
+                step = std::max(step, std::max(18.0f, b.hi[2] - feet[2] + 2.0f));
+        return step;
+    }
+}
+bool BotsIsBotRecord(uint8_t* base, uint32_t record);   // bots.cpp (0.5.738)
+extern "C" PPC_FUNC(__imp__sub_824A87E0);
+PPC_FUNC(sub_824A87E0)
+{
+    const std::string& map = Kernel::CurrentMap();
+    if (map != g_mantleMap) LoadMantle(map);
+    if (g_mantle.empty()) { __imp__sub_824A87E0(ctx, base); return; }
+    const uint32_t move = Guest::Read32(base, 0x82B922C8);
+    const uint32_t record = move ? Guest::Read32(base, move) : 0;
+    auto fl = [&](uint32_t at) { const uint32_t b = Guest::Read32(base, at); float f; memcpy(&f, &b, 4); return f; };
+    float feet[3] = {};
+    if (record) for (int i = 0; i < 3; i++) feet[i] = fl(record + 4 * i);
+    // 0.5.737: on these maps every step is up to ConvertedStep, not 18: WaW's
+    // terrain is lumpier than any CoD3 map's (bank feet, rubble, trench lips
+    // of 19-46 units) and the user, with the collision proven WaW's own spot
+    // by spot, still snagged "on invisible things" all over Seelow.
+    // 0.5.738: the mantle assist for bots always (they cannot choose to jump
+    // and crouch through a window), for players only with Mantle assist on
+    // (off by default: the user would rather jump and crouch himself).
+    const bool assist = record && (Settings::Get().mantleAssist || BotsIsBotRecord(base, record));
+    const float mantle = assist ? AtMantle(feet) : 0.0f;
+    const float step = std::max(mantle, record ? ConvertedStep : 0.0f);
+    if (step <= 0.0f) { __imp__sub_824A87E0(ctx, base); return; }
+    std::lock_guard<std::mutex> hold(g_mantleLock);
+    const uint32_t before = Guest::Read32(base, StepHeight);
+    uint32_t bits; memcpy(&bits, &step, 4);
+    Guest::Write32(base, StepHeight, bits);
+    __imp__sub_824A87E0(ctx, base);
+    Guest::Write32(base, StepHeight, before);
+    const float after = fl(record + 8);
+    static int said = 0;
+    if (mantle > ConvertedStep && after - feet[2] > ConvertedStep + 0.5f && said < 40) { said++; printf("moves: mantle at %.0f %.0f %.0f, up %.0f\n", feet[0], feet[1], feet[2], after - feet[2]); fflush(stdout); }
 }
 
 // Sprint: the player's stamina is the float at +1168 of his record (1 full),
@@ -885,6 +982,7 @@ void MpFixesFrame(uint8_t* base)
 const char* BotsSecondaryName(uint8_t* base,uint32_t entity);   // bots.cpp (0.5.284)
 bool BotsKitSticky(uint8_t* base,uint32_t entity);
 bool BotsKitMills(uint8_t* base,uint32_t entity);   // bots.cpp (0.5.329: Rusher 2)
+bool BotsKitFlare(uint8_t* base,uint32_t entity);   // bots.cpp (0.5.753: bot_kits.txt "flare")
 extern "C" PPC_FUNC(__imp__sub_82206028);
 extern "C" PPC_FUNC(__imp__sub_821E6118);
 extern "C" PPC_FUNC(__imp__sub_821E61A8);
@@ -906,10 +1004,28 @@ namespace
     bool g_launcherDue = false;      // the launcher still to give, after his kit
     bool g_binocularsDue = false;    // and the binoculars
     std::vector<uint32_t> g_binocularsOthers;   // the other players (and bots) whose kits this machine gave: binoculars for them too
+    std::vector<uint32_t> g_flareDue;           // 0.5.739: those whose smoke becomes World at War's signal flare, after their kit (SmokeToFlare)
+    // 0.5.739: our custom class's special grenade is the signal flare
+    bool OwnFlare()
+    {
+        const Settings::Values v = Settings::Get();
+        const int slot = v.activeClass - 1;
+        return slot >= 0 && slot < Settings::Values::CustomClasses && v.classSpecial[slot] == 1;
+    }
+    // and every bot's (COD3_BOT_FLARES=1: tests; 0.5.752: =2, every other bot's,
+    // by his script handle, to set flare throws beside smoke ones)
+    bool BotFlares(uint32_t handle)
+    {
+        static const int mode = getenv("COD3_BOT_FLARES") ? atoi(getenv("COD3_BOT_FLARES")) : 0;
+        return mode == 1 || (mode == 2 && (handle & 1));
+    }
     uint32_t g_ownHandle = 0;   // this machine's player's script handle, from his last kit
     const char* const CustomWeapons[] = { "", "m1garand", "thompson", "bar", "springfield", "mg30cal", "bazooka", "shotgun",
                                           "kar98", "mp40", "mp44", "kar98_sniper", "mg34", "panzerschreck",
-                                          "lee_enfield", "bren", "sten", "fg42", "fg42_scoped", "gewehr43", "mg42", "lee_enfield_sniper" };
+                                          "lee_enfield", "bren", "sten", "fg42", "fg42_scoped", "gewehr43", "mg42", "lee_enfield_sniper", "webley",   // 0.5.653: the Webley
+                                          "flamethrower",   // 0.5.681: World at War's M2
+                                          "mosin_scoped",     // 0.5.726: CoD2's scoped Mosin-Nagant
+                                          "colt_dual" };      // 0.5.809: two Colts, one in each hand
     // (The campaign's Sten and MG42 have models in the multiplayer archives
     // but no weapon file a map loads: given one, a player gets nothing.)
 
@@ -1032,6 +1148,7 @@ PPC_FUNC(sub_82206028)
         if ((giveFrag || giveSmoke) && g_botGifts.size() < 64) g_botGifts.push_back({ handle, g_botFrags, g_botSmokes, g_ownAmericanBot, giveFrag, giveSmoke });
         g_botSpawn = false;
     }
+    if ((g_ownSpawn ? OwnFlare() : (BotFlares(handle) || BotsKitFlare(base, entity))) && g_flareDue.size() < 64) g_flareDue.push_back(handle);   // 0.5.739; 0.5.753 a bot kit's
     if (g_ownSpawn && Settings::Get().launcher) g_launcherDue = true;
     if (g_ownSpawn && Settings::Get().binoculars) g_binocularsDue = true;
     else if (!g_ownSpawn && Settings::Get().binoculars && g_binocularsOthers.size() < 64) g_binocularsOthers.push_back(handle);
@@ -1189,9 +1306,49 @@ namespace
         Guest::Write32(base, name, 0);
         call.r3.u64 = name; call.r4.u64 = 0x82074D80; call.lr = 0;   // "special"
         Guest::Lookup(0x821E0E48)(call, base);
+        // 0.5.501: the player's clips (+688) and spares (+320) kept, and any
+        // the "special" call changed that is not a mine's or a rifle
+        // grenade's put back (user: a medic's MG42 and FG42 fired 4-5 rounds
+        // and had to reload: with no rifle grenade in his kit the 4 landed on
+        // his gun; the MG42's clip and spare are one pool, #14)
+        uint32_t ps = 0;
+        if (const uint32_t entities = Guest::Read32(base, 0x82BCC7FC))
+            for (uint32_t o = 0; o < 32 && !ps; o++)
+            {
+                const uint32_t e = Guest::Read32(base, entities + 4 * (o + 1));
+                if (e && Guest::Read32(base, e + 484) == handle) ps = Guest::Read32(base, e + 512);
+            }
+        uint32_t clips[128] = {}, spares[128] = {};
+        if (ps) for (int k = 0; k < 128; k++) { clips[k] = Guest::Read32(base, ps + 688 + 4 * k); spares[k] = Guest::Read32(base, ps + 320 + 4 * k); }
         call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
         call.r3.u64 = handle; call.r4.u64 = name; call.r5.u64 = uint32_t(want); call.lr = 0;
         Guest::Lookup(setSpare)(call, base);
+        if (ps)
+        {
+            // the mines' and rifle grenades' pools, by name
+            bool special[128] = {};
+            const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+            const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+            for (int32_t k = 1; list && k <= count && k < 128; k++)
+            {
+                const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+                if (!def) continue;
+                const std::string n = ReadText(base, Guest::Read32(base, def + 8), 32);
+                if (n.find("mine") == std::string::npos && !(n.size() > 3 && n.compare(n.size() - 3, 3, "_rg") == 0)) continue;
+                const uint32_t c = Guest::Read32(base, def + 1468), a = Guest::Read32(base, def + 1460);
+                if (c < 128) special[c] = true;
+                if (a < 128) special[a] = true;
+            }
+            for (int k = 0; k < 128; k++)
+            {
+                if (special[k]) continue;
+                if (Guest::Read32(base, ps + 688 + 4 * k) != clips[k]) { printf("class: %s: the special's 4 hit clip #%d (%u -> %u): put back\n", what, k, clips[k], Guest::Read32(base, ps + 688 + 4 * k)); Guest::Write32(base, ps + 688 + 4 * k, clips[k]); }
+                // 0.5.502: clips only: 501 also put back spares #116-118, which
+                // ARE the specials' (the 4 mines and rifle grenades went to 2)
+                (void)spares;
+            }
+            fflush(stdout);
+        }
         call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
         call.r3.u64 = name; call.lr = 0;
         Guest::Lookup(0x821DD938)(call, base);
@@ -1312,6 +1469,11 @@ namespace
     }
 }
 
+// 0.5.540: this machine's player's side from his last kit (American = side 1,
+// the bots' own rule), 0 before his first kit: bots.cpp's CTF code read his
+// entity's team (+520 -> +4) as 2 while he was on 1 (user: "i kept spawning
+// near the enemy flag")
+int MpFixesOwnSide() { return g_ownHandle ? (g_ownAmerican ? 1 : 2) : 0; }
 bool MpFixesStreakArmed(uint32_t handle);
 void MpFixesAbilities(PPCContext& ctx, uint8_t* base)
 {
@@ -1443,6 +1605,14 @@ PPC_FUNC(sub_82580E38)
 
 void MpFixesCampaignGuns(PPCContext& ctx, uint8_t* base);
 void MpFixesMg42View(uint8_t* base, uint32_t held);
+void MpFixesWebleyView(uint8_t* base, uint32_t held, uint32_t ps);   // 0.5.653 (0.5.676: ps, for the rounds left)
+void MpFixesDualView(uint8_t* base, uint32_t held);                 // 0.5.809 (below the Webley's)
+void MpFixesDualReloadBegan(uint8_t* base, bool empty);              // 0.5.811
+void MpFixesFlameView(uint8_t* base, uint32_t held, uint32_t ps);    // 0.5.681
+void MpFixesMosinView(uint8_t* base, uint32_t held);    // 0.5.726
+std::string MosinShotFile();    // 0.5.726: custom\mosin\nagant_sniper.wav (below)
+namespace { std::string WebleyDir(); }   // 0.5.653: custom\webley beside the game (below)
+static void SetOwnIconSource(const char* name, const std::string& from);   // 0.5.696: OwnIcon (below)
 namespace { std::string ReadText(uint8_t* base, uint32_t at, size_t most); }
 extern bool g_mortarRoundArms;   // 0.5.310 (below)
 
@@ -1493,6 +1663,227 @@ namespace
 {
     bool g_binocularsOut = false;
     constexpr const char* Binoculars = "mp_binoculars_nospot";
+}
+
+// 0.5.739: World at War's signal flare (flare.cpp; the weapon is Guns'
+// "signal_flare", the smoke grenade's copy). SmokeToFlare: a player's smoke
+// becomes it after his kit: the flare given (his weapon slots put back, as
+// with the binoculars), the smoke's rounds put on it (+4*(172 + clip), the
+// clip's number at the weapon's +1468; its spare +4*(80 + n), n at +1460)
+// and the smoke taken (its bit cleared in his 64-bit weapons mask, state
+// +1056). The smoke key's throw names a smoke-class grenade he owns, so the
+// flare goes. Nothing where the copy was not made (a map's 63 weapons full).
+// The first three log every word of his state holding the smoke's number
+// before (an offhand choice, should the flare not be the one thrown).
+float BotsFlameTrace(PPCContext& ctx, uint8_t* base, uint32_t ignored, const float from[3], const float to[3]);   // bots.cpp (0.5.703)
+void MpFixesFlareModelTest(PPCContext& ctx, uint8_t* base);   // below (0.5.742)
+void MpFixesFollowFlare(uint32_t id, uint32_t entity, const float at[3], uint32_t thrower);   // below (0.5.746)
+bool BotsThisMachineHostsBots(uint8_t* base);   // bots.cpp (0.5.275)
+int BotsSideOf(uint8_t* base, uint32_t entity);   // bots.cpp (0.5.285)
+void MpFixesFlareRest(PPCContext& ctx, uint8_t* base, uint32_t entity, const float at[3]);   // below (0.5.749)
+namespace
+{
+    void SmokeToFlare(PPCContext& ctx, uint8_t* base, uint32_t handle)
+    {
+        const uint32_t entity = Guest::Read32(base, 0x82BD1FC0 + 8 * (handle & 0x3FFF));
+        const uint32_t ps = entity ? Guest::Read32(base, entity + 512) : 0;
+        if (ps < 0x40000000u || ps >= 0x90000000u) return;
+        const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+        const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+        auto owned = [&](uint32_t w) { return ((Guest::Read32(base, ps + 1056 + 4 * (w >> 5)) >> (w & 31)) & 1) != 0; };
+        uint32_t flare = 0, smoke = 0;
+        for (int32_t k = 1; list && k <= count && k < 64; k++)
+        {
+            const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+            if (!def) continue;
+            const std::string n = ReadText(base, Guest::Read32(base, def + 8), 32);
+            if (n == "signal_flare") flare = uint32_t(k);
+            else if ((n == "smokegrenade" || n == "smokegrenade_axis") && owned(uint32_t(k))) smoke = uint32_t(k);
+        }
+        static int told = 0;
+        if (!flare || !smoke)
+        {
+            if (told < 20) { told++; printf("flare: handle %08X keeps his smoke (%s)\n", handle, !flare ? "no signal_flare on this map" : "he has no smoke"); fflush(stdout); }
+            return;
+        }
+        const uint32_t sdef = Guest::Read32(base, list + 4 * smoke), fdef = Guest::Read32(base, list + 4 * flare);
+        const uint32_t sclip = Guest::Read32(base, sdef + 1468), fclip = Guest::Read32(base, fdef + 1468);
+        const uint32_t sspare = Guest::Read32(base, sdef + 1460), fspare = Guest::Read32(base, fdef + 1460);
+        if (sclip >= 128 || fclip >= 128 || sspare >= 128 || fspare >= 128) return;
+        const uint32_t rounds = Guest::Read32(base, ps + 4 * (172 + sclip)), spare = Guest::Read32(base, ps + 4 * (80 + sspare));
+        if (told < 3)
+        {
+            std::string at;
+            for (uint32_t o = 0; o < 2000; o += 4)
+                if (Guest::Read32(base, ps + o) == smoke || Guest::Read8(base, ps + o) == smoke) { char one[24]; snprintf(one, sizeof(one), " +%u=%08X", o, Guest::Read32(base, ps + o)); at += one; }
+            printf("flare: handle %08X's state words holding the smoke's number %u:%s\n", handle, smoke, at.substr(0, 600).c_str());
+        }
+        uint8_t slots[10];
+        for (int i = 0; i < 10; i++) slots[i] = Guest::Read8(base, ps + 1064 + i);
+        OnWeaponFor(ctx, base, handle, 2664, "signal_flare");
+        // (0.5.740: the slot that held the smoke holds the flare: 0.5.739's log
+        // had the smoke's number in slot 4, +1068. Its +240 too, 24, but that is
+        // flags (0x10 or 0x18 on every player in 740's log), not a weapon:
+        // 740 wrote the flare's 48 there, 0.5.741 leaves it)
+        for (int i = 0; i < 10; i++)
+        {
+            const uint8_t want = slots[i] == smoke ? uint8_t(flare) : slots[i];
+            if (Guest::Read8(base, ps + 1064 + i) != want) Guest::Write8(base, ps + 1064 + i, want);
+        }
+        const bool given = owned(flare);
+        if (!given) Guest::Write32(base, ps + 1056 + 4 * (flare >> 5), Guest::Read32(base, ps + 1056 + 4 * (flare >> 5)) | (1u << (flare & 31)));
+        if (fclip != sclip) Guest::Write32(base, ps + 4 * (172 + sclip), 0);
+        if (fspare != sspare) Guest::Write32(base, ps + 4 * (80 + sspare), 0);
+        Guest::Write32(base, ps + 4 * (172 + fclip), rounds);
+        Guest::Write32(base, ps + 4 * (80 + fspare), spare);
+        Guest::Write32(base, ps + 1056 + 4 * (smoke >> 5), Guest::Read32(base, ps + 1056 + 4 * (smoke >> 5)) & ~(1u << (smoke & 31)));
+        // 0.5.756: and the class special's smoke (mp_smokegrenade_special, the
+        // same pool) if he has it: one smoke-kind left, the flare
+        for (int32_t k = 1; list && k <= count && k < 64; k++)
+        {
+            const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+            if (def && owned(uint32_t(k)) && ReadText(base, Guest::Read32(base, def + 8), 32) == "mp_smokegrenade_special")
+                Guest::Write32(base, ps + 1056 + 4 * (uint32_t(k) >> 5), Guest::Read32(base, ps + 1056 + 4 * (uint32_t(k) >> 5)) & ~(1u << (uint32_t(k) & 31)));
+        }
+        if (told < 40)
+        {
+            told++;
+            printf("flare: handle %08X: smoke (weapon %u, clip %u, spare %u: %u + %u) -> signal flare (weapon %u, clip %u, spare %u%s); smoke %s, flare %s\n", handle, smoke, sclip, sspare,
+                   rounds, spare, flare, fclip, fspare, given ? "" : ", its bit set by hand", owned(smoke) ? "STILL OWNED" : "taken",
+                   owned(flare) ? "owned" : "NOT OWNED");
+            fflush(stdout);
+        }
+    }
+
+    // 0.5.746: each thrown flare's grenade (its entity, +336 its place),
+    // followed until it lies still (0.5 s without moving), 4 s at most, or
+    // the entity jumps (used again by something else)
+    struct Followed { uint32_t entity; float last[3]; uint64_t since, stillSince; };
+    std::map<uint32_t, Followed> g_followed;   // by the flare's id
+    std::map<uint32_t, uint32_t> g_flareThrower;   // 0.5.753: by the flare's id, its thrower's entity (0: not known)
+
+    // 0.5.753: a burning flare burns who stands on it (the user: "slight
+    // burning damage if it comes into contact or if someone steps on it";
+    // World at War's own does none). Every 0.5 s, a living player whose feet
+    // are within 28 units of it across and 40 up or down takes 4 (8 a
+    // second), its thrower's (his own too); the thrower's side is spared.
+    // The game's G_Damage (sub_825862F8, as the hellfire's), means 14 (no
+    // shell shock), on the host alone (it runs every player's game).
+    // COD3_FLARE_BURN=n: n a tick (0: none).
+    void FlareBurn(PPCContext& ctx, uint8_t* base)
+    {
+        static const int burn = getenv("COD3_FLARE_BURN") ? atoi(getenv("COD3_FLARE_BURN")) : 4;
+        if (burn <= 0 || !BotsThisMachineHostsBots(base)) return;
+        static uint64_t next = 0;
+        const uint64_t now = GetTickCount64();
+        if (now < next) return;
+        next = now + 500;
+        const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+        if (!list) return;
+        static uint32_t point = 0;
+        if (!point) point = Guest::AllocatePhysical(0x20);
+        auto readF = [&](uint32_t at) { const uint32_t w = Guest::Read32(base, at); float v; memcpy(&v, &w, 4); return v; };
+        const int n = Flare::Count();
+        for (int k = 0; k < n; k++)
+        {
+            float at[3];
+            uint32_t id = 0;
+            if (!Flare::At(k, at, id) || !Flare::Lit(id)) continue;
+            const auto owner = g_flareThrower.find(id);
+            const uint32_t thrower = owner != g_flareThrower.end() ? owner->second : 0;
+            const int side = thrower ? BotsSideOf(base, thrower) : 0;
+            for (uint32_t i = 0; i < MpCapClients; i++)
+            {
+                const uint32_t e = Guest::Read32(base, list + 4 * (i + 1));
+                if (e < 0x40000000u || e >= 0xA0000000u || int32_t(Guest::Read32(base, e + 776)) <= 0) continue;
+                const float dx = readF(e + 336) - at[0], dy = readF(e + 340) - at[1], dz = readF(e + 344) - at[2];
+                if (!std::isfinite(dx) || dx * dx + dy * dy > 28.0f * 28.0f || fabsf(dz) > 40.0f) continue;
+                if (thrower && e != thrower && side != 0 && BotsSideOf(base, e) == side) continue;
+                const uint32_t attacker = thrower ? thrower : e;
+                for (int c = 0; c < 3; c++) { uint32_t w; memcpy(&w, &at[c], 4); Guest::Write32(base, point + 4 * uint32_t(c), w); }
+                PPCContext call = ctx;
+                call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+                Guest::Write32(base, call.r1.u32 + 84, 0);
+                Guest::Write32(base, call.r1.u32 + 92, 0xFFFFFFFFu);
+                call.r3.u64 = e; call.r4.u64 = attacker; call.r5.u64 = attacker; call.r6.u64 = 0; call.r7.u64 = point;
+                // (0.5.755: means 14, the mortar's: damage, no shell shock (the hellfire's
+                // notes); 753-754's means 0 took nothing: "100 -> 100" with god off)
+                call.r8.u64 = uint32_t(burn); call.r9.u64 = 0; call.r10.u64 = 14; call.lr = 0;
+                const int32_t before = int32_t(Guest::Read32(base, e + 776));
+                Guest::Lookup(0x825862F8)(call, base);
+                static int told = 0;
+                if (told < 40) { told++; printf("flare: %u burns player %u (%d -> %d health)%s\n", id, i, before, int32_t(Guest::Read32(base, e + 776)), e == thrower ? " (its thrower)" : ""); fflush(stdout); }
+            }
+        }
+    }
+    void FollowFlares(PPCContext& ctx, uint8_t* base)
+    {
+        const uint64_t now = GetTickCount64();
+        auto readF = [&](uint32_t at) { const uint32_t w = Guest::Read32(base, at); float v; memcpy(&v, &w, 4); return v; };
+        for (auto it = g_followed.begin(); it != g_followed.end();)
+        {
+            Followed& f = it->second;
+            const float at[3] = { readF(f.entity + 336), readF(f.entity + 340), readF(f.entity + 344) };
+            const float dx = at[0] - f.last[0], dy = at[1] - f.last[1], dz = at[2] - f.last[2];
+            const float moved = sqrtf(dx * dx + dy * dy + dz * dz);
+            const bool sane = std::isfinite(at[0]) && std::isfinite(at[1]) && std::isfinite(at[2]) && moved < 300.0f;
+            if (sane) { Flare::MoveTo(it->first, at); if (moved > 0.5f) f.stillSince = now; for (int k = 0; k < 3; k++) f.last[k] = at[k]; }
+            if (!sane || now - f.stillSince > 500 || now - f.since > 4000)
+            {
+                static int told = 0;
+                if (told < 20) { told++; printf("flare: %u came to rest at %.0f %.0f %.0f (%s)\n", it->first, f.last[0], f.last[1], f.last[2], !sane ? "its entity jumped" : now - f.since > 4000 ? "4 s" : "still"); fflush(stdout); }
+                if (sane) MpFixesFlareRest(ctx, base, f.entity, f.last);   // 0.5.749
+                it = g_followed.erase(it);
+            }
+            else ++it;
+        }
+    }
+
+    // Each burning flare: does our eye see it (no wall between)? World at
+    // War's script asks every 0.3 s; the M2's wall trace, to its head (5 up).
+    void FlareSight(PPCContext& ctx, uint8_t* base)
+    {
+        FollowFlares(ctx, base);
+        FlareBurn(ctx, base);   // 0.5.753
+        const int n = Flare::Count();
+        if (n <= 0) return;
+        static std::map<uint32_t, uint64_t> last;
+        const uint64_t now = GetTickCount64();
+        float eye[3];
+        if (!Flame::Eye(eye)) return;
+        const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
+        const uint32_t own = entities ? Guest::Read32(base, entities + 4) : 0;
+        for (int i = 0; i < n; i++)
+        {
+            float at[3];
+            uint32_t id = 0;
+            if (!Flare::At(i, at, id)) break;
+            uint64_t& when = last[id];
+            if (now - when < 300) continue;
+            when = now;
+            const float head[3] = { at[0], at[1], at[2] + 5.0f };
+            const float d = sqrtf((head[0] - eye[0]) * (head[0] - eye[0]) + (head[1] - eye[1]) * (head[1] - eye[1]) + (head[2] - eye[2]) * (head[2] - eye[2]));
+            // (0.5.750: or its light over it; 0.5.751: 20 or 40 over it, a line that
+            // stops within its last tenth counted (the light spills round a lip):
+            // 749-750's went dark as they rolled into the train shed's track bed, z 3
+            // below the floor's 11.7, a rail's lip in the line from eye height)
+            const float above[3] = { at[0], at[1], at[2] + 20.0f }, higher[3] = { at[0], at[1], at[2] + 40.0f };
+            const bool seen = d < 6000.0f && (BotsFlameTrace(ctx, base, own, eye, head) > 0.97f || BotsFlameTrace(ctx, base, own, eye, above) > 0.9f ||
+                                              BotsFlameTrace(ctx, base, own, eye, higher) > 0.9f);
+            Flare::Seen(id, seen);
+            static int told = 0;
+            if (told < 30) { told++; printf("flare: %u %s from our eye (%.0f away)\n", id, seen ? "seen" : "hidden", d); fflush(stdout); }
+        }
+        if (last.size() > 64) last.clear();
+    }
+}
+
+void MpFixesFollowFlare(uint32_t id, uint32_t entity, const float at[3], uint32_t thrower)
+{
+    if (!id || g_followed.size() > 32) return;
+    g_followed[id] = Followed{ entity, { at[0], at[1], at[2] }, GetTickCount64(), GetTickCount64() };
+    if (g_flareThrower.size() > 64) g_flareThrower.clear();
+    g_flareThrower[id] = thrower;
 }
 
 bool MpFixesOwnStrikeReady();
@@ -1598,6 +1989,11 @@ void MpFixesBinoculars(PPCContext& ctx, uint8_t* base)
         }
     }
     g_botGifts.clear();
+    // 0.5.739: World at War's signal flare in the smoke's place (after the bots' gifts: theirs may be one)
+    for (const uint32_t handle : g_flareDue) SmokeToFlare(ctx, base, handle);
+    g_flareDue.clear();
+    FlareSight(ctx, base);
+    MpFixesFlareModelTest(ctx, base);   // 0.5.742 (tests)
     // Whether they are out is read from the weapon in hand (+164 of the
     // player's state) each frame, never kept apart from it: the binoculars'
     // weapon number found by name, as the script's give finds it (the
@@ -1964,6 +2360,7 @@ void MpFixesUavFrame()
 // host's game runs every player's); the mover's path goes to the joiners
 // with the entity. Shooting it down: 0.5.254 (Build B).
 bool MpFixesStukaFound(PPCContext& ctx, uint8_t* base);   // 0.5.271 (below)
+bool BotsSkyZ(PPCContext& ctx, uint8_t* base, uint32_t ignore, float x, float y, float from, float reach, float& z);   // 0.5.608 (bots.cpp): the plane's ceiling
 namespace
 {
     struct UavPlane
@@ -1975,8 +2372,10 @@ namespace
         uint64_t until = 0;       // the UAV's end (circling)
         uint64_t next = 0;        // the next mover step
         float cx = 0, cy = 0, cz = 0, radius = 2000, angle = 0;
+        float squash = 1.0f;      // 0.5.718: an oval, its y radius over its x radius (radius)
         float dist = 1e9f;        // 0.5.259: its distance from the host's player
         float ground = 0;         // 0.5.260: the highest player's height when it was called
+        float flyZ = 0;           // 0.5.608: its height now (under the sky, BotsSkyZ); 0 not yet
     };
     UavPlane g_uavPlanes[2];      // by side: [0] side 1 (Axis), [1] side 2 (Allies)
     // 0.5.257: the ground the players have covered on this map (sampled every
@@ -1999,7 +2398,7 @@ namespace
     std::atomic<uint64_t> g_planeSoundQueued{0};   // 0.5.266: when queued (no event in 300 ms: played from the frame)
     std::atomic<bool> g_planeSoundDirect{false};   // 0.5.266: plane_sound ... now: from the frame at once
     std::string g_uavPlaneMap;
-    struct UavPlaneAsk { int side = 0; int seconds = 0; float cx = 0, cy = 0, cz = 0, radius = 0; float angle = -1.0f; bool remote = false; };
+    struct UavPlaneAsk { int side = 0; int seconds = 0; float cx = 0, cy = 0, cz = 0, radius = 0; float angle = -1.0f; bool remote = false; float squash = 1.0f; };   // (squash, 0.5.718: the oval's y over x)
     std::mutex g_uavPlaneLock;
     std::vector<UavPlaneAsk> g_uavPlaneAsks;
     constexpr float kPlaneYawOffset = 0.0f;   // the model's nose against +X (tune from a screenshot)
@@ -2093,6 +2492,91 @@ namespace
         fflush(stdout);
         return handle;
     }
+}
+
+// 0.5.749: a thrown flare come to rest. Its grenade is the smoke's copy, and
+// the smoke's cloud comes when the grenade's own fuse runs out (about 5 s
+// after the throw in 748's test; no event of ours sees it, and its weapon's
+// +1936 was not it): the grenade is sunk 30000 under the map at once (every
+// copy of its place in its entity: its origin, +336, and its trajectory's),
+// so its cloud is made where nobody sees it, and World at War's flare stick
+// (w_signal_flare_WORLD, a script_model) lies where it was, turned as it
+// lay. Six sticks are kept a map and used again in turn (a burnt one lies
+// till then). COD3_FLARE_KEEP_GRENADE=1: as 746 (the grenade left, smoking).
+void MpFixesFlareRest(PPCContext& ctx, uint8_t* base, uint32_t entity, const float at[3])
+{
+    if (getenv("COD3_FLARE_KEEP_GRENADE") || entity < 0x40000000u || entity >= 0xA0000000u) return;
+    const float angles[3] = { PlaneReadF(base, entity + 352), PlaneReadF(base, entity + 356), PlaneReadF(base, entity + 360) };
+    // the grenade under the map: every float triple in its entity that is its place
+    std::string moved;
+    for (uint32_t o = 0; o + 12 <= 0x400; o += 4)
+    {
+        const float x = PlaneReadF(base, entity + o), y = PlaneReadF(base, entity + o + 4), z = PlaneReadF(base, entity + o + 8);
+        if (fabsf(x - at[0]) < 1.0f && fabsf(y - at[1]) < 1.0f && fabsf(z - at[2]) < 1.0f)
+        {
+            PlaneWriteF(base, entity + o + 8, at[2] - 30000.0f);
+            char one[16]; snprintf(one, sizeof one, " +%u", o); moved += one;
+            o += 8;
+        }
+    }
+    // the stick in its place: the next of six (made the first time; a new map's are new)
+    static uint32_t sticks[6] = {}, map[6] = {};
+    static int next = 0;
+    const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+    const int slot = next++ % 6;
+    uint32_t& stick = sticks[slot];
+    if (map[slot] != list || !stick || !PlaneEntity(base, stick))
+    {
+        stick = PlaneSpawn(ctx, base, 0, at[0], at[1], at[2], "w_signal_flare_WORLD");
+        map[slot] = list;
+    }
+    else PlaneMoveTo(ctx, base, stick, at[0], at[1], at[2], 0.05f);
+    if (stick) PlaneRotateTo(ctx, base, stick, angles[0], angles[1], angles[2], 0.05f);
+    static int told = 0;
+    if (told < 20) { told++; printf("flare: its grenade sunk under the map (its place at%s), the stick %08X lies at %.0f %.0f %.0f (angles %.0f %.0f %.0f)\n",
+                                    moved.empty() ? " NONE FOUND" : moved.c_str(), stick, at[0], at[1], at[2], angles[0], angles[1], angles[2]); fflush(stdout); }
+}
+
+// 0.5.742: COD3_FLARE_MODEL_TEST="x y z": the signal flare's world model
+// (World at War's flare stick, FlareWorldModel) stood there as a script_model,
+// the American smoke's 20 units along y beside it, once a map, 4 s after the
+// view is drawn (a throw cannot be scripted; screenshots)
+void MpFixesFlareModelTest(PPCContext& ctx, uint8_t* base)
+{
+    // 0.5.744: COD3_FLARE_THROW_TEST="20 40": the left bumper (the special
+    // grenade: a pad's 0x0100 threw 740's flare) held that many seconds
+    // after the view is first drawn: a throw for the tests (COD3_PAD's presses
+    // keep the test from joining a side). 0.5.745: held 0.3 s, a throw (744's
+    // 1.5 s cooked it off in the hand: the fuse is 1 s); COD3_FLARE_THROW_HOLD=s
+    {
+        static std::vector<double> throws;
+        static const bool on = []() { const char* t = getenv("COD3_FLARE_THROW_TEST"); if (!t) return false; for (char* e = nullptr; *t; t = e) { const double v = strtod(t, &e); if (e == t) break; throws.push_back(v); } return !throws.empty(); }();
+        static std::chrono::steady_clock::time_point since{};
+        static bool started = false;
+        float eye[3];
+        if (on && Flame::Eye(eye))
+        {
+            if (!started) { started = true; since = std::chrono::steady_clock::now(); }
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+            static const double hold = getenv("COD3_FLARE_THROW_HOLD") ? atof(getenv("COD3_FLARE_THROW_HOLD")) : 0.3;
+            for (const double t : throws)
+                if (now >= t && now < t + hold) { Input::PressButton("ls"); static double told = -1; if (told != t) { told = t; printf("flare: test throw (left bumper) at %.0f s\n", t); fflush(stdout); } }
+        }
+    }
+    static float at[3];
+    static const bool on = []() { const char* t = getenv("COD3_FLARE_MODEL_TEST"); return t && sscanf(t, "%f %f %f", &at[0], &at[1], &at[2]) == 3; }();
+    if (!on) return;
+    static uint32_t map = 0;
+    static uint64_t since = 0;
+    const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+    float eye[3];
+    if (!list || !Flame::Eye(eye)) { since = 0; return; }
+    const uint64_t now = GetTickCount64();
+    if (!since) since = now;
+    if (map == list || now - since < 4000) return;
+    map = list;
+    PlaneSpawn(ctx, base, 0, at[0], at[1], at[2], "w_signal_flare_WORLD");
+    PlaneSpawn(ctx, base, 0, at[0], at[1] + 20.0f, at[2], "w_us_smoke_grenade_WORLD");
 }
 
 // 0.5.267: plane_model <name> [clear] in the console: that model made as a
@@ -2276,6 +2760,161 @@ namespace
     }
 }
 
+// 0.5.811: the dual Colts' left muzzle flash: the Colt's own flash (its event
+// 1, as a projectile's effect is played: on a script_origin of our own) at the
+// left gun's muzzle: from the eye, ahead, down and to the left by the right
+// gun's muzzle's place mirrored (COD3_DUAL_FLASH="ahead right up", default
+// 34 11 -7; the right one moved out with the spread). Facing where he looks.
+void MpFixesDualFlash(PPCContext& ctx, uint8_t* base, uint32_t own)
+{
+    const uint32_t ps = Guest::Read32(base, own + 512);
+    if (ps < 0x40000000u || ps >= 0xA0000000u) return;
+    static float ahead = 34.0f, right = 11.0f, up = -7.0f;
+    static bool parsed = false;
+    if (!parsed) { parsed = true; if (const char* t = getenv("COD3_DUAL_FLASH")) sscanf(t, "%f %f %f", &ahead, &right, &up); }
+    const float pitch = PlaneReadF(base, ps + 204), yaw = PlaneReadF(base, ps + 208);
+    const float eye = PlaneReadF(base, ps + 8) + (PlaneReadF(base, ps + 220) > 0.0f ? PlaneReadF(base, ps + 220) : 60.0f);
+    constexpr float Rad = 3.14159265f / 180.0f;
+    const float cp = cosf(pitch * Rad), sp = sinf(pitch * Rad), cy = cosf(yaw * Rad), sy = sinf(yaw * Rad);
+    const float fwd[3] = { cp * cy, cp * sy, -sp };
+    const float rgt[3] = { sy, -cy, 0.0f };
+    const float upv[3] = { sp * cy, sp * sy, cp };
+    const float side = -(right * 1.25f);   // the left gun, a little further out with the spread
+    float at[3];
+    for (int k = 0; k < 3; k++) at[k] = (k == 2 ? eye : PlaneReadF(base, ps + 4 * uint32_t(k))) + fwd[k] * ahead + rgt[k] * side + upv[k] * up;
+    static uint32_t handle = 0;
+    if (!handle || !PlaneEntity(base, handle)) handle = PlaneSpawnOrigin(ctx, base, at[0], at[1], at[2]);
+    const uint32_t ent = handle ? PlaneEntity(base, handle) : 0;
+    if (!ent) return;
+    PlaneWriteF(base, ent + 336, at[0]); PlaneWriteF(base, ent + 340, at[1]); PlaneWriteF(base, ent + 344, at[2]);
+    PlaneWriteF(base, ent + 352, pitch); PlaneWriteF(base, ent + 356, yaw); PlaneWriteF(base, ent + 360, 0.0f);
+    static uint32_t name = 0;
+    if (!name) { name = Guest::AllocatePhysical(0x10); memset(base + name, 0, 0x10); memcpy(base + name, "colt", 4); }
+    PPCContext call = ctx;
+    call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+    const uint32_t out = call.r1.u32 + 0x200;
+    Guest::Write32(base, out, 0);
+    call.r3.u64 = out; call.r4.u64 = ent; call.r5.u64 = name; call.r6.u64 = 1; call.r7.u64 = 0; call.r8.u64 = 0; call.lr = 0;
+    Guest::Lookup(0x82556180)(call, base);
+    static int told = 0;
+    if (told < 6) { told++; printf("dual colts: the left gun's flash at %.0f %.0f %.0f\n", at[0], at[1], at[2]); fflush(stdout); }
+}
+
+// 0.5.634: the killcam's explosions (user: "i dont see explosions in the bots
+// killcams"). A projectile's explosion is in no entity the killcam puts back:
+// the server plays it once, as its weapon's event 56 (sub_82556180 from
+// sub_82583310 at 825836A4; 630's play log: "weapons: event 56 for k98_rg",
+// stickygrenade, smokegrenade_axis). bots.cpp's Killcam keeps those calls
+// (BotsKillcamNoteEvent, from the sub_82556180 wrapper) and plays them again
+// here at their place and angles, each on one of 8 script_origins in turn (an
+// effect may stay on its entity: a smoke's cloud must not jump to the next).
+static bool g_killcamFxPlaying = false;
+void MpFixesKillcamFx(PPCContext& ctx, uint8_t* base, const float* at, const float* angles, const char* weapon, uint32_t event)
+{
+    static uint32_t handles[8] = {};
+    static int next = 0;
+    uint32_t& handle = handles[next];
+    next = (next + 1) % 8;
+    if (!handle || !PlaneEntity(base, handle)) handle = PlaneSpawnOrigin(ctx, base, at[0], at[1], at[2]);
+    const uint32_t ent = handle ? PlaneEntity(base, handle) : 0;
+    if (!ent) return;
+    static std::map<std::string, uint32_t> names;
+    uint32_t& name = names[weapon];
+    if (!name)
+    {
+        name = Guest::AllocatePhysical(0x40);
+        memset(base + name, 0, 0x40);
+        memcpy(base + name, weapon, std::min<size_t>(strlen(weapon), 0x3F));
+    }
+    PlaneWriteF(base, ent + 336, at[0]); PlaneWriteF(base, ent + 340, at[1]); PlaneWriteF(base, ent + 344, at[2]);
+    PlaneWriteF(base, ent + 352, angles[0]); PlaneWriteF(base, ent + 356, angles[1]); PlaneWriteF(base, ent + 360, angles[2]);
+    PPCContext call = ctx;
+    call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+    const uint32_t out = call.r1.u32 + 0x200;
+    Guest::Write32(base, out, 0);
+    call.r3.u64 = out; call.r4.u64 = ent; call.r5.u64 = name; call.r6.u64 = event; call.r7.u64 = 0; call.r8.u64 = 0; call.lr = 0;
+    g_killcamFxPlaying = true;
+    Guest::Lookup(0x82556180)(call, base);
+    g_killcamFxPlaying = false;
+}
+
+// 0.5.780: a cue played the way the game plays one itself (sub_824AFD70, as
+// sub_823AFFE0: r3 out, r4 the sound system *0x82BCBF80, r5 the cue's name,
+// r6 0, r7 1, r8 0, r9/r10 16-byte vectors, f1-f4 the constant at 0x825DA49C):
+// 778's tank shots played so were heard. at null: not placed.
+void MpFixesPlayCue(PPCContext& ctx, uint8_t* base, const char* cue, const float* at)
+{
+    static std::map<std::string, uint32_t> names;
+    uint32_t& name = names[cue];
+    if (!name) { name = Guest::AllocatePhysical(0x40); memset(base + name, 0, 0x40); memcpy(base + name, cue, std::min<size_t>(strlen(cue), 0x3F)); }
+    const uint32_t system = Guest::Read32(base, 0x82BCBF80);
+    if (!system) return;
+    PPCContext call = ctx;
+    call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+    const uint32_t out = call.r1.u32 + 0x200, vel = call.r1.u32 + 0x220, pos = call.r1.u32 + 0x240;
+    Guest::Write32(base, out, 0);
+    for (int k = 0; k < 4; k++) { PlaneWriteF(base, vel + 4 * k, 0.0f); PlaneWriteF(base, pos + 4 * k, at && k < 3 ? at[k] : 0.0f); }
+    const float gain = PlaneReadF(base, 0x825DA49C);
+    call.r3.u64 = out; call.r4.u64 = system; call.r5.u64 = name; call.r6.u64 = 0; call.r7.u64 = 1; call.r8.u64 = 0;
+    call.r9.u64 = vel; call.r10.u64 = pos;
+    call.f1.f64 = call.f2.f64 = call.f3.f64 = call.f4.f64 = double(gain);
+    call.lr = 0;
+    Guest::Lookup(0x824AFD70)(call, base);
+}
+
+// 0.5.780: a tank shell's explosion, Merville's own (projexplode_<turret>_dirt:
+// tank_dirt's effect), made where the shell hit: a named event (sub_82556868,
+// as the Hellfire's explosions are, seen) on one of our own script_origins, made
+// from Merville's table (sub_82554BA0, 779), and its sound Merville's cue
+// SHELL_EXPLO_DIRT_TANK at that place (sounds on a script_origin are not heard,
+// 259/260). From the frame, not inside the game's projectile code; each origin
+// put 60000 under the map 6 s after (the Hellfire's way).
+namespace
+{
+    struct TankBlast { float at[3]; std::string event; };
+    std::mutex g_tankBlastLock;
+    std::vector<TankBlast> g_tankBlasts;
+}
+void MpFixesQueueTankBlast(const float* at, const char* event)
+{
+    std::lock_guard<std::mutex> guard(g_tankBlastLock);
+    if (g_tankBlasts.size() < 16) g_tankBlasts.push_back({ { at[0], at[1], at[2] }, event });
+}
+void MpFixesTankBlastsFrame(PPCContext& ctx, uint8_t* base)
+{
+    std::vector<TankBlast> due;
+    {
+        std::lock_guard<std::mutex> guard(g_tankBlastLock);
+        due.swap(g_tankBlasts);
+    }
+    struct Slot { uint32_t handle = 0; uint64_t parkAt = 0; };
+    static Slot slots[6];
+    static int next = 0;
+    static std::string map;
+    if (map != Kernel::CurrentMap()) { map = Kernel::CurrentMap(); for (Slot& s : slots) s = Slot{}; }
+    const uint64_t now = GetTickCount64();
+    for (Slot& s : slots)
+        if (s.parkAt && now >= s.parkAt)
+        {
+            if (const uint32_t ent = s.handle ? PlaneEntity(base, s.handle) : 0) PlaneWriteF(base, ent + 344, -60000.0f);
+            s.parkAt = 0;
+        }
+    for (const TankBlast& b : due)
+    {
+        Slot& s = slots[next];
+        next = (next + 1) % 6;
+        if (!s.handle || !PlaneEntity(base, s.handle)) s.handle = PlaneSpawnOrigin(ctx, base, b.at[0], b.at[1], b.at[2]);
+        const uint32_t ent = s.handle ? PlaneEntity(base, s.handle) : 0;
+        if (!ent) continue;
+        PlaneWriteF(base, ent + 336, b.at[0]); PlaneWriteF(base, ent + 340, b.at[1]); PlaneWriteF(base, ent + 344, b.at[2]);
+        PlaneSound(ctx, base, ent, b.event.c_str());
+        MpFixesPlayCue(ctx, base, "SHELL_EXPLO_DIRT_TANK", b.at);
+        s.parkAt = now + 6000;
+        static int said = 0;
+        if (said < 20) { said++; printf("vehicles: a tank shell's explosion: Merville's %s at %.0f %.0f %.0f (and SHELL_EXPLO_DIRT_TANK)\n", b.event.c_str(), b.at[0], b.at[1], b.at[2]); fflush(stdout); }
+    }
+}
+
 bool BotsIsBotEntity(uint8_t* base, uint32_t entity);   // bots.cpp (0.5.275)
 void BotsLearnKill(uint8_t* base, uint32_t attacker, uint32_t victim);   // bots.cpp (0.5.282): lookouts
 void MpFixesSendPlaneHit(int side, int hit, bool rocket, bool down);   // 0.5.275 (below)
@@ -2360,10 +2999,13 @@ namespace
         // sounds are (the scoped Lee-Enfield's shot: the shooter's EntityList
         // entity, r8 = 0); 259/260 on a script_origin were never heard.
         if (!ent) return;
+        // 0.5.808: room for 111 characters (was 48: mgcheck1's
+        // "weapon_mg50cal_sherman_tank_gunner_weapon_fire_3rd", 50, was cut
+        // to "..._fire_3" and found nothing)
         static uint32_t text = 0;
-        if (!text) text = Guest::AllocatePhysical(0x40);
-        memset(base + text, 0, 0x40);
-        memcpy(base + text + 8, alias, std::min<size_t>(strlen(alias), 0x30));
+        if (!text) text = Guest::AllocatePhysical(0x80);
+        memset(base + text, 0, 0x80);
+        memcpy(base + text + 8, alias, std::min<size_t>(strlen(alias), 0x6F));
         PPCContext call = ctx;
         call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
         call.r3.u64 = text; call.r4.u64 = ent; call.r5.u64 = text + 8; call.r6.u64 = 0; call.r7.u64 = uint64_t(int64_t(-1)); call.r8.u64 = 0; call.lr = 0;
@@ -2467,6 +3109,7 @@ void MpFixesSendPlane(const UavPlaneAsk& ask)
 {
     std::vector<uint8_t> v = { 'C', '3', 'U', 'P', PlaneNetVersion, uint8_t(ask.side), uint8_t(ask.seconds >> 8), uint8_t(ask.seconds) };
     PutF(v, ask.cx); PutF(v, ask.cy); PutF(v, ask.cz); PutF(v, ask.radius); PutF(v, ask.angle);
+    PutF(v, ask.squash);   // 0.5.718 (read when the packet is long enough)
     PlaneNetSend(v);
     printf("uav plane: told the other machines (side %d, %d s)\n", ask.side, ask.seconds);
     fflush(stdout);
@@ -2533,7 +3176,7 @@ void MpFixesUavPlane(uint8_t* base, uint32_t caller, int seconds, bool enemy = f
     // entity whose class name has "spawn" in it: they cover where play can
     // go), else the ground the players have covered.
     {
-        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+        float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f, halfSpan = 0.0f, boxX = 0.0f, boxY = 0.0f;
         int spawns = 0;
         for (uint32_t i = 0; i < 4096; i++)
         {
@@ -2553,7 +3196,9 @@ void MpFixesUavPlane(uint8_t* base, uint32_t caller, int seconds, bool enemy = f
         {
             ask.cx = (minX + maxX) * 0.5f;
             ask.cy = (minY + maxY) * 0.5f;
-            ask.radius = std::clamp(std::max(maxX - minX, maxY - minY) * 0.5f * 0.98f, 2500.0f, 12000.0f);   // 0.5.280: 2% in from the edge (Justin)
+            halfSpan = std::max(maxX - minX, maxY - minY) * 0.5f;
+            boxX = (maxX - minX) * 0.5f; boxY = (maxY - minY) * 0.5f;   // 0.5.718
+            ask.radius = std::clamp(halfSpan * 0.98f, 2500.0f, 12000.0f);   // 0.5.280: 2% in from the edge (Justin)
             printf("uav plane: %d spawn points span %.0f..%.0f x %.0f..%.0f: circle %.0f\n", spawns, minX, maxX, minY, maxY, ask.radius);
         }
         else if (g_playMaxX > g_playMinX + 500.0f && g_playMaxY > g_playMinY + 500.0f)
@@ -2563,6 +3208,72 @@ void MpFixesUavPlane(uint8_t* base, uint32_t caller, int seconds, bool enemy = f
             ask.radius = std::clamp(std::max(g_playMaxX - g_playMinX, g_playMaxY - g_playMinY) * 0.45f, 2500.0f, 9000.0f);
         }
         else ask.radius = std::max(ask.radius, 2500.0f);
+        // 0.5.466: Rouen: the circle 10% tighter and 2% higher (Justin: the plane
+        // "fly to far on the outskirts of the map that they flicker in and out
+        // of the draw distance sometimes")
+        if (Kernel::CurrentMap() == "rouen")
+        {
+            ask.radius *= 0.90f;
+            ask.cz += (ask.cz - sz / float(n) + 0.0f) * 0.02f;
+        }
+        // 0.5.709: Carentan (CoD2's, small): the user, "needs a tighter circle as
+        // it flys far outside the map boundaries", and 12% higher. The 2500
+        // floor above held it past the map's edge: 80% of the spawn box's
+        // half-width (at least 1200, a turn the plane can fly), 12% higher
+        // above the players.
+        if (Kernel::CurrentMap() == "carentan" || Kernel::CurrentMap() == "mp_isle")   // (and Isle, the test map: the user)
+        {
+            if (halfSpan > 0.0f) ask.radius = std::max(1200.0f, halfSpan * 0.80f);
+            ask.cz += (ask.cz - sz / float(n)) * 0.12f;
+            // 0.5.712: Isle, the user again: "higher by another 14 %", "tighter by
+            // at least 15%"
+            if (Kernel::CurrentMap() == "mp_isle")
+            {
+                ask.radius = std::max(1200.0f, ask.radius * 0.94f);   // 0.5.719: 0.85 was "too tight to the map" (the user): about 10% wider
+                ask.cz += (ask.cz - sz / float(n)) * 0.14f;
+                ask.cz += (ask.cz - sz / float(n)) * 0.07f;   // 0.5.720: the user, "raise the uav up by at least another 7%"
+            }
+            printf("uav plane: %s: circle %.0f (spawns' half-width %.0f), height %.0f above the players\n", Kernel::CurrentMap().c_str(), ask.radius, halfSpan, ask.cz - sz / float(n));
+        }
+        // 0.5.718: an oval the map's shape, kept within the draw distance (the
+        // user, Isle: the plane "was popping in and out of frame, it needs to
+        // stay visible at all times no matter where on the map someone is";
+        // with draw distance far, r_zfar 9000, a player at one end of Isle's
+        // 8280 was 9300 from the far side of its round circle). Its x and y
+        // radii the circle's times the spawn box's half-widths over the larger;
+        // then smaller, 8% a time (to a quarter at most), until no corner of
+        // the spawn box is farther from any point of it (its height counted)
+        // than 92% of the draw distance.
+        if (boxX > 0.0f && boxY > 0.0f)
+        {
+            const float big = std::max(boxX, boxY);
+            float rx = ask.radius * boxX / big, ry = ask.radius * boxY / big;
+            static const float Distances[] = { 0.0f, 9000.0f, 6000.0f, 3500.0f };
+            const int dd = Settings::Get().drawDistance;
+            const float zfar = dd >= 0 && dd < 4 ? Distances[dd] : 0.0f;
+            const float height = ask.cz - sz / float(n);
+            auto farthest = [&](float ax, float ay)
+            {
+                float most = 0.0f;
+                for (int c = 0; c < 4; c++)
+                    for (int k = 0; k < 32; k++)
+                    {
+                        const float a = float(k) * 6.2831853f / 32.0f;
+                        const float px = ask.cx + cosf(a) * ax, py = ask.cy + sinf(a) * ay;
+                        const float qx = ask.cx + ((c & 1) ? boxX : -boxX), qy = ask.cy + ((c & 2) ? boxY : -boxY);
+                        most = std::max(most, sqrtf((px - qx) * (px - qx) + (py - qy) * (py - qy) + height * height));
+                    }
+                return most;
+            };
+            float scale = 1.0f;
+            if (zfar > 0.0f)
+                while (scale > 0.25f && farthest(rx * scale, ry * scale) > 0.92f * zfar) scale *= 0.92f;
+            rx = std::max(800.0f, rx * scale); ry = std::max(800.0f, ry * scale);
+            ask.radius = rx;
+            ask.squash = ry / rx;
+            printf("uav plane: an oval %.0f x %.0f (the spawn box %.0f x %.0f, scale %.2f), at most %.0f from its corners (draw distance %.0f)\n",
+                   rx, ry, boxX, boxY, scale, farthest(rx, ry), zfar);
+        }
     }
     ask.angle = float(GetTickCount64() % 6283) / 1000.0f;   // 0.5.275: chosen here, sent to the others
     MpFixesSendPlane(ask);
@@ -2614,6 +3325,188 @@ namespace
         static int told = 0;
         if ((told < 30 && told++ < 30)) { printf("uav plane: sound %s at %s entity %08X\n", alias, where == 0 ? "the plane" : where == 1 ? "the origin" : where == 2 ? "my player" : "the nearest bot", ent); fflush(stdout); }
     }
+}
+
+// 0.5.440: THE HELLFIRE'S BOMBERS (Justin: "a set of bombers that fly really
+// high up passed the map while the bombs drop ... planes flying by high high
+// up"). With a Hellfire the host sends C3KB (the map's middle, the height,
+// a heading, the half-length of a pass, how many waves and planes) and every
+// machine flies its own, as the UAV plane (0.5.275): BomberWaves waves of
+// BomberPlanes in a V (the lead, then pairs 300 to each side and 350 back),
+// one wave every 6 s, each on another heading, from 3000 past one edge of
+// the map to as far past the other at kBomberSpeed. The planes are kept
+// (parked far under the map) for the next. Their sound: the P-47's engine
+// (ARPL_P47_1 and _2 by turns, every 1.8 s) and its flybys (By01..07, one
+// every 1.5 s while a wave is within 6000 across), on a sound origin of the
+// wave's, from this machine's player's eyes toward the lead, 900 out at most
+// (as the UAV plane's, 0.5.259: heard from the planes' side).
+namespace
+{
+    constexpr int BomberWaves = 3, BomberPlanes = 5;
+    constexpr float kBomberSpeed = 1800.0f;
+    float BomberHeight()   // above the highest ground the players have stood on
+    {
+        static const float h = [] { const char* e = getenv("COD3_BOMBER_HEIGHT"); const float v = e ? float(atof(e)) : 0.0f; return v > 0 ? std::clamp(v, 500.0f, 20000.0f) : 2200.0f; }();   // 0.5.442: 2200 (was 3000: Justin, planes glitching in and out)
+        return h;
+    }
+    struct BomberWave
+    {
+        uint64_t at = 0, end = 0, nextEngine = 0, nextFlyby = 0, nextMove = 0;
+        float sx = 0, sy = 0, ex = 0, ey = 0, z = 0, angle = 0;
+        int phase = 0;   // 0 waiting, 1 put at the start, 2 flying, 3 done
+        int side = 2, sounds = 0;
+        uint32_t sound = 0;   // its sound origin
+    };
+    std::mutex g_bomberLock;
+    std::vector<BomberWave> g_bomberWaves;
+    uint32_t g_bomberPool[BomberWaves * BomberPlanes] = {};
+    uint32_t g_bomberSound[BomberWaves] = {};
+    std::string g_bomberMap;
+
+    // Where plane j of a wave flies, against the lead: (back, across).
+    void BomberSlot(int j, float& back, float& across)
+    {
+        const int pair = (j + 1) / 2;
+        back = 350.0f * float(pair);
+        across = j == 0 ? 0.0f : (j % 2 ? 300.0f : -300.0f) * float(pair);
+    }
+}
+// The waves on this machine (from the host's Hellfire, here or from C3KB).
+void MpFixesBombersAsk(float cx, float cy, float z, float angle, float half, int waves)
+{
+    std::lock_guard<std::mutex> hold(g_bomberLock);
+    const uint64_t now = GetTickCount64();
+    g_bomberWaves.clear();
+    for (int w = 0; w < std::clamp(waves, 1, BomberWaves); w++)
+    {
+        BomberWave b;
+        b.angle = angle + float(w) * 2.2f;
+        const float dx = cosf(b.angle), dy = sinf(b.angle);
+        b.sx = cx - dx * half; b.sy = cy - dy * half; b.ex = cx + dx * half; b.ey = cy + dy * half;
+        b.z = z + float(w) * 150.0f;
+        b.at = now + uint64_t(w) * 6000;
+        b.side = w % 2 ? 1 : 2;
+        g_bomberWaves.push_back(b);
+    }
+    printf("bombers: %d waves of %d over %.0f %.0f at height %.0f, passes of %.0f\n", int(g_bomberWaves.size()), BomberPlanes, cx, cy, z, 2 * half);
+    fflush(stdout);
+}
+// On the host, with its Hellfire: here and on every other machine.
+void MpFixesBombersStart(float minX, float minY, float maxX, float maxY, float angle)
+{
+    const float cx = (minX + maxX) * 0.5f, cy = (minY + maxY) * 0.5f;
+    const float half = 0.5f * sqrtf((maxX - minX) * (maxX - minX) + (maxY - minY) * (maxY - minY)) + 1500.0f;   // 0.5.442: 1500 past the edge (was 3000)
+    const float z = std::max(g_playTop, -5000.0f) + BomberHeight();
+    MpFixesBombersAsk(cx, cy, z, angle, half, BomberWaves);
+    std::vector<uint8_t> v = { 'C', '3', 'K', 'B', PlaneNetVersion, uint8_t(BomberWaves) };
+    PutF(v, cx); PutF(v, cy); PutF(v, z); PutF(v, angle); PutF(v, half);
+    PlaneNetSend(v);
+}
+// Each server frame, on every machine.
+void MpFixesBomberFrame(PPCContext& ctx, uint8_t* base)
+{
+    const std::string map = Kernel::CurrentMap();
+    std::lock_guard<std::mutex> hold(g_bomberLock);
+    if (map != g_bomberMap)
+    {
+        g_bomberMap = map;
+        for (uint32_t& h : g_bomberPool) h = 0;
+        for (uint32_t& h : g_bomberSound) h = 0;
+        g_bomberWaves.clear();
+    }
+    if (map.empty() || g_bomberWaves.empty()) return;
+    const uint64_t now = GetTickCount64();
+    const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+    const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+    const uint32_t ps = own ? Guest::Read32(base, own + 512) : 0;
+    const bool havePlayer = ps >= 0x40000000u && ps < 0x90000000u;
+    const float px = havePlayer ? PlaneReadF(base, ps) : 0, py = havePlayer ? PlaneReadF(base, ps + 4) : 0, pz = havePlayer ? PlaneReadF(base, ps + 8) + 60.0f : 0;
+    bool any = false;
+    for (int w = 0; w < int(g_bomberWaves.size()); w++)
+    {
+        BomberWave& b = g_bomberWaves[w];
+        if (b.phase == 3) continue;
+        any = true;
+        if (now < b.at) continue;
+        const float dx = cosf(b.angle), dy = sinf(b.angle);
+        const float yaw = fmodf(b.angle * 57.2957795f + 720.0f, 360.0f) + kPlaneYawOffset;
+        const float seconds = sqrtf((b.ex - b.sx) * (b.ex - b.sx) + (b.ey - b.sy) * (b.ey - b.sy)) / kBomberSpeed;
+        if (b.phase == 0)
+        {
+            // Made (or taken from the pool) and put at the start of the pass.
+            for (int j = 0; j < BomberPlanes; j++)
+            {
+                float back, across;
+                BomberSlot(j, back, across);
+                const float x = b.sx - dx * back - dy * across, y = b.sy - dy * back + dx * across;
+                uint32_t& handle = g_bomberPool[w * BomberPlanes + j];
+                if (!handle || !PlaneEntity(base, handle)) handle = PlaneSpawn(ctx, base, b.side, x, y, b.z);
+                if (!handle) continue;
+                PlaneMoveTo(ctx, base, handle, x, y, b.z, 0.05f);
+                PlaneRotateTo(ctx, base, handle, 0.0f, yaw, 0.0f, 0.05f);
+            }
+            if (!g_bomberSound[w] || !PlaneEntity(base, g_bomberSound[w])) g_bomberSound[w] = PlaneSpawnOrigin(ctx, base, px, py, pz);
+            b.sound = g_bomberSound[w];
+            b.phase = 1;
+            b.at = now + 200;
+            continue;
+        }
+        if (b.phase == 1)
+        {
+            for (int j = 0; j < BomberPlanes; j++)
+            {
+                float back, across;
+                BomberSlot(j, back, across);
+                const uint32_t handle = g_bomberPool[w * BomberPlanes + j];
+                if (handle && PlaneEntity(base, handle))
+                    PlaneMoveTo(ctx, base, handle, b.ex - dx * back - dy * across, b.ey - dy * back + dx * across, b.z, seconds);
+            }
+            b.phase = 2;
+            b.at = now;
+            b.end = now + uint64_t(seconds * 1000.0f) + 200;
+            printf("bombers: wave %d on its way (heading %.0f, %.1f s)\n", w + 1, yaw, seconds);
+            fflush(stdout);
+            continue;
+        }
+        // Flying: where the lead is now, along the pass.
+        const float f = std::clamp(float(now - b.at) / (seconds * 1000.0f), 0.0f, 1.0f);
+        const float lx = b.sx + (b.ex - b.sx) * f, ly = b.sy + (b.ey - b.sy) * f;
+        if (havePlayer && b.sound && now >= b.nextMove)
+        {
+            b.nextMove = now + 100;
+            float vx = lx - px, vy = ly - py, vz = b.z - pz;
+            const float length = sqrtf(vx * vx + vy * vy + vz * vz);
+            const float out = length > 1 ? std::min(900.0f, length) / length : 0.0f;
+            PlaneMoveTo(ctx, base, b.sound, px + vx * out, py + vy * out, pz + vz * out, 0.1f);
+        }
+        const uint32_t at = b.sound ? PlaneEntity(base, b.sound) : 0;
+        const float across = havePlayer ? sqrtf((lx - px) * (lx - px) + (ly - py) * (ly - py)) : 1e9f;
+        if (at && now >= b.nextEngine && across < 12000.0f)
+        {
+            b.nextEngine = now + 1300;   // 0.5.446: 1.3 s (was 1.8)
+            PlaneSound(ctx, base, at, b.sounds++ % 2 ? "ARPL_P47_1" : "ARPL_P47_2");
+        }
+        if (at && now >= b.nextFlyby && across < 6000.0f)
+        {
+            static const char* const flybys[6] = { "ARPL_P47_By01", "ARPL_P47_By02", "ARPL_P47_By03", "ARPL_P47_By04", "ARPL_P47_By06", "ARPL_P47_By07" };
+            b.nextFlyby = now + 1100;   // 0.5.446: 1.1 s (was 1.5)
+            PlaneSound(ctx, base, at, flybys[(b.sounds + w) % 6]);
+        }
+        if (now >= b.end)
+        {
+            // Gone past the map: parked far under it for the next.
+            for (int j = 0; j < BomberPlanes; j++)
+            {
+                const uint32_t handle = g_bomberPool[w * BomberPlanes + j];
+                if (handle && PlaneEntity(base, handle)) PlaneMoveTo(ctx, base, handle, b.ex, b.ey, -60000.0f, 0.05f);
+            }
+            if (at) PlaneMoveTo(ctx, base, b.sound, b.ex, b.ey, -60000.0f, 0.05f);
+            b.phase = 3;
+            printf("bombers: wave %d gone\n", w + 1);
+            fflush(stdout);
+        }
+    }
+    if (!any) g_bomberWaves.clear();
 }
 
 // 0.5.258: shots at the plane. 257's plane was never hit (no "hit for"
@@ -2773,9 +3666,11 @@ void MpFixesStreakUsedOut(uint8_t* base)
 
 void MpFixesMortarPacket(PPCContext& ctx, uint8_t* base, char kind, const uint8_t* d, size_t n);   // 0.5.285 (with the killstreak box)
 void MpFixesMortarFrame(PPCContext& ctx, uint8_t* base);
+void MpFixesHellfireImpact(PPCContext& ctx, uint8_t* base, float x, float y, float z, int index, bool host);   // 0.5.440 (with the mortar)
 // Each server frame on the host (MpFixesLauncher).
 void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
 {
+    MpFixesTankBlastsFrame(ctx, base);   // 0.5.780
     const std::string map = Kernel::CurrentMap();
     if (map != g_uavPlaneMap)
     {
@@ -2784,6 +3679,7 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
         g_playMinX = g_playMinY = g_playTop = 1e9f; g_playMaxX = g_playMaxY = -1e9f; g_playTop = -1e9f;
     }
     if (map.empty()) return;
+    MpFixesBomberFrame(ctx, base);   // 0.5.440: the Hellfire's bombers
     {
         static uint64_t sampled = 0;
         const uint64_t t = GetTickCount64();
@@ -2821,6 +3717,7 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
                 UavPlaneAsk a;
                 a.side = d[5]; a.seconds = d[6] << 8 | d[7];
                 a.cx = GetF(d + 8); a.cy = GetF(d + 12); a.cz = GetF(d + 16); a.radius = GetF(d + 20); a.angle = GetF(d + 24);
+                if (n >= 40) { const float q = GetF(d + 28); if (std::isfinite(q) && q > 0.1f && q < 3.0f) a.squash = q; }   // 0.5.718
                 a.remote = true;
                 if ((a.side == 1 || a.side == 2) && std::isfinite(a.cx) && std::isfinite(a.radius))
                 {
@@ -2834,6 +3731,17 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
                 MpFixesStreakSyncIn(base, d, n);   // 0.5.276
             else if (pk.kind == 'u' && n >= 6)
                 MpFixesStreakUsedIn(base, d[5]);   // 0.5.276
+            else if (pk.kind == 'h' && n >= 18)   // 0.5.440: a Hellfire shell of the host's: its explosion here
+            {
+                const float x = GetF(d + 6), y = GetF(d + 10), z = GetF(d + 14);
+                if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z)) MpFixesHellfireImpact(ctx, base, x, y, z, d[5], false);
+            }
+            else if (pk.kind == 'b' && n >= 26)   // 0.5.440: the host's Hellfire bombers
+            {
+                const float cx = GetF(d + 6), cy = GetF(d + 10), z = GetF(d + 14), angle = GetF(d + 18), half = GetF(d + 22);
+                if (std::isfinite(cx) && std::isfinite(cy) && std::isfinite(z) && std::isfinite(angle) && std::isfinite(half) && half > 0 && half < 100000)
+                    MpFixesBombersAsk(cx, cy, z, angle, half, d[5]);
+            }
             else if (pk.kind == 'f' || pk.kind == 'p' || pk.kind == 'm')
                 MpFixesMortarPacket(ctx, base, pk.kind, d, n);   // 0.5.285
             else if ((pk.kind == 'H' || pk.kind == 'D') && n >= 9 && (d[5] == 1 || d[5] == 2))
@@ -2856,8 +3764,9 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
     for (const UavPlaneAsk& ask : asks)
     {
         UavPlane& p = g_uavPlanes[ask.side == 2 ? 1 : 0];
-        p.cx = ask.cx; p.cy = ask.cy; p.cz = ask.cz; p.radius = ask.radius;
+        p.cx = ask.cx; p.cy = ask.cy; p.cz = ask.cz; p.radius = ask.radius; p.squash = ask.squash;
         p.ground = ask.cz - 1400.0f;   // 0.5.260
+        p.flyZ = 0.0f;   // 0.5.608: found again under the sky
         // 0.5.263: Poissons' sky is low (a town): seen only when it came
         // down to ~300 over the highest player (260); 1400 everywhere else.
         // 0.5.279: 900 (Justin: very low at 400). 259's unseen plane there
@@ -2882,7 +3791,7 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
         if (ent) Guest::Write32(base, ent + 608, 1);
         p.health = kPlaneHealth;
         if (ent) { PlaneWriteF(base, ent + 336, ex); PlaneWriteF(base, ent + 340, ey); PlaneWriteF(base, ent + 344, p.cz + 600.0f); }
-        const float tx = p.cx + cosf(p.angle) * p.radius, ty = p.cy + sinf(p.angle) * p.radius;
+        const float tx = p.cx + cosf(p.angle) * p.radius, ty = p.cy + sinf(p.angle) * p.radius * p.squash;
         const float yaw = atan2f(ty - ey, tx - ex) * 180.0f / Pi;
         PlaneRotateTo(ctx, base, p.handle, 0.0f, yaw + kPlaneYawOffset, 0.0f, 0.2f);
         PlaneMoveTo(ctx, base, p.handle, tx, ty, p.cz, 4.0f);
@@ -3056,7 +3965,7 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
                        PlaneReadF(base, e + 336), PlaneReadF(base, e + 340), PlaneReadF(base, e + 344),
                        PlaneReadF(base, e + 352), PlaneReadF(base, e + 356), PlaneReadF(base, e + 360),
                        Guest::Read32(base, e + 16), Guest::Read32(base, e + 20), Guest::Read32(base, e + 620),
-                       p.cx + cosf(p.angle) * p.radius, p.cy + sinf(p.angle) * p.radius, p.cz);
+                       p.cx + cosf(p.angle) * p.radius, p.cy + sinf(p.angle) * p.radius * p.squash, p.cz);
                 fflush(stdout);
             }
         }
@@ -3065,8 +3974,10 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
             if (now >= p.until)
             {
                 // Off along the circle's tangent, far away, in 6 seconds.
-                const float dx = -sinf(p.angle), dy = cosf(p.angle);
-                const float x = p.cx + cosf(p.angle) * p.radius + dx * 14000.0f, y = p.cy + sinf(p.angle) * p.radius + dy * 14000.0f;
+                float dx = -sinf(p.angle), dy = cosf(p.angle) * p.squash;
+                const float dl = std::max(1e-3f, sqrtf(dx * dx + dy * dy));
+                dx /= dl; dy /= dl;
+                const float x = p.cx + cosf(p.angle) * p.radius + dx * 14000.0f, y = p.cy + sinf(p.angle) * p.radius * p.squash + dy * 14000.0f;
                 PlaneRotateTo(ctx, base, p.handle, -8.0f, atan2f(dy, dx) * 180.0f / Pi + kPlaneYawOffset, 0.0f, 1.0f);
                 PlaneMoveTo(ctx, base, p.handle, x, y, p.cz + 1500.0f, 6.0f);
                 p.phase = 3;
@@ -3077,10 +3988,34 @@ void MpFixesPlaneFrame(PPCContext& ctx, uint8_t* base)
             }
             // About 1100 units a second round the circle, counter-clockwise.
             const float step = float(kPlaneStepMs) / 1000.0f;
-            p.angle += kPlaneSpeed * step / std::max(p.radius, 500.0f);
-            const float x = p.cx + cosf(p.angle) * p.radius, y = p.cy + sinf(p.angle) * p.radius;
-            const float yaw = (p.angle + Pi * 0.5f) * 180.0f / Pi;
-            PlaneMoveTo(ctx, base, p.handle, x, y, p.cz, step);
+            // (0.5.718: round an oval, the same speed along it: the angle by the
+            // radius it has here; its heading along it)
+            const float here = sqrtf(powf(sinf(p.angle) * p.radius, 2.0f) + powf(cosf(p.angle) * p.radius * p.squash, 2.0f));
+            p.angle += kPlaneSpeed * step / std::max(here, 500.0f);
+            const float x = p.cx + cosf(p.angle) * p.radius, y = p.cy + sinf(p.angle) * p.radius * p.squash;
+            const float yaw = atan2f(cosf(p.angle) * p.radius * p.squash, -sinf(p.angle) * p.radius) * 180.0f / Pi;
+            // 0.5.608: kept under the map's sky where it is low (the user: the
+            // plane "disappears sometimes when circling the map"; 0.5.260: an
+            // entity above the sky's brush is outside the world, not linked, so
+            // not drawn or sent): a line up from 900 over the players finds the
+            // sky over the next point; the plane flies at most 200 under it,
+            // never under 600 over the players, a change of 150 a step at most
+            float z = p.cz;
+            {
+                float sky = 0.0f;
+                const uint32_t self = PlaneEntity(base, p.handle);
+                if (BotsSkyZ(ctx, base, self, x, y, p.ground + 900.0f, 9000.0f, sky) && sky > p.ground + 1000.0f)   // a roof or spire just over the start is not the sky
+                    z = std::max(p.ground + 600.0f, std::min(p.cz, sky - 200.0f));
+                if (p.flyZ == 0.0f) p.flyZ = z;
+                z = std::max(p.flyZ - 150.0f, std::min(p.flyZ + 150.0f, z));
+                if (fabsf(z - p.cz) > 50.0f)
+                {
+                    static int told = 0;
+                    if (told++ < 40) { printf("uav plane: side %d under the sky at %.0f %.0f: %.0f (wanted %.0f, sky %.0f)\n", k + 1, x, y, z, p.cz, sky); fflush(stdout); }
+                }
+                p.flyZ = z;
+            }
+            PlaneMoveTo(ctx, base, p.handle, x, y, z, step);
             PlaneRotateTo(ctx, base, p.handle, 0.0f, fmodf(yaw, 360.0f) + kPlaneYawOffset, -kPlaneBank, p.phase == 1 ? 0.8f : step);
             p.phase = 2;
             p.next = now + kPlaneStepMs;
@@ -3113,6 +4048,157 @@ namespace
 
     float BitsF(uint32_t w) { float f; memcpy(&f, &w, 4); return f; }
     uint32_t FBits(float f) { uint32_t w; memcpy(&w, &f, 4); return w; }
+
+    // 0.5.438: THE HELLFIRE BARRAGE (the Typhoon's place on the ladder;
+    // Justin: "rain down artillerys around the whole map ... as chaotic and
+    // hellish as possible ... press right on the dpad ... everyone is
+    // affected"). No binoculars: d-pad right and the shells start, one
+    // every HellfireGapMs, HellfireStrikes() of them (144: 18 s), each an
+    // explosion of ours (0.5.440: MpFixesHellfireImpact). One in four falls
+    // by a living player (each in turn, 150 to 900 units off); the others
+    // cover the whole map ("we essentially need to just bomb the whole
+    // map"): the box of the map's spawn points and the ground the players
+    // have covered, 400 units more round it, cut into an 8 x 8 grid, each
+    // cell hit in a shuffled order, then again (a random spot in the cell),
+    // on the ground found straight down. One Hellfire at a time.
+    // 0.5.447: 288 shells, one every 70 ms (20 s), half by the players
+    // (Justin: "i still feel like the hellfire wasnt accross the whole
+    // map's areas": 144 over the map were about 2 for each house-sized spot
+    // in 18 s, a few seen from any one place)
+    // 0.5.448: the game's own artillery barrages (Justin: "no shell shock, no
+    // big explosions like the artillery ... switch it to the artillerys
+    // shelling"): 48 of them, one every 420 ms (20 s), each the scout's
+    // whole barrage with its shells, sounds, shock and damage; one in three
+    // by a living player, the rest over a 6 x 6 grid of the map.
+    // 0.5.450: 240 shells of ours, one every 80 ms (19 s), half by the players,
+    // half over a 10 x 10 grid; the game's barrage only once (its call)
+    constexpr uint64_t HellfireGapMs = 95;   // 0.5.454: 200 shells, one every 95 ms (19 s): Justin, "bring the strikes down to 200"
+    constexpr int HellfireGrid = 10;
+    int HellfireStrikes()
+    {
+        static const int n = [] { const char* e = getenv("COD3_HELLFIRE_STRIKES"); const int v = e ? atoi(e) : 0; return v > 0 ? std::clamp(v, 8, 600) : 200; }();
+        return n;
+    }
+    struct Hellfire
+    {
+        uint32_t handle = 0; int caller = -1; int left = 0, fired = 0, cell = 0; uint64_t next = 0, until = 0;
+        float minX = 0, minY = 0, maxX = 0, maxY = 0; bool box = false, pooled = false;
+        uint64_t startedAt = 0, quietUntil = 0;   // 0.5.448: the artillery's call once a Hellfire
+        uint32_t slot = 0;   // 0.5.449: the caller's dispenser's ready word
+        uint8_t order[HellfireGrid * HellfireGrid] = {};
+    };
+    Hellfire g_hellfire;
+    bool g_hellfireDamaging = false;   // 0.5.441: a Hellfire shell's damage being done (its kills earn no streak)
+    uint32_t g_hellfireRandom = 0x48454C4Cu;
+    float HellfireRandom()   // 0 to 1
+    {
+        g_hellfireRandom = g_hellfireRandom * 1664525u + 1013904223u;
+        return float(g_hellfireRandom >> 8) / float(1u << 24);
+    }
+}
+bool BotsGroundZ(PPCContext& ctx, uint8_t* base, uint32_t ignore, float x, float y, float top, float& z);
+// 0.5.448: during a Hellfire, the artillery's firing and the scout's call
+// (MP_Artillery_*, Scout_*) are let through twice (the first barrage's), not
+// with each of its 48 (Justin, 440: "only once should be enough").
+bool MpFixesHellfireQuiet(const std::string& alias)
+{
+    static uint64_t forStart = 0;
+    static int played = 0;
+    if (!g_hellfire.handle || GetTickCount64() > g_hellfire.quietUntil) return false;
+    if (alias.rfind("MP_Artillery", 0) != 0 && alias.rfind("Scout_", 0) != 0) return false;
+    if (forStart != g_hellfire.startedAt) { forStart = g_hellfire.startedAt; played = 0; }
+    return played++ >= 2;
+}
+// True when it started (none was falling already).
+bool MpFixesHellfireStart(uint8_t* base, int client)
+{
+    if (g_hellfire.left > 0 || client < 0 || client >= int(MpCapClients) || !g_streaks[client].handle) return false;
+    Hellfire h;
+    h.handle = g_streaks[client].handle;
+    h.caller = client;
+    h.left = HellfireStrikes();
+    h.next = GetTickCount64();
+    h.startedAt = h.next;
+    h.quietUntil = h.next + 30000;
+    g_hellfireRandom ^= uint32_t(GetTickCount64());
+    // The whole map: the spawn points' box (as the UAV plane's circle, 0.5.264) and the ground covered
+    float minX = 1e9f, minY = 1e9f, maxX = -1e9f, maxY = -1e9f;
+    int spawns = 0;
+    for (uint32_t i = 0; i < 4096; i++)
+    {
+        const uint32_t e = Guest::Read32(base, 0x82BD1FC0 + 8 * i);
+        if (e < 0x40000000u || e >= 0x90000000u) continue;
+        const uint32_t cls = Guest::Read32(base, e + 548);
+        if (cls < 0x40000000u || cls >= 0x90000000u) continue;
+        char name[40] = {};
+        for (int c = 0; c < 39; c++) { name[c] = char(base[cls + 12 + c]); if (!name[c]) break; }
+        if (!strstr(name, "spawn")) continue;
+        const float x = PlaneReadF(base, e + 336), y = PlaneReadF(base, e + 340);
+        if (!std::isfinite(x) || !std::isfinite(y) || fabsf(x) > 60000 || fabsf(y) > 60000) continue;
+        minX = std::min(minX, x); maxX = std::max(maxX, x); minY = std::min(minY, y); maxY = std::max(maxY, y);
+        spawns++;
+    }
+    if (g_playMaxX > g_playMinX && g_playMaxY > g_playMinY)
+    {
+        minX = std::min(minX, g_playMinX); maxX = std::max(maxX, g_playMaxX);
+        minY = std::min(minY, g_playMinY); maxY = std::max(maxY, g_playMaxY);
+    }
+    h.box = maxX > minX + 500.0f && maxY > minY + 500.0f;
+    if (h.box) { h.minX = minX - 800.0f; h.maxX = maxX + 800.0f; h.minY = minY - 800.0f; h.maxY = maxY + 800.0f; }   // 0.5.447: 800 past (was 400)
+    for (int c = 0; c < HellfireGrid * HellfireGrid; c++) h.order[c] = uint8_t(c);
+    for (int c = HellfireGrid * HellfireGrid - 1; c > 0; c--) std::swap(h.order[c], h.order[int(HellfireRandom() * float(c + 1)) % (c + 1)]);
+    g_hellfire = h;
+    printf("killstreak: client %d's HELLFIRE BARRAGE: %d shells, one every %llu ms, over %.0f..%.0f x %.0f..%.0f (%d spawn points)\n", client, h.left,
+           (unsigned long long)HellfireGapMs, h.minX, h.maxX, h.minY, h.maxY, spawns);
+    fflush(stdout);
+    if (h.box) MpFixesBombersStart(h.minX, h.minY, h.maxX, h.maxY, HellfireRandom() * 6.2831853f);   // 0.5.440: the bombers over it
+    return true;
+}
+// Where the next one falls: false when no one is in play.
+bool MpFixesHellfirePoint(PPCContext& ctx, uint8_t* base, int n, float& x, float& y, float& z)
+{
+    struct P { uint32_t entity; float x, y, z; };
+    std::vector<P> players;
+    const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
+    for (uint32_t i = 0; entities && i < MpCapClients; i++)
+    {
+        const uint32_t e = Guest::Read32(base, entities + 4 * (i + 1));
+        const uint32_t ps = e ? Guest::Read32(base, e + 512) : 0;
+        if (ps < 0x40000000u || ps >= 0x90000000u || int32_t(Guest::Read32(base, e + 776)) <= 0) continue;
+        const float px = PlaneReadF(base, ps), py = PlaneReadF(base, ps + 4), pz = PlaneReadF(base, ps + 8);
+        if (!std::isfinite(px) || !std::isfinite(py) || !std::isfinite(pz) || fabsf(px) > 60000 || fabsf(py) > 60000 || (px == 0 && py == 0)) continue;
+        players.push_back({ e, px, py, pz });
+    }
+    if (players.empty()) return false;
+    const P& by = players[size_t(n / 2) % players.size()];
+    const bool byPlayer = n % 2 == 0 || !g_hellfire.box;
+    float top;
+    if (byPlayer)
+    {
+        const float angle = HellfireRandom() * 6.2831853f, distance = 80.0f + HellfireRandom() * 820.0f;   // 0.5.454: 80 to 900 (was 120 to 1200)
+        x = by.x + cosf(angle) * distance; y = by.y + sinf(angle) * distance; z = by.z;
+        top = by.z + 600.0f;
+    }
+    else
+    {
+        const int cells = HellfireGrid * HellfireGrid;
+        const int cell = g_hellfire.order[g_hellfire.cell++ % cells];
+        const float w = (g_hellfire.maxX - g_hellfire.minX) / HellfireGrid, h = (g_hellfire.maxY - g_hellfire.minY) / HellfireGrid;
+        x = g_hellfire.minX + (float(cell % HellfireGrid) + 0.1f + 0.8f * HellfireRandom()) * w;
+        y = g_hellfire.minY + (float(cell / HellfireGrid) + 0.1f + 0.8f * HellfireRandom()) * h;
+        z = by.z;
+        top = std::max(g_playTop, by.z) + 2500.0f;
+    }
+    float ground;
+    if (BotsGroundZ(ctx, base, by.entity, x, y, top, ground)) z = ground;
+    else if (!byPlayer)
+    {
+        // nothing under that spot (outside the map): a second try in the same cell, else by the player
+        const float x2 = (x + (g_hellfire.minX + g_hellfire.maxX) * 0.5f) * 0.5f, y2 = (y + (g_hellfire.minY + g_hellfire.maxY) * 0.5f) * 0.5f;
+        if (BotsGroundZ(ctx, base, by.entity, x2, y2, top, ground)) { x = x2; y = y2; z = ground; }
+        else { x = by.x; y = by.y; z = by.z; }
+    }
+    return true;
 }
 bool MpFixesStreakBarrage(uint32_t handle);
 extern "C" PPC_FUNC(__imp__sub_821F70A8);
@@ -3168,6 +4254,7 @@ PPC_FUNC(sub_821F70A8)
     }
     __imp__sub_821F70A8(ctx, base);
 }
+void MpFixesHellfireFrame(PPCContext& ctx, uint8_t* base);   // 0.5.440 (with the mortar)
 void MpFixesBarrageFrame(PPCContext& ctx, uint8_t* base)
 {
     static uint32_t word = 0;
@@ -3183,6 +4270,7 @@ void MpFixesBarrageFrame(PPCContext& ctx, uint8_t* base)
         g_repeating = false;
     };
     const uint64_t now = GetTickCount64();
+    MpFixesHellfireFrame(ctx, base);   // 0.5.440: the Hellfire's own shells
     for (size_t k = 0; k < g_strafe.size();)
     {
         if (now < g_strafe[k].at) { k++; continue; }
@@ -3204,11 +4292,52 @@ namespace { int MortarKills(); }   // 0.5.285 (with the killstreak box)
 extern "C" PPC_FUNC(__imp__sub_825862F8);
 PPC_FUNC(sub_825862F8)
 {
+    // 0.5.834: a tank shell's hit (means 10) names the tank itself as the attacker (tankdmg1, Seelow:
+    // 82A6E810, health 2400): no kill to anyone, friendly fire unchecked, and the tank hurt by its own
+    // shell. The player in its seat 0 (the driver: the cannon is his) is the attacker then.
+    if (ctx.r5.u32 && ctx.r10.u32 == 10 && ClientOf(base, ctx.r5.u32) < 0)
+    {
+        const uint32_t vehicle = ctx.r5.u32, entities = Guest::Read32(base, 0x82BCC7FC);
+        for (int i = 0; entities && i < int(MpCapClients); i++)
+        {
+            const uint32_t them = Guest::Read32(base, entities + 4 * uint32_t(i + 1));
+            const uint32_t link = them ? Guest::Read32(base, them + 900) : 0;
+            if (!link || Guest::Read32(base, link) != vehicle) continue;
+            const uint32_t client = Guest::Read32(base, them + 512);
+            if (!client || Guest::Read32(base, client + 1300) != 0) continue;
+            static int told = 0;
+            if (told++ < 20) { printf("damage: a tank shell's hit: its driver (client %d) is the attacker, not the tank %08X\n", i, vehicle); fflush(stdout); }
+            ctx.r5.u32 = them;
+            break;
+        }
+    }
     const uint32_t target = ctx.r3.u32, attacker = ctx.r5.u32;
     if (target && MpFixesPlaneHit(ctx, base, target, attacker, int32_t(ctx.r8.u32))) return;   // 0.5.257: the UAV plane
     const int32_t before = target ? int32_t(Guest::Read32(base, target + 776)) : 0;
+    const uint32_t means = ctx.r10.u32;   // 0.5.442: the means of death (kept: the call may change r10)
+    if (means == 18 && target)   // 0.5.449: the game's artillery's shells landing (the Hellfire's are the game's now)
+    {
+        static int told = 0;
+        if (told++ < 40) { printf("artillery: a shell's damage %d to entity %08X (attacker %08X)\n", int32_t(ctx.r8.u32), target, attacker); fflush(stdout); }
+    }
     g_damageSeen = true;
+    // 0.5.833: DIAGNOSTIC (COD3_DAMAGE_LOG=1): every hit's means, damage, weapon (r9's low byte?) and
+    // the target's health before and after: does a tank shell's hit hurt (tank tests, Seelow)
+    static const bool damageLog = [] { const char* e = getenv("COD3_DAMAGE_LOG"); return e && *e == '1'; }();
+    const uint32_t inflictor = ctx.r4.u32, r9 = ctx.r9.u32;
+    const int32_t dealt = int32_t(ctx.r8.u32);
     __imp__sub_825862F8(ctx, base);
+    if (damageLog && target)
+    {
+        static int told = 0;
+        if (told++ < 400)
+        {
+            printf("damage: target %08X (client %d) by %08X (client %d) inflictor %08X (client %d, weapon byte %u) means %u damage %d r9 %08X health %d -> %d\n",
+                   target, ClientOf(base, target), attacker, attacker ? ClientOf(base, attacker) : -1, inflictor, inflictor ? ClientOf(base, inflictor) : -1,
+                   inflictor ? Guest::Read8(base, inflictor + 3) : 0, means, dealt, r9, before, int32_t(Guest::Read32(base, target + 776)));
+            fflush(stdout);
+        }
+    }
     // 0.5.282: a kill teaches the bots a lookout when it was a long one.
     if (target && before > 0 && int32_t(Guest::Read32(base, target + 776)) <= 0) BotsLearnKill(base, attacker, target);
     // 0.5.331 (Justin): the class's artillery (the scout's, Rusher 2's; about
@@ -3258,6 +4387,17 @@ PPC_FUNC(sub_825862F8)
     dead.kills = 0;
     dead.alive = false;
     dead.ours = false;   // his dispenser ends with him
+    // 0.5.441 / 0.5.442: a killstreak's kills earn no killstreak (Justin: "once
+    // used they shouldnt count towards more streaks, so even the mortar and
+    // artillery"): the Hellfire's shells, the mortar's blast (means 14,
+    // MOD_MORTAR_SPLASH: ours alone) and the artillery's (means 18). The
+    // kill is still his (the scoreboard); his run of kills goes on as it was.
+    if (g_hellfireDamaging || means == 14 || means == 18)
+    {
+        static int told = 0;
+        if (told++ < 20) { printf("killstreak: a kill by %s: not counted for a killstreak\n", g_hellfireDamaging ? "the Hellfire" : means == 14 ? "the mortar" : "artillery"); fflush(stdout); }
+        return;
+    }
     const int killer = ClientOf(base, attacker);
     if (killer < 0 || killer == victim) return;
     Streak& s = g_streaks[killer];
@@ -3289,8 +4429,8 @@ PPC_FUNC(sub_825862F8)
     {
         s.charges++;
         s.typhoons++;
-        printf("killstreak: client %d earned the Typhoon (%d strikes waiting, %d of them runs)\n", killer, s.charges, s.typhoons);
-        if (mine) Overlay::Notice("TYPHOON EARNED  -  d-pad down to pick, d-pad right to call", 3000);
+        printf("killstreak: client %d earned the Hellfire Barrage (%d strikes waiting, %d of them Hellfire)\n", killer, s.charges, s.typhoons);
+        if (mine) Overlay::Notice("HELLFIRE BARRAGE EARNED  -  d-pad down to pick, d-pad right to unleash it", 3000);
     }
     if (mine) Overlay::ConsolePrint("killstreak: " + std::to_string(s.kills) + " in a row");
     fflush(stdout);
@@ -3301,12 +4441,27 @@ PPC_FUNC(sub_825862F8)
 namespace { std::atomic<int> g_streakAsked{0}; }
 void MpFixesGiveStreak(const std::string& kind)
 {
-    const int what = kind == "uav" ? 1 : kind == "artillery" ? 2 : kind == "typhoon" ? 3 : kind == "enemyuav" ? 4 : kind == "mortar" ? 5 : 0;
-    if (!what) { Overlay::ConsolePrint("streak_give: uav, artillery, typhoon, mortar or enemyuav"); return; }
+    const int what = kind == "uav" ? 1 : kind == "artillery" ? 2 : (kind == "typhoon" || kind == "hellfire") ? 3 : kind == "enemyuav" ? 4 : kind == "mortar" ? 5 : 0;
+    if (!what) { Overlay::ConsolePrint("streak_give: uav, artillery, hellfire, mortar or enemyuav"); return; }
     g_streakAsked.store(what);
 }
 void MpFixesGiveStreakFrame(uint8_t* base)
 {
+    // 0.5.608: COD3_UAVTEST_AT=N (a self-test of the UAV plane): the enemy's
+    // plane over the map N s into a match, and again every 70 s
+    {
+        static const int testAt = []() { const char* t = getenv("COD3_UAVTEST_AT"); return t ? atoi(t) : 0; }();
+        static uint64_t inGameSince = 0, nextAt = 0;
+        if (testAt > 0)
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+            const bool inGame = list && ClientOf(base, Guest::Read32(base, list + 4)) >= 0;
+            const uint64_t t = GetTickCount64();
+            if (!inGame) inGameSince = 0;
+            else if (!inGameSince) { inGameSince = t; nextAt = t + uint64_t(testAt) * 1000; }
+            else if (t >= nextAt) { nextAt = t + 70000; g_streakAsked.store(4); printf("killstreak: UAV plane self-test (COD3_UAVTEST_AT)\n"); fflush(stdout); }
+        }
+    }
     const int what = g_streakAsked.exchange(0);
     if (!what) return;
     const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
@@ -3335,7 +4490,7 @@ void MpFixesGiveStreakFrame(uint8_t* base)
     if (what == 3) s.typhoons++;
     printf("killstreak: streak_give %d for client %d (%d strikes waiting, %d runs)\n", what, i, s.charges, s.typhoons);
     fflush(stdout);
-    Overlay::Notice(what == 3 ? "TYPHOON GIVEN" : what == 2 ? "ARTILLERY GIVEN" : "UAV GIVEN", 2000);
+    Overlay::Notice(what == 3 ? "HELLFIRE BARRAGE GIVEN" : what == 2 ? "ARTILLERY GIVEN" : "UAV GIVEN", 2000);
 }
 
 // Each frame on the host: strikes earned are made ready, called ones taken off.
@@ -3355,6 +4510,23 @@ void MpFixesKillstreaks(PPCContext& ctx, uint8_t* base)
     if (!entities) return;
     const uint32_t now = GameTime(ctx, base);
     if (!now) return;
+    // 0.5.438: COD3_HELLFIRE_TEST=seconds: the host's own Hellfire Barrage
+    // that long after its player is first in play (a hands-off test)
+    {
+        static const int testAt = [] { const char* e = getenv("COD3_HELLFIRE_TEST"); return e ? atoi(e) : 0; }();
+        static uint64_t inPlaySince = 0;
+        static bool tested = false;
+        const uint32_t own = Guest::Read32(base, entities + 4);
+        if (testAt > 0 && !tested && own && int32_t(Guest::Read32(base, own + 776)) > 0)
+        {
+            if (!inPlaySince) inPlaySince = GetTickCount64();
+            else if (GetTickCount64() - inPlaySince > uint64_t(testAt) * 1000)
+            {
+                tested = MpFixesHellfireStart(base, ClientOf(base, own));
+                if (tested) Overlay::Notice("HELLFIRE BARRAGE (test)  -  the whole map is burning", 4000);
+            }
+        }
+    }
     for (int i = 0; i < int(MpCapClients); i++)
     {
         Streak& s = g_streaks[i];
@@ -3368,10 +4540,16 @@ void MpFixesKillstreaks(PPCContext& ctx, uint8_t* base)
         // but only the host has the killstreak box): one earned is armed at
         // once, the spotter's binoculars given and put in his hands (every
         // other slot kept), and fired as the host's are.
-        if (s.alive && !s.armed && s.charges > 0 && entity != Guest::Read32(base, entities + 4))
+        // 0.5.438: their Hellfire Barrage falls at once (no binoculars; one at a time)
+        if (s.alive && !s.armed && s.typhoons > 0 && s.charges > 0 && entity != Guest::Read32(base, entities + 4) && MpFixesHellfireStart(base, i))
+        {
+            s.typhoons--;
+            s.charges--;
+        }
+        if (s.alive && !s.armed && s.charges - s.typhoons > 0 && entity != Guest::Read32(base, entities + 4))
         {
             s.armed = true;
-            s.typhoonCalled = s.typhoons > 0;
+            s.typhoonCalled = false;
             uint8_t slots[10];
             for (int n = 0; n < 10; n++) slots[n] = Guest::Read8(base, ps + 1064 + n);
             OnWeaponFor(ctx, base, handle, 2664, "mp_binoculars");
@@ -3557,6 +4735,9 @@ namespace
         uint64_t nextShot = 0, nextTrace = 0, nextTurn = 0, nextTell = 0, stopAt = 0;
     };
     MortarUse g_mortar;
+    bool g_mortarOwnEvents = false;            // 0.5.801: a round's own explosion made from Laison's table
+    std::atomic<int> g_mortarTestRounds{0};   // 0.5.801: mortar_test's rounds still to fire
+    uint64_t g_mortarTestNext = 0;
     std::atomic<int> g_mortarAskStart{0};      // from the box (frame): 1 the rounds left, 2 a new mortar's
     std::atomic<bool> g_mortarAskStop{false};
     std::atomic<int> g_mortarLeft{0};          // rounds left while put away (the box)
@@ -3623,6 +4804,56 @@ namespace
         PlaneSound(ctx, base, ent, alias);
         static int said = 0;
         if ((said < 60 && said++ < 60)) { printf("mortar: sound %s, %.0f away\n", alias, d); fflush(stdout); }
+    }
+
+    // 0.5.803: the round's real hit (see the flight's landing, below): the
+    // tube's weapon's shell launched by the game's vehicle shell launcher
+    // sub_82582A98(r3 the owner entity: its byte +3 the weapon, +480 its archive
+    // scope, +484 its handle, copied to the shell; r4 the origin, r5 the
+    // direction; f1 the fuse in seconds) from 60 over the landing point,
+    // straight down. The shooter's own entity is the owner (his kill), with the
+    // tube's weapon and Laison's archive in it for the call.
+    int32_t MpFixesLaisonArchiveIndex();   // (below, with the archives)
+    bool MortarRealHit(PPCContext& ctx, uint8_t* base, float x, float y, float z, uint32_t attacker)
+    {
+        static const bool off = [] { const char* t = getenv("COD3_MORTAR_REAL_HIT"); return t && t[0] == '0'; }();
+        const int32_t archive = MpFixesLaisonArchiveIndex();
+        if (off || archive < 0) return false;
+        const uint32_t owner = attacker ? attacker : MortarOwn(base);
+        if (owner < 0x40000000u || owner >= 0xA0000000u) return false;
+        static int32_t weapon = -1;
+        if (weapon < 0)
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+            const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+            for (int32_t k = 1; list && k <= count && k < 256; k++)
+            {
+                const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+                const uint32_t text = def >= 0x40000000u && def < 0xA0000000u ? Guest::Read32(base, def + 8) : 0;
+                if (text >= 0x40000000u && text < 0xA0000000u && ReadText(base, text, 32) == "mortar_81mm_turret") { weapon = k; break; }
+            }
+            printf("mortar: real hit: mortar_81mm_turret is weapon %d\n", weapon); fflush(stdout);
+            if (weapon < 0) { weapon = 0; return false; }
+        }
+        if (weapon <= 0 || weapon > 255) return false;
+        static uint32_t buf = 0;
+        if (!buf) buf = Guest::AllocatePhysical(0x40);
+        PlaneWriteF(base, buf, x); PlaneWriteF(base, buf + 4, y); PlaneWriteF(base, buf + 8, z + 60.0f);
+        PlaneWriteF(base, buf + 16, 0.0f); PlaneWriteF(base, buf + 20, 0.0f); PlaneWriteF(base, buf + 24, -1.0f);
+        const uint8_t wasWeapon = Guest::Read8(base, owner + 3);
+        const uint32_t wasArchive = Guest::Read32(base, owner + 480);
+        Guest::Write8(base, owner + 3, uint8_t(weapon));
+        Guest::Write32(base, owner + 480, uint32_t(archive));
+        PPCContext call = ctx;
+        call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+        call.r3.u64 = owner; call.r4.u64 = buf; call.r5.u64 = buf + 16; call.f1.f64 = 4.0; call.lr = 0;
+        Guest::Lookup(0x82582A98)(call, base);
+        Guest::Write8(base, owner + 3, wasWeapon);
+        Guest::Write32(base, owner + 480, wasArchive);
+        const uint32_t shell = call.r3.u32;
+        static int said = 0;
+        if (said < 20) { said++; printf("mortar: real hit: the game's mortar_81mm_turret shell %08X launched down at %.0f %.0f %.0f (owner %08X)\n", shell, x, y, z + 60.0f, owner); fflush(stdout); }
+        return shell >= 0x40000000u && shell < 0xA0000000u;
     }
 
     void MortarPlace(PPCContext& ctx, uint8_t* base, uint32_t& handle, bool shell, float x, float y, float z, float pitch, float yaw)
@@ -4019,6 +5250,9 @@ namespace
         // Looking 30 down: the nearest; 50 up: the furthest.
         const float t = std::clamp((30.0f - pitch) / 80.0f, 0.0f, 1.0f);
         g_mortar.range = kMortarMinRange + (kMortarMaxRange - kMortarMinRange) * t;
+        // 0.5.806: COD3_MORTAR_TEST_RANGE=N: a test's rounds land N ahead (in view)
+        static const float testRange = [] { const char* r = getenv("COD3_MORTAR_TEST_RANGE"); return r ? float(atof(r)) : 0.0f; }();
+        if (testRange > 0.0f) g_mortar.range = testRange;
         g_mortar.tx = g_mortar.px + cosf(yaw * Rad) * g_mortar.range;
         g_mortar.ty = g_mortar.py + sinf(yaw * Rad) * g_mortar.range;
         if (now >= g_mortar.nextTrace)
@@ -4074,7 +5308,15 @@ namespace
             printf("mortar look: aim pitch %.1f yaw %.1f range %.0f target %.0f %.0f %.0f\n", pitch, yaw, g_mortar.range, g_mortar.tx, g_mortar.ty, g_mortar.tz);
             fflush(stdout);
         }
-        const int fires = Input::TakeMortarFires();
+        int fires = Input::TakeMortarFires();
+        // 0.5.801: "mortar_test [rounds]" (tests cannot press RT): a round every 2.5 s
+        if (g_mortarTestRounds.load() > 0 && now >= g_mortarTestNext && g_mortar.rounds > 0 && now >= g_mortar.nextShot && !g_mortar.feedAt)
+        {
+            g_mortarTestNext = now + 2500;
+            g_mortarTestRounds.fetch_sub(1);
+            fires = 1;
+            printf("mortar: test round (%d more)\n", g_mortarTestRounds.load()); fflush(stdout);
+        }
         if (fires > 0 && g_mortar.rounds > 0 && now >= g_mortar.nextShot && !g_mortar.feedAt)
         {
             // 0.5.311: the round fed in first (held over the muzzle, then
@@ -4243,9 +5485,374 @@ void MpFixesMortarUsedOut(uint8_t* base)
     PlaneNetSend({ 'C', '3', 'K', 'M', PlaneNetVersion, uint8_t(mine) });
 }
 
+// 0.5.440: THE HELLFIRE'S OWN SHELLS. 439's two tests: the game's barrage
+// (sub_821F70A8) called at our spots sent only its notifies, its shells
+// fell where the game chose (Justin: "only isolated to a certain area", "im
+// not feeling it every where"), its kills went to the last caller of the
+// game's artillery or to no one, and its firing call sounded with each one
+// ("only once should be enough"). Now each strike is an explosion of ours
+// at its spot, as the mortar's round lands (0.5.291): the effects
+// (panzerschreck, frag, and the campaign round's when Laison's weapons are
+// in) and Mortar_Explo on every machine (C3KH from the host), the blast
+// (MortarBlast's damage, kMortarRadius) on the host only: every living
+// player in reach, the caller's damage to his enemies (his kills), the
+// victim's own to the caller and his side ("everyone is affected").
+namespace
+{
+    constexpr int HellfirePoolSize = 96;   // 0.5.446: 96 (was 64): a third effect for the shells near
+    uint32_t g_hellfirePool[HellfirePoolSize] = {};
+    uint64_t g_hellfireParkAt[HellfirePoolSize] = {};   // 0.5.453: when each origin (and its glow) is put away
+    int g_hellfireNext = 0;
+    std::string g_hellfirePoolMap;
+}
+// 0.5.443: the effects' 64 origins made ahead (under the map), before the
+// first shell: an event on an entity made in the same frame is not seen.
+void MpFixesHellfirePool(PPCContext& ctx, uint8_t* base)
+{
+    const std::string map = Kernel::CurrentMap();
+    if (map != g_hellfirePoolMap) { g_hellfirePoolMap = map; for (uint32_t& h : g_hellfirePool) h = 0; }
+    for (uint32_t& h : g_hellfirePool) if (!h || !PlaneEntity(base, h)) h = PlaneSpawnOrigin(ctx, base, 0.0f, 0.0f, -60000.0f);
+}
+namespace
+{
+    // 0.5.444: a shell's effects wait for their origins to be there: each
+    // origin is moved to the spot with the game's mover (moveto, which the
+    // snapshot carries), and the effects are played on it 150 ms later. 442
+    // and 443 wrote the spot into the entity alone (PlaneFx's way), and the
+    // origins made ahead under the map stayed there for the players (Justin:
+    // "i never seen any explosions"). The blast's damage comes with them.
+    struct HellfireDue { uint32_t a = 0, b = 0, c = 0; float x = 0, y = 0, z = 0; uint64_t at = 0; int index = 0; bool host = false; };
+    std::vector<HellfireDue> g_hellfireDue;
+    std::vector<uint64_t> g_hellfireShots;   // COD3_HELLFIRE_TEST: screenshots due
+}
+void MpFixesHellfireBlast(PPCContext& ctx, uint8_t* base, float x, float y, float z, int index)
+{
+    // 0.5.454: deadlier than the mortar's (Justin: "make sure they actaully kill
+    // people"): death within 280 (was 170), the blast to 700 (was 560), 60 at
+    // its edge, the concussion to 1000; as the artillery's (means 18: the kill
+    // feed shows it; 14, the mortar's splash, was not shown)
+    constexpr float Radius = 700.0f, KillRadius = 280.0f, ShakeRadius = 1000.0f;
+    constexpr int Damage = 400, EdgeDamage = 60;
+    const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
+    if (!entities) return;
+    const uint32_t caller = g_hellfire.caller >= 0 ? Guest::Read32(base, entities + 4 * uint32_t(g_hellfire.caller + 1)) : 0;
+    const int side = caller ? BotsSideOf(base, caller) : 0;
+    static uint32_t point = 0;
+    if (!point) point = Guest::AllocatePhysical(0x20);
+    int hits = 0;
+    for (uint32_t i = 0; i < MpCapClients; i++)
+    {
+        const uint32_t e = Guest::Read32(base, entities + 4 * (i + 1));
+        const uint32_t ps = MortarState(base, e);
+        if (!ps || int32_t(Guest::Read32(base, e + 776)) <= 0) continue;
+        const float ex = PlaneReadF(base, ps), ey = PlaneReadF(base, ps + 4), ez = PlaneReadF(base, ps + 8) + 36.0f;
+        const float d = sqrtf((ex - x) * (ex - x) + (ey - y) * (ey - y) + (ez - z) * (ez - z));
+        if (!std::isfinite(d) || d > ShakeRadius) continue;
+        // 0.5.446: from the blast's edge (560) to 950: the concussion, 12 damage as
+        // his own (the game's flinch and shock, as from its artillery), never
+        // a death (only with 25 or more left)
+        if (d > Radius)
+        {
+            if (int32_t(Guest::Read32(base, e + 776)) < 25) continue;
+            PlaneWriteF(base, point, x); PlaneWriteF(base, point + 4, y); PlaneWriteF(base, point + 8, z);
+            PPCContext shake = ctx;
+            shake.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+            Guest::Write32(base, shake.r1.u32 + 84, 0);
+            Guest::Write32(base, shake.r1.u32 + 92, 0xFFFFFFFFu);
+            shake.r3.u64 = e; shake.r4.u64 = e; shake.r5.u64 = e; shake.r6.u64 = 0; shake.r7.u64 = point;
+            // 0.5.447: 12 as a grenade's splash (means 11): 446's 4 as the mortar's
+            // (14) made no shell shock at all (1 in the whole test)
+            shake.r8.u64 = 12; shake.r9.u64 = 0; shake.r10.u64 = 11; shake.lr = 0;
+            g_hellfireDamaging = true;
+            Guest::Lookup(0x825862F8)(shake, base);
+            g_hellfireDamaging = false;
+            continue;
+        }
+        float damage = d <= KillRadius ? float(Damage)
+            : float(Damage) - (d - KillRadius) / (Radius - KillRadius) * float(Damage - EdgeDamage);
+        if (!BotsLineClear(ctx, base, e, x, y, z + 24.0f, ex, ey, ez)) damage *= 0.35f;
+        const int amount = int(damage);
+        if (amount < 1) continue;
+        const bool friendly = !caller || e == caller || (side != 0 && BotsSideOf(base, e) == side);
+        const uint32_t attacker = friendly ? e : caller;
+        PlaneWriteF(base, point, x); PlaneWriteF(base, point + 4, y); PlaneWriteF(base, point + 8, z);
+        PPCContext call = ctx;
+        call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+        Guest::Write32(base, call.r1.u32 + 84, 0);
+        Guest::Write32(base, call.r1.u32 + 92, 0xFFFFFFFFu);
+        // G_Damage as MortarBlast's: target, inflictor, attacker, direction,
+        // point, damage, flags, means (MOD_MORTAR_SPLASH), +84 0, +92 -1
+        call.r3.u64 = e; call.r4.u64 = attacker; call.r5.u64 = attacker; call.r6.u64 = 0; call.r7.u64 = point;
+        call.r8.u64 = uint32_t(amount); call.r9.u64 = 0; call.r10.u64 = 18; call.lr = 0;
+        g_hellfireDamaging = true;
+        Guest::Lookup(0x825862F8)(call, base);
+        g_hellfireDamaging = false;
+        hits++;
+    }
+    static int told = 0;
+    if (told++ < 60 || hits) { printf("killstreak: hellfire shell %d at %.0f %.0f %.0f: %d hit\n", index + 1, x, y, z, hits); fflush(stdout); }
+}
+void MpFixesHellfireImpact(PPCContext& ctx, uint8_t* base, float x, float y, float z, int index, bool host)
+{
+    if (Kernel::CurrentMap() != g_hellfirePoolMap) MpFixesHellfirePool(ctx, base);
+    HellfireDue due;
+    due.x = x; due.y = y; due.z = z; due.index = index; due.host = host;
+    // 0.5.446 (Justin: "the next level intensity ... its sounds and
+    // animations"): each shell is heard coming in first, Mortar_Miss (the
+    // falling shell's whistle, the mortar's) 250 above its spot within 2500
+    // of this machine's player (one each 350 ms at most), and falls 700 ms
+    // later; a shell within 1800 has a third effect, a second fireball 70
+    // off the first, for a wider blast.
+    const uint64_t now = GetTickCount64();
+    due.at = now + 1100;   // 0.5.452: as the game's shell's incoming (1.1 s, sub_82583728)
+    const uint32_t own = MortarState(base, MortarOwn(base));
+    const float nearMe = own ? sqrtf((PlaneReadF(base, own) - x) * (PlaneReadF(base, own) - x) + (PlaneReadF(base, own + 4) - y) * (PlaneReadF(base, own + 4) - y)) : 1e9f;
+    {
+        static uint64_t lastWhistle = 0;
+        if (!host && nearMe < 2500.0f && now - lastWhistle >= 350)   // 0.5.452: the host's shells whistle as the game's own (below)
+        {
+            lastWhistle = now;
+            MortarSoundAt(ctx, base, x, y, z + 250.0f, "UAV:IMP_INCOMING");   // 0.5.450: the artillery's incoming cue (was the mortar's whistle)
+        }
+    }
+    for (uint32_t* h : { &due.a, &due.b, &due.c })
+    {
+        if (h == &due.c && nearMe >= 1800.0f) break;
+        const int slot = g_hellfireNext++ % HellfirePoolSize;
+        uint32_t& pooled = g_hellfirePool[slot];
+        g_hellfireParkAt[slot] = 0;   // 0.5.453: in use again: not put away under it
+        if (!pooled || !PlaneEntity(base, pooled)) pooled = PlaneSpawnOrigin(ctx, base, x, y, z + 8.0f);
+        if (pooled) PlaneMoveTo(ctx, base, pooled, h == &due.c ? x + 70.0f : x, h == &due.c ? y - 40.0f : y, z + 8.0f, 0.05f);
+        *h = pooled;
+    }
+    g_hellfireDue.push_back(due);
+    // 0.5.451: THE GAME'S OWN ARTILLERY SHELL at this spot (the host: its
+    // entities and their explosions reach every player from the game). A real
+    // strike's shells are entities: sub_82583728 (from the strike's script)
+    // plays SHELL_INCOMING on one and sets it to think 1.1 s later as think 9
+    // (+764; +760 the time; G_RunThink sub_8255DA38 calls the table at
+    // 0x825FCFD0), its explosion. 0.5.450's real strike in the log: the call,
+    // then SHELL_INCOMING from 82583770, then SHELL_EXPLO_MAINIMP. Here an
+    // entity of ours is made at the spot and handed to it the same way.
+    if (host)
+    {
+        // 0.5.453: 48 shell entities used by turns (451 made one a shell, never
+        // freed: 240 entities a Hellfire)
+        static int made = 0, told = 0, nextShell = 0;
+        static uint32_t shells[48] = {};
+        static std::string shellMap;
+        if (Kernel::CurrentMap() != shellMap) { shellMap = Kernel::CurrentMap(); for (uint32_t& s : shells) s = 0; }
+        uint32_t& handle = shells[nextShell++ % 48];
+        if (!handle || !PlaneEntity(base, handle)) handle = PlaneSpawnOrigin(ctx, base, x, y, z + 4.0f);
+        const uint32_t ent = handle ? PlaneEntity(base, handle) : 0;
+        if (ent)
+        {
+            PlaneWriteF(base, ent + 336, x); PlaneWriteF(base, ent + 340, y); PlaneWriteF(base, ent + 344, z + 4.0f);
+            PlaneMoveTo(ctx, base, handle, x, y, z + 4.0f, 0.05f);
+        }
+        if (ent)
+        {
+            PPCContext call = ctx;
+            call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+            call.r3.u64 = ent; call.lr = 0;
+            Guest::Lookup(0x82583728)(call, base);
+            made++;
+            if (told++ < 6) { printf("killstreak: hellfire artillery shell %d: entity %08X at %.0f %.0f %.0f, think %u at %u (think 9 is %08X)\n", made, ent, x, y, z, Guest::Read32(base, ent + 764), Guest::Read32(base, ent + 760), Guest::Read32(base, 0x825FCFD0 + 36)); fflush(stdout); }
+        }
+    }
+}
+// Each frame, on every machine (MpFixesMortarFrame): the shells whose origins are there.
+void MpFixesHellfireDueFrame(PPCContext& ctx, uint8_t* base)
+{
+    const uint64_t now = GetTickCount64();
+    // 0.5.453: the origins whose glow has had its 6 s: under the map
+    for (int slot = 0; slot < HellfirePoolSize; slot++)
+        if (g_hellfireParkAt[slot] && now >= g_hellfireParkAt[slot])
+        {
+            g_hellfireParkAt[slot] = 0;
+            if (g_hellfirePool[slot] && PlaneEntity(base, g_hellfirePool[slot])) PlaneMoveTo(ctx, base, g_hellfirePool[slot], 0.0f, 0.0f, -60000.0f, 0.05f);
+        }
+    for (size_t k = 0; k < g_hellfireShots.size();)
+    {
+        if (now < g_hellfireShots[k]) { k++; continue; }
+        g_hellfireShots.erase(g_hellfireShots.begin() + k);
+        Overlay::RequestScreenshot();
+        printf("killstreak: hellfire test screenshot\n");
+        fflush(stdout);
+    }
+    for (size_t k = 0; k < g_hellfireDue.size();)
+    {
+        if (now < g_hellfireDue[k].at) { k++; continue; }
+        const HellfireDue d = g_hellfireDue[k];
+        g_hellfireDue.erase(g_hellfireDue.begin() + k);
+        if (d.index == 0)
+        {
+            // The call, once: the game's artillery being fired
+            const uint32_t ps = MortarState(base, MortarOwn(base));
+            if (ps) MortarSoundAt(ctx, base, PlaneReadF(base, ps) + 600.0f, PlaneReadF(base, ps + 4), PlaneReadF(base, ps + 8) + 400.0f, "MP_Artillery_Fire");
+        }
+        // The frag's and the panzerschreck's (the mortar's two seen ones,
+        // 0.5.298 on), each on its own origin (an entity carries one event
+        // a snapshot: 0.5.442)
+        {
+            // 0.5.450: the spotter binoculars' explosion fields, once (as the
+            // mortar round's, 0.5.308): whether its effect and sound are the
+            // artillery's
+            static bool told = false;
+            if (!told)
+            {
+                told = true;
+                const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+                const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+                for (int32_t k = 1; list && k <= count && k < 92; k++)
+                {
+                    const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+                    const uint32_t text = def ? Guest::Read32(base, def + 8) : 0;
+                    if (text < 0x40000000u || text >= 0x90000000u || ReadText(base, text, 16) != "mp_binoculars") continue;
+                    const uint32_t fx = Guest::Read32(base, def + 1940), snd = Guest::Read32(base, def + 1944), model = Guest::Read32(base, def + 1932);
+                    printf("killstreak: mp_binoculars (weapon %d) explosion effect %08X sound %08X projectile model %08X\n", k, fx, snd, model);
+                    if (fx >= 0x40000000u && fx < 0x90000000u) printf("killstreak:   its effect is '%s'\n", ReadText(base, fx, 40).c_str());
+                    if (snd >= 0x40000000u && snd < 0x90000000u) printf("killstreak:   its sound is '%s'\n", ReadText(base, snd, 40).c_str());
+                    fflush(stdout);
+                }
+            }
+        }
+        const uint32_t keep = g_planeFxHandle;
+        // 0.5.452: THE ARTILLERY'S OWN EXPLOSION. The strike's shells are the
+        // spotter binoculars' projectiles (weapusge.cod: projectileDelay 6000,
+        // projExplosionEffect), and their explosion is an event by surface in
+        // every map's event table: projexplode_mp_binoculars_<surface>, whose
+        // effects are artillery/artillery_<dirt|concrete|metal|generic>.effect.
+        // 450 played the binoculars' plain explosion (empty: nothing drawn);
+        // now that event by name at the spot (as the planes' sounds are
+        // played, sub_82556868), surfaces by turns.
+        if (const uint32_t at = d.a ? PlaneEntity(base, d.a) : 0)
+        {
+            static const char* const surfaces[6] = { "projexplode_mp_binoculars_dirt", "projexplode_mp_binoculars_grass", "projexplode_mp_binoculars_mud",
+                                                     "projexplode_mp_binoculars_dirt", "projexplode_mp_binoculars_rock", "projexplode_mp_binoculars_concrete" };
+            PlaneSound(ctx, base, at, surfaces[d.index % 6]);
+        }
+        if (d.b && PlaneEntity(base, d.b)) { g_planeFxHandle = d.b; PlaneFx(ctx, base, d.x, d.y, d.z + 8.0f, "panzerschreck", 56); }
+        if (d.c && PlaneEntity(base, d.c)) { g_planeFxHandle = d.c; PlaneFx(ctx, base, d.x + 70.0f, d.y - 40.0f, d.z + 8.0f, "mp_mine", 56); }   // 0.5.447: the mine's blast (was a second panzerschreck)
+        // 0.5.453: their glow stays on the origin it was played on until that
+        // origin is moved (Justin: "those little red balls stay around the
+        // map ... we can keep the glow its cool but just let it fade out after
+        // a little while"): each origin used here is put away 6 s on
+        for (const uint32_t used : { d.a, d.b, d.c })
+            for (int slot = 0; used && slot < HellfirePoolSize; slot++)
+                if (g_hellfirePool[slot] == used) g_hellfireParkAt[slot] = now + 6000;
+        g_planeFxHandle = keep;
+        // The explosion's sound within 3000 (or one shell in six), at most one
+        // each 400 ms: our sounds are all the Kar98 event's, and the bombers'
+        // need its voices too (0.5.442)
+        {
+            static uint64_t lastSound = 0;
+            const uint32_t ps = MortarState(base, MortarOwn(base));
+            const float dist = ps ? sqrtf((PlaneReadF(base, ps) - d.x) * (PlaneReadF(base, ps) - d.x) + (PlaneReadF(base, ps + 4) - d.y) * (PlaneReadF(base, ps + 4) - d.y)) : 0.0f;
+            if ((dist < 3000.0f || d.index % 6 == 0) && now - lastSound >= 400)
+            {
+                lastSound = now;
+                MortarSoundAt(ctx, base, d.x, d.y, d.z + 20.0f, "UAV:Mortar_Explo");
+            }
+        }
+        if (d.host) MpFixesHellfireBlast(ctx, base, d.x, d.y, d.z, d.index);
+    }
+}
+// On the host, each frame: the next shells due (MpFixesBarrageFrame).
+bool MpFixesHellfirePoint(PPCContext& ctx, uint8_t* base, int n, float& x, float& y, float& z);
+void MpFixesHellfireFrame(PPCContext& ctx, uint8_t* base)
+{
+    const uint64_t now = GetTickCount64();
+    if (g_hellfire.left > 0 && g_hellfire.fired == 0 && !g_hellfire.pooled)
+    {
+        // 0.5.448: the game's barrage (sub_821F70A8) does nothing for a player
+        // with no artillery dispenser (0.5.438/439: no shell fell; a bot's
+        // earlier barrage was all that was seen and killed): the caller's
+        // dispenser started, as a killstreak's artillery is (StartDispenser),
+        // its ready time parked an hour away (as after a killstreak's strike:
+        // the barrage's repeat works then), and the first barrage 400 ms on.
+        StartDispenser(ctx, base, g_hellfire.handle);
+        const uint32_t slot = ReadySlot(ctx, base, g_hellfire.handle);
+        g_hellfire.slot = slot;
+        // 0.5.449: kept ready (0) through the Hellfire, as an armed killstreak
+        // strike's is: 448 parked it an hour away and the barrages marked
+        // their spots (the red markers Justin saw) but dropped no shell
+        if (slot) Guest::Write32(base, slot, 0);
+        printf("killstreak: Hellfire's dispenser started for handle %08X (ready word %08X)\n", g_hellfire.handle, slot);
+        fflush(stdout);
+        g_hellfire.pooled = true;
+        g_hellfire.next = now + 400;
+        return;
+    }
+    for (int k = 0; k < 4 && g_hellfire.left > 0 && now >= g_hellfire.next; k++)
+    {
+        g_hellfire.left--;
+        g_hellfire.next += HellfireGapMs;
+        float x, y, z;
+        bool point = MpFixesHellfirePoint(ctx, base, g_hellfire.fired, x, y, z);
+        // COD3_HELLFIRE_TEST: every 40th 600 in front of the host's player,
+        // with screenshots 0.8 and 1.5 s on
+        static const bool test = getenv("COD3_HELLFIRE_TEST") != nullptr;
+        if (test && g_hellfire.fired % 40 == 20)
+        {
+            const uint32_t ps = MortarState(base, MortarOwn(base));
+            if (ps)
+            {
+                const float yaw = PlaneReadF(base, ps + 208) * 3.14159265f / 180.0f;
+                x = PlaneReadF(base, ps) + cosf(yaw) * 600.0f; y = PlaneReadF(base, ps + 4) + sinf(yaw) * 600.0f; z = PlaneReadF(base, ps + 8);
+                point = true;
+                g_hellfireShots.push_back(now + 800);
+                g_hellfireShots.push_back(now + 1500);
+                printf("killstreak: hellfire test shell %d in front of the host at %.0f %.0f %.0f\n", g_hellfire.fired + 1, x, y, z);
+            }
+        }
+        // 0.5.450: the game's barrage once, at the first shell: its call ("Artillery
+        // strike called", the firing, the scout's call, the compass marker).
+        // 449's 48 calls showed the message 48 times and dropped no shell: the
+        // barrage is the call, not the shells (Justin: "its only supposed to
+        // say it once").
+        if (point && g_hellfire.fired == 0)
+        {
+            static uint32_t word = 0;
+            if (!word) word = Guest::AllocatePhysical(0x10);
+            Guest::Write32(base, word, g_hellfire.handle);
+            if (g_hellfire.slot) Guest::Write32(base, g_hellfire.slot, 0);   // 0.5.449: ready for each barrage
+            PPCContext call = ctx;
+            call.r1.u32 = (ctx.r1.u32 - 0x2000) & ~0xFu;
+            call.r3.u64 = word; call.r4.u64 = (uint64_t(FBits(x)) << 32) | FBits(y); call.r5.u64 = uint64_t(FBits(z)) << 32; call.lr = 0;
+            g_repeating = true;
+            Guest::Lookup(0x821F70A8)(call, base);
+            g_repeating = false;
+            g_hellfire.quietUntil = now + 12000;
+            static int said = 0;
+            if (said++ < 60) { printf("killstreak: hellfire barrage %d at %.0f %.0f %.0f\n", g_hellfire.fired + 1, x, y, z); fflush(stdout); }
+        }
+        // 0.5.450: every shell ours (the artillery's own explosion: the spotter
+        // binoculars' projectile, mp_binoculars, whose events come with a real
+        // strike; see MpFixesHellfireDueFrame), on every machine (C3KH)
+        if (point)
+        {
+            const int index = 1000 + g_hellfire.fired;   // (not 0: the call's sound is the barrage's)
+            MpFixesHellfireImpact(ctx, base, x, y, z, index, true);
+            std::vector<uint8_t> v = { 'C', '3', 'K', 'H', PlaneNetVersion, uint8_t(1 + (index % 254)) };
+            PutF(v, x); PutF(v, y); PutF(v, z);
+            PlaneNetSend(v);
+        }
+        g_hellfire.fired++;
+        if (g_hellfire.left == 0 && g_hellfire.slot)
+        {
+            // 0.5.449: over: the dispenser parked an hour away (no free artillery after)
+            const uint32_t time = GameTime(ctx, base);
+            if (time) Guest::Write32(base, g_hellfire.slot, time + 3600000u);
+        }
+        if (g_hellfire.left == 0) { printf("killstreak: the Hellfire Barrage is over (%d barrages)\n", g_hellfire.fired); fflush(stdout); }
+    }
+}
+
 // Each server frame (MpFixesPlaneFrame), on every machine.
 void MpFixesMortarFrame(PPCContext& ctx, uint8_t* base)
 {
+    MpFixesHellfireDueFrame(ctx, base);   // 0.5.444
     const std::string map = Kernel::CurrentMap();
     if (map != g_mortarMap)
     {
@@ -4286,9 +5893,21 @@ void MpFixesMortarFrame(PPCContext& ctx, uint8_t* base)
             // explosion that Justin could see, so the panzerschreck's and
             // the frag's (seen before 298) always go off too; the round's
             // own explosion fields are logged once to find why.
-            if (MortarCampaignWeapons(base))
+            // 0.5.803: the round's REAL hit (host): the game's own shell of the
+            // tube's weapon (mortar_81mm_turret), launched by the vehicle shell
+            // launcher (sub_82582A98) from just over the landing point straight
+            // down, so the game finds the surface and makes Laison's own
+            // projexplode_81mm_<surface> (effect, sound) and the shell's damage.
+            // 802's event 56 on a script_origin had no surface: only the set's
+            // generic events (mervtank2). The stand-ins only if this fails.
+            bool realHit = false;
+            if (MortarCampaignWeapons(base) && BotsThisMachineHostsBots(base))
             {
-                PlaneFx(ctx, base, s.tx, s.ty, s.tz + 8.0f, "mortar_shell", 56);
+                const uint32_t attacker = s.attacker ? s.attacker : MortarShooter(base, s.number);
+                realHit = MortarRealHit(ctx, base, s.tx, s.ty, s.tz, attacker);
+            }
+            if (!realHit && MortarCampaignWeapons(base))
+            {
                 static bool told = false;
                 if (!told)
                 {
@@ -4307,9 +5926,16 @@ void MpFixesMortarFrame(PPCContext& ctx, uint8_t* base)
                     fflush(stdout);
                 }
             }
-            PlaneFx(ctx, base, s.tx, s.ty, s.tz + 8.0f, "panzerschreck", 56);
-            PlaneFx(ctx, base, s.tx, s.ty, s.tz + 8.0f, "fraggrenade", 56);
-            MortarSoundAt(ctx, base, s.tx, s.ty, s.tz + 20.0f, "UAV:Mortar_Explo");
+            // 0.5.801: the stand-ins only while the round's own events have not
+            // worked (Laison's table, sub_82555160: g_mortarOwnEvents once a
+            // round's event 56 made something). COD3_MORTAR_STANDIN=1: always.
+            static const bool standIn = [] { const char* t = getenv("COD3_MORTAR_STANDIN"); return t && t[0] == '1'; }();
+            if (standIn || (!realHit && !g_mortarOwnEvents))
+            {
+                PlaneFx(ctx, base, s.tx, s.ty, s.tz + 8.0f, "panzerschreck", 56);
+                PlaneFx(ctx, base, s.tx, s.ty, s.tz + 8.0f, "fraggrenade", 56);
+                MortarSoundAt(ctx, base, s.tx, s.ty, s.tz + 20.0f, "UAV:Mortar_Explo");
+            }
             MortarPark(ctx, base, s.handle);
             if (BotsThisMachineHostsBots(base))
             {
@@ -4421,7 +6047,7 @@ namespace
         ImFont* font = ImGui::GetFont();
         const float scale = height / 1080.0f;
         const float size = 22.0f * scale, small = 17.0f * scale, row = 34.0f * scale, w = 250.0f * scale;
-        static const char* const names[StreakKinds] = { "UAV", "ARTILLERY", "TYPHOON", "MORTAR" };
+        static const char* const names[StreakKinds] = { "UAV", "ARTILLERY", "HELLFIRE", "MORTAR" };   // 0.5.438: the Typhoon's place
         int rows = 0;
         for (int k = 0; k < StreakKinds; k++) if (box.counts[k] > 0) rows++;
         const float h = (rows + 1) * row + 14.0f * scale;
@@ -4512,7 +6138,18 @@ bool MpFixesStreakPad(PPCContext& ctx, uint8_t* base, bool down, int rights)
                 if (Settings::Get().uavPlane) MpFixesUavPlane(base, own, Settings::Get().uavSeconds);   // 0.5.253: the plane over the map
                 printf("killstreak: own UAV called from the box\n");
             }
-            else if ((k == StreakArtillery || k == StreakTyphoon) && StreakCount(s, k) > 0)
+            else if (k == StreakTyphoon && StreakCount(s, k) > 0)   // 0.5.438: the Hellfire Barrage, at once
+            {
+                if (MpFixesHellfireStart(base, i))
+                {
+                    s.typhoons--;
+                    s.charges--;
+                    Overlay::Notice("HELLFIRE BARRAGE  -  the whole map is burning", 4000);
+                    printf("killstreak: own Hellfire Barrage unleashed from the box\n");
+                }
+                else Overlay::Notice("HELLFIRE BARRAGE  -  one is already falling", 2000);
+            }
+            else if (k == StreakArtillery && StreakCount(s, k) > 0)
             {
                 s.armed = true;
                 s.typhoonCalled = k == StreakTyphoon;
@@ -4966,8 +6603,10 @@ static void MpFixesWeaponCycle(PPCContext& ctx,uint8_t* base)
 }
 
 static void TacticalInsertionFrame(PPCContext& ctx, uint8_t* base);
+void SpectatorGameFrame(PPCContext& ctx, uint8_t* base);   // spectator.cpp (0.5.609: the spectator's seat during play)
 void MpFixesLauncher(PPCContext& ctx, uint8_t* base)
 {
+    SpectatorGameFrame(ctx, base);
     TacticalInsertionFrame(ctx, base);
     MpFixesVehicles(ctx, base);
     MpFixesKillstreaks(ctx, base);
@@ -5300,6 +6939,61 @@ namespace
         // Lee-Enfield. Its shot Lee_Enfield_Sniper_FIRE_1ST (laison.wbk).
         { "lee_enfield_sniper", "kar98_sniper", "WEAPON_LEE_ENFIELD_SNIPER", "lee_enfield", "w_lee_Enfield_WORLD", "hud_Lee_enfield_scoped",
           "geRFL", "brRFL", 10, 0, 0.0f, 0.0f, 0.0f, 0.0f, 100, 100, 3, "Lee_Enfield_Sniper" },
+        // 0.5.653: CoD2's Webley revolver (the user's own CoD2 install, read by
+        // tools/cod2import into custom\webley beside the game: its view model,
+        // texture and sounds). A copy of the Colt (its view, arms and moves),
+        // its numbers CoD2's own (WebleyFields, below), its view the Colt's
+        // with the body's mesh swapped for CoD2's Webley while it is held
+        // (MpFixesWebleyView). Its world model (0.5.661): a copy of the
+        // Colt's with CoD2's world mesh (WebleyWorldModel), under a name of
+        // its own. Appended last so the others keep their numbers.
+        { "webley", "colt", "WEAPON_WEBLEY", nullptr, "w_brit_webley_WORLD", nullptr, nullptr, nullptr,
+          6, 0, 0.0f, 0.0f, 0.0f, 5.0f, 100, 100, 0, nullptr, nullptr },
+        // 0.5.681: World at War's M2 flamethrower (the user's own World at War,
+        // read by tools/waw into custom\flamethrower: its view model, texture,
+        // flame sprites and sounds). A copy of the Thompson (its arms and moves:
+        // the right hand on the rear grip, the left under the tube), its
+        // numbers FlameFields' (below), its view the Thompson's with the body's
+        // mesh swapped for the M2 while it is held (MpFixesFlameView), its flame
+        // drawn over the view and its sounds World at War's (flamethrower.cpp).
+        // Its world model (0.5.683): a copy of the Thompson's with World at War's
+        // world mesh (FlameWorldModel). Appended last so the others keep their numbers.
+        { "flamethrower", "thompson", "WEAPON_FLAMETHROWER", nullptr, "w_usa_flamethrower_WORLD", nullptr, nullptr, nullptr,
+          100, 0, 0.0f, 0.0f, 0.0f, 2.5f, 100, 100, 0, nullptr, nullptr },
+        // 0.5.726: CoD2's scoped Mosin-Nagant (the user's own CoD2, read by
+        // tools/cod2import/make_mosin.py into custom\mosin beside the game: its
+        // view and world meshes on one texture atlas, its shot and reload
+        // sounds, its kill icon). A copy of the scoped Kar98 (its scope, zoom,
+        // bolt and reload moves), its view the Kar98's with the body's mesh
+        // swapped for CoD2's Mosin while it is held (MpFixesMosinView; the
+        // Kar98's bolt, clips and scope hidden: CoD2's has its own), its shot
+        // CoD2's. Its world model the Kar98's for now. Last, so the others keep
+        // their numbers.
+        { "mosin_scoped", "kar98_sniper", "WEAPON_MOSIN_SCOPED", nullptr, "w_mosin_scoped_WORLD", nullptr, nullptr, nullptr,
+          5, 0, 0.0f, 0.0f, 0.0f, 0.0f, 100, 100, 0, nullptr, nullptr },
+        // 0.5.739: World at War's signal flare (weapons/mp/signal_flare_mp: a
+        // grenade of the smoke's offhand class, its fuse 1 s). A copy of the
+        // American smoke (its throw, fuse and bounces, its model for now), in
+        // a custom class's special's place (SmokeToFlare); where it goes off
+        // (its event 56) it lights, burns and blinds (flare.cpp) instead of
+        // the smoke's cloud. Last, so the others keep their numbers.
+        // 0.5.742: its own world model, World at War's flare stick
+        // (w_signal_flare_WORLD: FlareWorldModel), in the hand, thrown and lying.
+        // 0.5.745: its name the text itself: a text key the game has not is shown
+        // as it is (744's HUD said "WEAPON_SIGNAL_FLARE").
+        { "signal_flare", "smokegrenade", "SIGNAL FLARE", nullptr, "w_signal_flare_WORLD", nullptr, nullptr, nullptr,
+          0, 0, 0.0f, 0.0f, 0.0f, 0.0f, 100, 100, 0, nullptr, nullptr },
+        // 0.5.809: dual Colts (the user: "dual weilding for the pistols ... a
+        // proper second arm drawn for a second gun with the left hand"). The
+        // retail game has the cut give code (coltdual/p38dual, sub_821EE270:
+        // ammo x2) and the names ("Colt .45 Dual") but no weapon, model or
+        // animation (docs/PISTOL-ASSET-AUDIT.md F3). A copy of the Colt with
+        // both guns' rounds (14), its view the Colt's: the right arm and Colt
+        // drawn again mirrored as the left (MpFixesDualView ->
+        // Render::SetMirrorBuffers). Last, so the others keep their numbers.
+        // 0.5.835: its world model two Colts (w_us_pist_dual_WORLD: DualColtWorldModel)
+        { "colt_dual", "colt", "COLT .45 DUAL", nullptr, "w_us_pist_dual_WORLD", nullptr, nullptr, nullptr,
+          14, 0, 0.0f, 0.0f, 0.0f, 0.0f, 100, 100, 0, nullptr, nullptr },
         // 0.5.288: the mortar killstreak's hands (Justin: the gun stayed in
         // them at the mortar): a copy of "interact" (the bare arms the
         // game's interactions use, w_arms_interact_idle_a) with the
@@ -5580,6 +7274,156 @@ namespace
         { 2232, 6, 0.4f, "adsBulletConeAngle" },   // scoped Kar98 0.2
     };
 
+    // 0.5.653: CoD2's Webley, its weapon file's own numbers (weapons/mp/webley_mp
+    // in the user's CoD2 iw_13.iwd), every field CoD3's weapon record names the
+    // same (CoD3's field table, tools/cod2import/cod3mp_weapon_fields.txt), less
+    // the view model's placements (stand/ducked/prone moves and offsets: CoD2's
+    // for its own arms, not the Colt's here) and the crosshair's sizes. CoD2's
+    // damage (45 near, 10 far, 384 to 800 units) in CoD3's terms: damage 45,
+    // minDamagePercent 22, damageInnerRadius 384, damageOuterRadius 800.
+    const G43Field WebleyFields[] = {
+        { 1452, 4, 18.0f, "startAmmo" },
+        { 1472, 4, 18.0f, "maxAmmo" },
+        { 1476, 4, 6.0f, "clipSize" },
+        { 1492, 4, 45.0f, "damage" },
+        { 1500, 4, 22.0f, "minDamagePercent" },
+        { 1504, 4, 384.0f, "damageInnerRadius" },
+        { 1508, 4, 800.0f, "damageOuterRadius" },
+        { 1512, 4, 50.0f, "meleeDamage" },
+        { 1520, 7, 0.0f, "fireDelay" },
+        { 1524, 7, 0.1f, "meleeDelay" },
+        { 1528, 7, 0.135f, "fireTime" },
+        { 1532, 7, 0.1f, "rechamberTime" },
+        { 1536, 7, 0.0f, "rechamberBoltTime" },
+        { 1544, 7, 0.7f, "meleeTime" },
+        { 1548, 7, 5.0f, "reloadTime" },
+        { 1552, 7, 5.0f, "reloadEmptyTime" },
+        { 1556, 7, 3.5f, "reloadAddTime" },
+        { 1560, 7, 0.0f, "reloadStartTime" },
+        { 1564, 7, 0.0f, "reloadStartAddTime" },
+        { 1568, 7, 0.0f, "reloadEndTime" },
+        { 1572, 7, 0.25f, "dropTime" },
+        { 1576, 7, 0.25f, "raiseTime" },
+        { 1580, 7, 0.0f, "altDropTime" },
+        { 1584, 7, 0.0f, "altRaiseTime" },
+        { 1596, 6, 1.1f, "moveSpeedScale" },
+        { 1600, 6, 80.0f, "adsZoomFov" },
+        { 1608, 6, 0.42f, "adsZoomInFrac" },
+        { 1612, 6, 0.08f, "adsZoomOutFrac" },
+        { 1632, 6, 0.5f, "adsBobFactor" },
+        { 1636, 6, 0.25f, "adsViewBobMult" },
+        { 1640, 6, 3.0f, "hipSpreadStandMin" },
+        { 1644, 6, 2.5f, "hipSpreadDuckedMin" },
+        { 1648, 6, 2.0f, "hipSpreadProneMin" },
+        { 1652, 6, 7.0f, "hipSpreadMax" },
+        { 1656, 6, 4.0f, "hipSpreadDecayRate" },
+        { 1660, 6, 1.0f, "hipSpreadFireAdd" },
+        { 1664, 6, 0.0f, "hipSpreadTurnAdd" },
+        { 1668, 6, 8.5f, "hipSpreadMoveAdd" },
+        { 1672, 6, 1.0f, "hipSpreadDuckedDecay" },
+        { 1676, 6, 1.0f, "hipSpreadProneDecay" },
+        { 1684, 7, 0.275f, "adsTransInTime" },
+        { 1688, 7, 0.4f, "adsTransOutTime" },
+        { 1692, 6, 2.0f, "adsIdleAmount" },
+        { 1696, 6, 30.0f, "hipIdleAmount" },
+        { 1700, 6, 0.8f, "idleCrouchFactor" },
+        { 1704, 6, 0.6f, "idleProneFactor" },
+        { 1708, 6, 2.0f, "gunMaxPitch" },
+        { 1712, 6, 6.0f, "gunMaxYaw" },
+        { 1716, 6, 3.0f, "swayMaxAngle" },
+        { 1720, 6, 7.0f, "swayLerpSpeed" },
+        { 1724, 6, 0.1f, "swayPitchScale" },
+        { 1728, 6, 0.1f, "swayYawScale" },
+        { 1732, 6, 0.16f, "swayHorizScale" },
+        { 1736, 6, 0.18f, "swayVertScale" },
+        { 1740, 6, 5.0f, "swayShellShockScale" },
+        { 1744, 6, 4.0f, "adsSwayMaxAngle" },
+        { 1748, 6, 6.0f, "adsSwayLerpSpeed" },
+        { 1752, 6, 0.1f, "adsSwayPitchScale" },
+        { 1756, 6, 0.1f, "adsSwayYawScale" },
+        { 1760, 6, 0.15f, "adsSwayHorizScale" },
+        { 1764, 6, 0.24f, "adsSwayVertScale" },
+        { 1768, 5, 0.0f, "twoHanded" },
+        { 1772, 5, 0.0f, "rifleBullet" },
+        { 1776, 5, 1.0f, "semiAuto" },
+        { 1780, 5, 0.0f, "boltAction" },
+        { 1788, 5, 1.0f, "rechamberWhileAds" },
+        { 1868, 5, 0.0f, "noPartialReload" },
+        { 1872, 5, 0.0f, "segmentedReload" },
+        { 1876, 4, 0.0f, "reloadAmmoAdd" },
+        { 1880, 4, 0.0f, "reloadStartAdd" },
+        { 1896, 4, 1.0f, "shotCount" },
+        { 1900, 4, 6.0f, "dropAmmoMin" },
+        { 1904, 4, 12.0f, "dropAmmoMax" },
+        { 1992, 6, 0.0f, "adsAimPitch" },
+        { 1996, 6, 1.0f, "adsCrosshairInFrac" },
+        { 2000, 6, 0.2f, "adsCrosshairOutFrac" },
+        { 2004, 6, -100.0f, "adsGunKickPitchMin" },
+        { 2008, 6, -100.0f, "adsGunKickPitchMax" },
+        { 2012, 6, -20.0f, "adsGunKickYawMin" },
+        { 2016, 6, 18.0f, "adsGunKickYawMax" },
+        { 2020, 6, 220.0f, "adsGunKickAccel" },
+        { 2024, 6, 1000.0f, "adsGunKickSpeedMax" },
+        { 2028, 6, 25.0f, "adsGunKickSpeedDecay" },
+        { 2032, 6, 50.0f, "adsGunKickStaticDecay" },
+        { 2036, 6, 30.0f, "adsViewKickPitchMin" },
+        { 2040, 6, 35.0f, "adsViewKickPitchMax" },
+        { 2044, 6, -8.0f, "adsViewKickYawMin" },
+        { 2048, 6, 8.0f, "adsViewKickYawMax" },
+        { 2052, 6, 1400.0f, "adsViewKickCenterSpeed" },
+        { 2064, 6, 1.0f, "adsSpread" },
+        { 2076, 6, -30.0f, "hipGunKickPitchMin" },
+        { 2080, 6, -35.0f, "hipGunKickPitchMax" },
+        { 2084, 6, -2.0f, "hipGunKickYawMin" },
+        { 2088, 6, 18.0f, "hipGunKickYawMax" },
+        { 2092, 6, 1000.0f, "hipGunKickAccel" },
+        { 2096, 6, 1200.0f, "hipGunKickSpeedMax" },
+        { 2100, 6, 100.0f, "hipGunKickSpeedDecay" },
+        { 2104, 6, 2.0f, "hipGunKickStaticDecay" },
+        { 2108, 6, 60.0f, "hipViewKickPitchMin" },
+        { 2112, 6, 70.0f, "hipViewKickPitchMax" },
+        { 2116, 6, -15.0f, "hipViewKickYawMin" },
+        { 2120, 6, 15.0f, "hipViewKickYawMax" },
+        { 2124, 6, 1400.0f, "hipViewKickCenterSpeed" },
+        { 2148, 7, 0.6f, "adsReloadTransTime" },
+        { 2152, 7, 0.1f, "adsTransBlendTime" },
+    };
+
+    // 0.5.681: World at War's M2 flamethrower (weapons/mp/m2_flamethrower_mp
+    // in the user's iw_14.iwd) in CoD3's terms. World at War's flame does 50
+    // every 0.2 s (damage 50, damageInterval 300 ms over fireTime 0.2) to about
+    // 340 units (maxDist; the crosshair's enemy range 485): here 25 a shot at
+    // 10 shots a second (the same 250 a second), full to 250 units and none
+    // past 450 (minDamagePercent 0), the trace no longer than 500 (maxRange).
+    // It overheats there (overheatRate 38, cooldownRate 13); CoD3 has no
+    // overheating, so a 100-round tank (10 s of flame) and two spare. Its
+    // light kick (hipViewKickPitch 1) and its zoom (adsZoomFov 65).
+    const G43Field FlameFields[] = {
+        { 1452, 4, 200.0f, "startAmmo" },
+        { 1472, 4, 200.0f, "maxAmmo" },
+        { 1476, 4, 100.0f, "clipSize" },
+        { 1492, 4, 26.0f, "damage" },   // 0.5.718: the user, "5% stronger" (25 x 1.05, whole: 26)
+        { 1500, 4, 0.0f, "minDamagePercent" },
+        { 1504, 4, 250.0f, "damageInnerRadius" },
+        { 1508, 4, 450.0f, "damageOuterRadius" },
+        { 1512, 4, 135.0f, "meleeDamage" },
+        { 1528, 7, 0.1f, "fireTime" },
+        { 1572, 7, 0.5f, "dropTime" },
+        { 1576, 7, 0.85f, "raiseTime" },
+        { 1596, 6, 0.95f, "moveSpeedScale" },
+        { 1600, 6, 65.0f, "adsZoomFov" },
+        { 1640, 6, 1.5f, "hipSpreadStandMin" },
+        { 1644, 6, 1.2f, "hipSpreadDuckedMin" },
+        { 1648, 6, 1.0f, "hipSpreadProneMin" },
+        { 1652, 6, 4.0f, "hipSpreadMax" },
+        { 1660, 6, 0.2f, "hipSpreadFireAdd" },
+        { 2108, 6, 1.0f, "hipViewKickPitchMin" },
+        { 2112, 6, 1.0f, "hipViewKickPitchMax" },
+        { 2116, 6, 0.0f, "hipViewKickYawMin" },
+        { 2120, 6, 0.0f, "hipViewKickYawMax" },
+        { 2188, 6, 500.0f, "maxRange" },
+    };
+
     void Reload(uint8_t* base, const CampaignGun& gun, uint32_t weapon)
     {
         const uint32_t was = Guest::Read32(base, weapon + 1548);
@@ -5678,6 +7522,87 @@ namespace
             }
             printf("weapons: %s's own numbers: %d fields from its campaign weapon file\n", gun.name, set);
         }
+        if (strcmp(gun.name, "webley") == 0)
+        {
+            // 0.5.653: CoD2's numbers, each logged with the Colt's it replaces
+            int set = 0;
+            for (const G43Field& f : WebleyFields)
+            {
+                const uint32_t was = Guest::Read32(base, weapon + f.offset);
+                if (f.kind == 6) { uint32_t bits; memcpy(&bits, &f.value, 4); Guest::Write32(base, weapon + f.offset, bits); }
+                else if (f.kind == 7) time(f.offset, f.value);
+                else Guest::Write32(base, weapon + f.offset, uint32_t(int32_t(f.value)));
+                if (set < 200) { float wf; memcpy(&wf, &was, 4); printf("weapons: webley %s %g (the Colt's: %u / %g)\n", f.name, f.value, was, wf); }
+                set++;
+            }
+            printf("weapons: %s's own numbers: %d fields from CoD2's weapon file\n", gun.name, set);
+            // 0.5.677: its own icon, CoD2's, in the kill feed (+1860) and on
+            // the HUD (+1440): hud_webley, made by the image look-up below
+            // (MakeWebleyIcon). 0.5.680: only with COD3_WEBLEY_OWN_ICON=1: the kill feed showed a white box for hud_webley (the name is looked up somewhere not found yet), so by default the Colt's stays.
+            // 0.5.693: on by default (the kill feed's look-up of hud_webley answered in
+            // sub_82477E70); COD3_WEBLEY_COLT_ICON=1 keeps the Colt's
+            if (!getenv("COD3_WEBLEY_COLT_ICON"))
+            {
+                Guest::Write32(base, weapon + 1860, GuestText(base, "hud_webley"));
+                Guest::Write32(base, weapon + 1440, GuestText(base, "hud_webley"));
+            }
+        }
+        if (strcmp(gun.name, "flamethrower") == 0)
+        {
+            // 0.5.681: World at War's numbers (FlameFields), each logged with the Thompson's it replaces
+            int set = 0;
+            for (const G43Field& f : FlameFields)
+            {
+                const uint32_t was = Guest::Read32(base, weapon + f.offset);
+                if (f.kind == 6) { uint32_t bits; memcpy(&bits, &f.value, 4); Guest::Write32(base, weapon + f.offset, bits); }
+                else if (f.kind == 7) time(f.offset, f.value);
+                else Guest::Write32(base, weapon + f.offset, uint32_t(int32_t(f.value)));
+                float wf; memcpy(&wf, &was, 4);
+                printf("weapons: flamethrower %s %g (the Thompson's: %u / %g)\n", f.name, f.value, was, wf);
+                set++;
+            }
+            printf("weapons: %s's own numbers: %d fields from World at War's weapon file\n", gun.name, set);
+            // 0.5.703: fire, not bullets: a weapon's bullet hits (the effect and
+            // the mark for each of the 23 surfaces, WeaponMarks above) are its
+            // own records at +2284; a weapon with none leaves no hit. The
+            // flamethrower's (the Thompson's, copied) are cleared: no sparks,
+            // dust, blood or holes where it hits. (0.5.703's first try set the
+            // ammo type +192 to 15: the Thompson's is 0, so that is not it; left.)
+            // COD3_FLAME_BULLET_FX=1 keeps them.
+            if (!getenv("COD3_FLAME_BULLET_FX"))
+            {
+                int cleared = 0;
+                for (uint32_t k = 0; k < 23; k++)
+                    if (Guest::Read32(base, weapon + 2284 + 4 * k)) { Guest::Write32(base, weapon + 2284 + 4 * k, 0); cleared++; }
+                printf("weapons: flamethrower: %d of its 23 bullet hit records cleared (fire, not bullets)\n", cleared);
+            }
+            // 0.5.696: its own icon, World at War's hud_m2_flamethrower, in the kill
+            // feed (+1860) and on the HUD (+1440), made from the Thompson's (OwnIcon)
+            if (!getenv("COD3_FLAME_THOMPSON_ICON"))
+            {
+                const std::string thompson = ReadText(base, Guest::Read32(base, weapon + 1860), 32);
+                printf("weapons: flamethrower icon: the Thompson's is %s\n", thompson.c_str());
+                if (!thompson.empty() && thompson != "hud_m2_flamethrower")
+                {
+                    SetOwnIconSource("hud_m2_flamethrower", thompson);
+                    Guest::Write32(base, weapon + 1860, GuestText(base, "hud_m2_flamethrower"));
+                    Guest::Write32(base, weapon + 1440, GuestText(base, "hud_m2_flamethrower"));
+                }
+            }
+        }
+        // 0.5.726: the scoped Mosin's own icon, CoD2's hud_scoped_nagant (custom\mosin),
+        // in the kill feed and on the HUD, made from the scoped Kar98's (OwnIcon)
+        if (strcmp(gun.name, "mosin_scoped") == 0 && !getenv("COD3_MOSIN_KAR_ICON"))
+        {
+            const std::string kar = ReadText(base, Guest::Read32(base, weapon + 1860), 32);
+            printf("weapons: mosin icon: the scoped Kar98's is %s\n", kar.c_str());
+            if (!kar.empty() && kar != "hud_scoped_nagant")
+            {
+                SetOwnIconSource("hud_scoped_nagant", kar);
+                Guest::Write32(base, weapon + 1860, GuestText(base, "hud_scoped_nagant"));
+                Guest::Write32(base, weapon + 1440, GuestText(base, "hud_scoped_nagant"));
+            }
+        }
         if (strcmp(gun.name, "lee_enfield_sniper") == 0)
         {
             int set = 0;
@@ -5758,7 +7683,7 @@ namespace
         // the copy's world model (the frag's first-person grenade is its
         // world model in the hands, w_us_nade_world), is its own world
         // model too: the Mills bomb in the hand.
-        if (!gun.armsFrom)
+        if (!gun.armsFrom && gun.worldModel)
         {
             const std::string view = ReadText(base, Guest::Read32(base, weapon + 20));
             const std::string world = ReadText(base, Guest::Read32(base, weapon + 1432));
@@ -5768,15 +7693,15 @@ namespace
                    same ? ": its own world model in the hands too" : "");
             if (same) Guest::Write32(base, weapon + 20, GuestText(base, gun.worldModel));
         }
-        Guest::Write32(base, weapon + 1432, GuestText(base, gun.worldModel));
+        if (gun.worldModel) Guest::Write32(base, weapon + 1432, GuestText(base, gun.worldModel));   // 0.5.653: else the copy's (the Webley's: the Colt's)
         // Its item's own name (+1428, hashed for the items list,
         // sub_82486BF8): the copy's ("weapon_thompson", "weapon_bar") was
         // shared, so a dropped campaign gun's item was the copy's too.
         Guest::Write32(base, weapon + 1428, GuestText(base, std::string("weapon_") + gun.name));
-        if (Guest::Read32(base, weapon + 1436) != 0) Guest::Write32(base, weapon + 1436, GuestText(base, gun.worldModel));
+        if (gun.worldModel && Guest::Read32(base, weapon + 1436) != 0) Guest::Write32(base, weapon + 1436, GuestText(base, gun.worldModel));
         // A grenade's (no animations of its own): its thrown model too
         // (+1932, projectileModel), when it has one.
-        if (!gun.armsFrom && !ReadText(base, Guest::Read32(base, weapon + 1932)).empty())
+        if (!gun.armsFrom && gun.worldModel && !ReadText(base, Guest::Read32(base, weapon + 1932)).empty())
         {
             printf("weapons: %s's thrown model %s -> %s\n", gun.name, ReadText(base, Guest::Read32(base, weapon + 1932)).c_str(), gun.worldModel);
             Guest::Write32(base, weapon + 1932, GuestText(base, gun.worldModel));
@@ -5784,7 +7709,7 @@ namespace
         // The HUD icon (+1440, the pick-up prompt's): the campaign's own are
         // found (0.5.35) but drew as a white box (the Sten's) or a hand
         // (the others'); the copy's own icon is kept until they draw.
-        if (Settings::Get().campaignIcons) Guest::Write32(base, weapon + 1440, GuestText(base, gun.hud));
+        if (Settings::Get().campaignIcons && gun.hud) Guest::Write32(base, weapon + 1440, GuestText(base, gun.hud));
         // Its gunshots: the copy's sound names (THOMPSON_FIRE_1ST and _3RD,
         // ...) in the weapon's fields become the campaign gun's own, which
         // the campaign banks loaded beside the map's have (STEN_FIRE_1ST in
@@ -5893,6 +7818,12 @@ namespace
             printf("weapons: mg42's fireTime %08X -> 50 ms\n", was);
         }
         g_campaignWeapon[&gun - Guns] = count;
+        if (strcmp(gun.name, "signal_flare") == 0)   // 0.5.739: what it shares with the smoke
+        {
+            printf("weapons: signal_flare: clip %u, spare %u, class %u, kind %u, thrown model %s\n", Guest::Read32(base, weapon + 1468), Guest::Read32(base, weapon + 1460),
+                   Guest::Read32(base, weapon + 176), Guest::Read32(base, weapon + 180), ReadText(base, Guest::Read32(base, weapon + 1932)).c_str());
+            // (0.5.747-748: diagnostics of its words for the smoke: none was it; see MpFixesFlareRest)
+        }
         printf("weapons: %s made as weapon %d (%08X) from %s, %d animations renamed (test %d)\n", gun.name, count, weapon, gun.from, renamed, test);
         fflush(stdout);
     }
@@ -5913,6 +7844,22 @@ namespace
     // (the console's vehicles_everywhere 1, before the map): its vehicle
     // files, models and effects. -1: not on this map.
     int32_t g_vehicleArchive = -1;
+    bool g_vehicleArchiveWhole = false;   // 0.5.771: g_vehicleArchive is Merville's whole archive (not the vehicles' pack)
+    std::atomic<bool> g_mervilleWorldLoading{false};   // 0.5.762: Merville's archive loading beside another map (its world left unbound)
+    // 0.5.763: DIAGNOSTIC: every resource Merville's archive makes or puts in
+    // a table while it loads beside another map (the handlers sub_82475550
+    // "made", sub_82475610 "put" with its kind, sub_82476E88 "mesh",
+    // textures left out), 1500 lines at most: which of them is its world.
+    // 0.5.764: only with COD3_MERV_LOADLOG=1 (763's test: 660 lines).
+    void MervilleLoadLog(const char* how, const std::string& name, uint32_t a, uint32_t b)
+    {
+        static const bool on = [] { const char* t = getenv("COD3_MERV_LOADLOG"); return t && t[0] == '1'; }();
+        if (!on || !g_mervilleWorldLoading.load()) return;
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) >= 1500) return;
+        printf("merville load: %s %s %08X %u\n", how, name.c_str(), a, b);
+        fflush(stdout);
+    }
     int32_t g_mapArchive = -1;   // the map's own archive's number (kind 3), 0.5.85
     bool g_kangarooWaiting = false;   // its archive put off till the map's is in
     bool g_kangarooPendingMap() { return g_kangarooWaiting; }
@@ -5920,7 +7867,12 @@ namespace
     bool g_stukaEarly = false;   // 0.5.271
     int32_t g_mortarArchive = -1;   // 0.5.285: Laison's vehicles (the mortar's v_81mm)
     int32_t g_laisonArchive = -1, g_laisonFxArchive = -1, g_laisonZoneArchive = -1;   // 0.5.291: Laison's own archive and effects (the campaign mortar); 0.5.298 zone 8's arms
+    int32_t MpFixesLaisonArchiveIndex() { return g_laisonArchive; }   // 0.5.803 (MortarRealHit, above)
+    bool g_tankMgNoRule = false;   // 0.5.804: a tank machine gun's shot (event 2) matched no rule in Merville's set
+    int32_t g_tankArchive = -1;   // 0.5.769: the tanks' models beside the vehicles' database pack (sp\saint_lo\vehicles.cod)
+    int32_t g_vehicleFxArchive = -1;   // 0.5.773: the vehicles' effects pack (mp\mp_merv\mp_merv_vehiclefx.cod), in every list
     bool g_laisonWeaponFilter = false, g_laisonVehicleFilter = false;   // 0.5.291: reading only the mortar's files from it
+    bool g_vehicleWeaponFilter = false;   // 0.5.770: reading only the vehicles' guns from the vehicles' pack
     int8_t g_archiveKind[64] = {};   // 0.5.294: each archive number's kind as opened (3 a map, 4 its zones; sub_82477B50)
     bool g_laisonPending = false;     // 0.5.296: Laison's archive waits for the map's (MpFixesLoadLaisonAfterMap)
     int32_t g_laisonWeapon[4] = {};   // 0.5.303: the weapon numbers Laison's two were given (set up for drawing like the campaign guns)
@@ -5940,6 +7892,20 @@ PPC_FUNC(sub_8249A380)
     {
         const bool wanted = name == "mortar_81mm_turret" || name == "mortar_shell";
         printf("mortar: Laison's weapon file %s %s\n", name.c_str(), wanted ? "set up" : "left out");
+        fflush(stdout);
+        if (!wanted) return;
+        __imp__sub_8249A380(ctx, base);
+        return;
+    }
+    // 0.5.770: from the vehicles' pack only the vehicles' guns (PanzerIV_Turret,
+    // Sherman_Turret, mg30cal_sherman_tank, mg50cal_sherman_tank_gunner, the
+    // Horch's and WC51's gunners); mg30cal and panzerschreck are the map's already.
+    if (g_vehicleWeaponFilter)
+    {
+        std::string lower = name;
+        for (char& c : lower) c = char(tolower(static_cast<unsigned char>(c)));
+        const bool wanted = lower.find("turret") != std::string::npos || lower.find("_tank") != std::string::npos || lower.find("_gunner") != std::string::npos;
+        printf("vehicles: the pack's weapon file %s %s\n", name.c_str(), wanted ? "set up" : "left out");
         fflush(stdout);
         if (!wanted) return;
         __imp__sub_8249A380(ctx, base);
@@ -5976,6 +7942,30 @@ PPC_FUNC(sub_8249E970)
     // projectile's, never a player's: with COD3_WEAPONS_PAST_63=1 (test)
     // they may be 64 and 65 on a full map (Fuel Plant).
     printf("weapons: %d set up from the map, %d with the campaign's\n", before, int32_t(Guest::Read32(base, 0x82BCBF94)));
+    // 0.5.770: the vehicles' guns. On a map with vehicles from the vehicles'
+    // pack (Seelow: 0.5.769), the tanks drove but their turrets did not turn or
+    // fire, from either seat (the user's play 2026-11-04): a vehicle's guns are
+    // weapons set up from WEAPONFILE entries (PanzerIV_Turret, Sherman_Turret,
+    // the gunners' MGs), Merville's own, in its game database: only its
+    // VEHICLEFILEs were read. Read here, as the map's are, before the vehicle
+    // files (which name them); their models (tankshell, vg_50cal, vg_mg42) are
+    // in Crossroads' vehicles archive, loaded on every map for the Stuka.
+    if (g_vehicleArchive >= 0)
+    {
+        const int32_t was = int32_t(Guest::Read32(base, 0x82BCBF94));
+        if (was + 6 > 63)
+            printf("vehicles: no room for the vehicles' guns (%d of 63 weapons in use)\n", was);
+        else
+        {
+            PPCContext call = saved;
+            call.r1.u32 = (saved.r1.u32 - 0x2000) & ~0xFu;
+            call.r3.u64 = Guest::Read32(base, 0x82BCBE1C); call.r4.u64 = uint32_t(g_vehicleArchive); call.r5.u64 = 0x82076044; call.r6.u64 = 0x8249A380; call.lr = 0;
+            g_vehicleWeaponFilter = true;
+            Guest::Lookup(0x8254B318)(call, base);
+            g_vehicleWeaponFilter = false;
+            printf("vehicles: the vehicles' guns read: %d -> %d weapons\n", was, int32_t(Guest::Read32(base, 0x82BCBF94)));
+        }
+    }
     fflush(stdout);
 }
 // 0.5.310: the campaign round in the multiplayer's arms. 303 crashed in the
@@ -6133,24 +8123,50 @@ PPC_FUNC(sub_82474CB8)
     // v_tracked_wheel, which Merville's and Poissons' archives have and its
     // own does not (Mace 2 has them in its vehicles.cod). Not in its list,
     // they were never found, and the treads and wheels were not drawn.
-    int32_t extra[ArchiveCount + 9];
+    int32_t extra[ArchiveCount + 11];
     for (int i = 0; i < ArchiveCount; i++) extra[i] = g_archiveActive[i];
     extra[ArchiveCount] = g_vehicleArchive;
-    extra[ArchiveCount + 1] = g_kangarooArchive;
-    extra[ArchiveCount + 2] = g_kangarooArchive >= 0 || g_kangarooPendingMap() ? g_mapArchive : -1;
-    extra[ArchiveCount + 3] = g_planeArchiveP47;     // 0.5.253: the UAV's P-47
-    extra[ArchiveCount + 4] = g_planeArchiveStuka;   // and Stuka
-    extra[ArchiveCount + 5] = g_mortarArchive;       // 0.5.285: the mortar
-    extra[ArchiveCount + 6] = g_laisonArchive;       // 0.5.291: the campaign mortar's own (arms, effects, interactions)
-    extra[ArchiveCount + 7] = g_laisonFxArchive;
-    extra[ArchiveCount + 8] = g_laisonZoneArchive;   // 0.5.298
+    extra[ArchiveCount + 1] = g_tankArchive;         // 0.5.769: the tanks' models (a campaign vehicle archive)
+    extra[ArchiveCount + 2] = g_vehicleFxArchive;    // 0.5.773: the vehicles' effects (shell explosions, flashes, exhaust)
+    extra[ArchiveCount + 3] = g_kangarooArchive;
+    extra[ArchiveCount + 4] = g_kangarooArchive >= 0 || g_kangarooPendingMap() ? g_mapArchive : -1;
+    extra[ArchiveCount + 5] = g_planeArchiveP47;     // 0.5.253: the UAV's P-47
+    extra[ArchiveCount + 6] = g_planeArchiveStuka;   // and Stuka
+    extra[ArchiveCount + 7] = g_mortarArchive;       // 0.5.285: the mortar
+    extra[ArchiveCount + 8] = g_laisonArchive;       // 0.5.291: the campaign mortar's own (arms, effects, interactions)
+    extra[ArchiveCount + 9] = g_laisonFxArchive;
+    extra[ArchiveCount + 10] = g_laisonZoneArchive;  // 0.5.298
     // 0.5.269: the planes' archives right after the campaign weapons' (a
     // full list keeps the first ones; the Kangaroo's and the map's last).
-    std::rotate(extra + ArchiveCount, extra + ArchiveCount + 3, extra + ArchiveCount + 9);
+    std::rotate(extra + ArchiveCount, extra + ArchiveCount + 5, extra + ArchiveCount + 11);
+    // 0.5.782: the tanks' models (Saint-Lo's, loaded fresh with each map) and
+    // the vehicles' effects ahead of the planes' and the mortar's archives: the
+    // Stuka's (Crossroads) and the mortar's (Laison) have a v_shermanm4a3 too,
+    // and they are kept from map to map; loaded beside Merville, their tanks'
+    // shaders were Merville's, gone on the next map: Seelow after Merville
+    // crashed spawning its Shermans (sub_824427C0 under sub_8257E220, tests
+    // mervseelow1-3). Fresh Seelow found them first in the kept archives and
+    // worked only because those were loaded beside Seelow.
+    {
+        int32_t* first = extra + ArchiveCount;
+        int32_t* last = extra + ArchiveCount + 11;
+        std::stable_partition(first, last, [](int32_t a) { return a >= 0 && (a == g_tankArchive || a == g_vehicleFxArchive); });
+    }
     for (const int32_t archive : extra)
     {
         if (archive < 0) continue;
         if (mapList && !laisonEverywhere && (archive == g_laisonArchive || archive == g_laisonFxArchive)) continue;   // 0.5.294
+        // 0.5.759: Merville's archive (vehicles on another map) kept out of the
+        // map's and its zones' lists too, as Laison's: Seelow's ground drew
+        // tan beside it (test seelowveh1), its textures found in Merville's
+        // archive under the same names (Seelow is built on Rouen's files).
+        // The vehicles' own lists still have it. COD3_MERV_LISTS=all: as 758.
+        static const bool mervEverywhere = []() { const char* t = getenv("COD3_MERV_LISTS"); return t && strcmp(t, "all") == 0; }();
+        // (0.5.771 left the vehicles' pack in the map's lists: the map's weapon
+        // set-up then read all 24 of Merville's WEAPONFILEs from it, 76 weapons,
+        // and every campaign and own gun was left out (no room): the Mosin drew
+        // green, test seelowfx1. 0.5.772: kept out again, as 759.)
+        if (mapList && !mervEverywhere && archive == g_vehicleArchive && owner != uint32_t(g_vehicleArchive)) continue;
         const int32_t count = int32_t(Guest::Read32(base, list + 128));
         if (count < 0 || count >= 32)
         {
@@ -6169,6 +8185,13 @@ PPC_FUNC(sub_82474CB8)
     }
 }
 
+// 0.5.767: 761's look-up log, 762-764's unbinding of Merville's cell meshes and
+// 766's hook on the level handler (sub_824346C8) are gone. Each new hook on
+// these loader functions broke loading even while it only passed the call
+// on: 764 crashed Seelow without Merville (tests seelowbase1-2, the
+// Typhoon's archive), 766 froze Seelow's load with Merville (seelowveh17).
+// See docs/CLAUDE-SESSION-2026-11-03.md before hooking them again.
+
 // Vehicles on any map (the console's vehicles_everywhere 1, typed before the
 // map is loaded). Only Merville and Poissons carry vehicle files; on another
 // map Merville's archive is loaded beside the map's, as the campaign weapons
@@ -6183,9 +8206,42 @@ namespace
 {
     // An archive loaded beside the map's, with the weapons' (as the campaign
     // weapons archives are): kept loaded for the maps after, used again.
-    struct ExtraArchive { const char* path; const char* label; int32_t active = -1, loaded = -1; uint32_t object = 0, guestPath = 0; };
+    // (0.5.784: mapBound is no longer set anywhere: 781's fresh reload of
+    // Laison's after-map archives on the next map raised the game's asserts
+    // in a loop (sub_8218D9B4, 250k) and froze Merville's load after Seelow
+    // (test mapchain1); reusing them is what the game expects. The crashes
+    // 781 was after came from the vehicle files read twice a map: 783.)
+    // 0.5.781: mapBound: loaded AFTER the map, into the map's own banks (the
+    // Kangaroo's on Merville/Poissons, Laison's three): gone with the map, so
+    // never taken as "still loaded" by the next map. Merville then Seelow
+    // crashed loading Seelow's vehicles (the user, 780; test mervseelow1):
+    // Laison's and the Kangaroo's archives "still loaded as 13-16", their
+    // memory (banks 33/34, Merville's) now Seelow's: lookups through them read
+    // garbage (sub_824427C0 under the vehicles' spawn, a call through 'APKF').
+    struct ExtraArchive { const char* path; const char* label; int32_t active = -1, loaded = -1; uint32_t object = 0, guestPath = 0; bool mapBound = false; };
     ExtraArchive g_merville{ "mp\\mp_merv\\mp_merv.cod", "Merville's archive" };
+    // 0.5.730: the vehicles' pack (tools/kapf/vehicle_pack.sh: Merville's
+    // archive cut to its vehicles, their textures, effects, skeletons, drive
+    // animations and its game database with the VEHICLEFILE entries; 45
+    // blocks -> 20), used in Merville's place when it is there.
+    ExtraArchive g_vehiclePack{ "mp\\mp_merv\\mp_merv_vehicles.cod", "the vehicles' pack" };
     ExtraArchive g_kangarooFile{ "sp\\mace2\\kangaroo.cod", "the Kangaroo's archive" };
+    // 0.5.769: with the vehicles' database pack (Merville's game database alone,
+    // test seelowdb1), the tanks' models from a campaign vehicle archive: no level
+    // of its own (Merville's whole archive made itself the level: Seelow's world
+    // vanished). Saint-Lo's: the Panzer IV and the Sherman, 16 MB.
+    ExtraArchive g_tankFile{ "sp\\saint_lo\\vehicles.cod", "Saint-Lo's vehicles (Panzer IV, Sherman)" };
+    // 0.5.773: the vehicles' effects alone (Merville's tank_*, tank mf_*, exhaust,
+    // tread/wheel dust, damage, fire, destruction; no WEAPONFILEs), in every list:
+    // the shells' explosions are looked up in the map's (the database pack must
+    // stay out of those: 771's map read all 24 of Merville's weapons from it).
+    // Loaded before the database pack, so its set-up finds them.
+    // 0.5.816: in sp\vehfx, out of mp\mp_merv: loaded from a map's folder its
+    // asset slot was released once the level started (tankboom11: the asset
+    // manager's slots for it and the database pack 00000000, as the front
+    // end's), so its effects were never found: no tank muzzle blast or shell
+    // explosion on Seelow (seelow_install.sh copies it there)
+    ExtraArchive g_vehicleFxFile{ "sp\\vehfx\\mp_merv_vehiclefx.cod", "the vehicles' effects" };
     // 0.5.253: the UAV's planes: the P-47 (v_rep_P47; Chambois' vehicles,
     // 13 MB, the smallest with it) and the Stuka (stuka_flying; Crossroads'
     // vehicles, 10 MB). Loaded on every map (g_uavPlaneArchives).
@@ -6210,12 +8266,34 @@ namespace
     void LoadExtra(PPCContext& saved, uint8_t* base, uint32_t manager, uint32_t bank, ExtraArchive& archive, const std::string& map)
     {
         archive.active = -1;
+        if (archive.mapBound)   // 0.5.781: it went with the map it was loaded after
+        {
+            printf("vehicles: %s was loaded after the last map (in its banks): loaded again, not reused\n", archive.label);
+            fflush(stdout);
+            archive.object = 0;
+            archive.loaded = -1;
+            archive.mapBound = false;
+        }
         if (archive.object && archive.loaded >= 0 && Guest::Read32(base, manager + 4 * uint32_t(archive.loaded + 11)) == archive.object)
         {
             archive.active = archive.loaded;
             printf("vehicles: %s still loaded as %d\n", archive.label, archive.active);
             fflush(stdout);
             return;
+        }
+        // 0.5.790: the Stuka's cut of Crossroads' vehicles.cod (seelow_install.sh:
+        // the Stuka, the guns, the weapons' textures; its Sherman, Kangaroo, A-20
+        // and C-47 out; 3 blocks of 5) when installed: about 6 MB of the game
+        // heap back on every map (Seelow after Merville loaded the vehicles'
+        // packs into what was left, 1 MB, and got only part of them).
+        if (&archive == &g_stukaFile && !archive.guestPath)
+        {
+            std::error_code error;
+            if (std::filesystem::exists(Guest::GameRoot / "sp" / "crssrds" / "vehicles_stuka.cod", error))
+            {
+                archive.path = "sp\\crssrds\\vehicles_stuka.cod";
+                archive.label = "the Stuka's archive (its cut)";
+            }
         }
         if (!archive.guestPath) archive.guestPath = GuestText(base, archive.path);
         PPCContext call = saved;
@@ -6235,6 +8313,7 @@ namespace
         printf("vehicles: %s loading as %d beside %s\n", archive.label, index, map.c_str());
         fflush(stdout);
         if (index == -1) return;
+        if (&archive == &g_merville) g_mervilleWorldLoading = true;   // 0.5.762
         for (int spins = 0; spins < 100000 && Guest::Read32(base, manager) == 0; spins++)
         {
             PPCContext pump = call;
@@ -6243,9 +8322,64 @@ namespace
             Guest::Lookup(0x820F9CA8)(pump, base);
             Guest::Lookup(0x820F9D00)(pump, base);
         }
+        g_mervilleWorldLoading = false;
         archive.active = archive.loaded = index;
         archive.object = Guest::Read32(base, manager + 4 * uint32_t(index + 11));
-        printf("vehicles: %s loaded (%08X)\n", archive.label, archive.object);
+        // 0.5.785: the game heap after it (0x82A84120: +1156 capacity, +1160 used, as "heap:" lines)
+        printf("vehicles: %s loaded (%08X); game heap %.1f of %.1f MB used\n", archive.label, archive.object,
+               Guest::Read32(base, 0x82A84120u + 1160) / 1048576.0, Guest::Read32(base, 0x82A84120u + 1156) / 1048576.0);
+        // 0.5.817: its asset slot (the effects' lookup: *(*0x82BCC824 + 4*(n+13))) right after it loads
+        if (const uint32_t assets = Guest::Read32(base, 0x82BCC824))
+        {
+            const uint32_t slot = Guest::Read32(base, assets + 4 * uint32_t(index + 13));
+            uint32_t effects = 0;
+            if (slot >= 0x40000000u && slot < 0xA0000000u)
+            {
+                const uint32_t recs = Guest::Read32(base, slot + 12);
+                if (recs >= 0x40000000u && recs < 0xA0000000u && Guest::Read32(base, slot + 8) > 9) effects = Guest::Read32(base, recs + 32 * 9 + 24);
+            }
+            printf("vehicles: %s's asset slot %08X (%u effects)\n", archive.label, slot, effects);
+        }
+        // 0.5.818: where its blocks are: the archive object's words, those that
+        // point at an APKF block (or at a word that does) marked
+        if (&archive == &g_vehicleFxFile && archive.object >= 0x40000000u && archive.object < 0xA0000000u)
+        {
+            std::string line;
+            char t[48];
+            for (uint32_t w = 0; w < 48; w++)
+            {
+                const uint32_t v = Guest::Read32(base, archive.object + 4 * w);
+                const char* mark = "";
+                if (v >= 0x40000000u && v < 0xC0000000u && (v & 3) == 0)
+                {
+                    if (Guest::Read32(base, v) == 0x41504B46u) mark = "=APKF";
+                    else { const uint32_t v2 = Guest::Read32(base, v); if (v2 >= 0x40000000u && v2 < 0xC0000000u && (v2 & 3) == 0 && Guest::Read32(base, v2) == 0x41504B46u) mark = "->APKF"; }
+                }
+                snprintf(t, sizeof t, " +%u:%08X%s", 4 * w, v, mark);
+                line += t;
+            }
+            printf("vehicles: the effects pack's object:%s\n", line.c_str());
+            // and what +144 points at, one level more
+            const uint32_t sub = Guest::Read32(base, archive.object + 144);
+            if (sub >= 0x40000000u && sub < 0xA0000000u)
+            {
+                line.clear();
+                for (uint32_t w = 0; w < 32; w++)
+                {
+                    const uint32_t v = Guest::Read32(base, sub + 4 * w);
+                    const char* mark = "";
+                    if (v >= 0x40000000u && v < 0xC0000000u && (v & 3) == 0)
+                    {
+                        if (Guest::Read32(base, v) == 0x41504B46u) mark = "=APKF";
+                        else { const uint32_t v2 = Guest::Read32(base, v); if (v2 >= 0x40000000u && v2 < 0xC0000000u && (v2 & 3) == 0 && Guest::Read32(base, v2) == 0x41504B46u) mark = "->APKF"; }
+                    }
+                    snprintf(t, sizeof t, " +%u:%08X%s", 4 * w, v, mark);
+                    line += t;
+                }
+                printf("vehicles: its +144 (%08X):%s\n", sub, line.c_str());
+            }
+            fflush(stdout);
+        }
         fflush(stdout);
     }
 }
@@ -6253,31 +8387,246 @@ void MpFixesKangaroo(bool on) { g_kangaroo.store(on); }
 void MpFixesKangarooType(int type) { const int t = type == 2 ? 2 : type == 1 ? 1 : 3; g_kangarooType.store(t); printf("kangaroo: type %d from the next map start\n", t); fflush(stdout); }
 
 namespace { uint32_t g_kangarooManager = 0, g_kangarooBank = 0; bool& g_kangarooPending = g_kangarooWaiting; }
+
+// 0.5.786 (COD3_PEERTRAP=1 only): who writes the list at 0x826F9BA0 (data,
+// capacity, count; zeros in the image). A map change after Seelow with its
+// tanks crashed in DemonWare's bdSession::leave (sub_821C1758 -> sub_821C08B0)
+// walking that list with a garbage count (mapchain2/3, seelowseelow1); the game
+// heap was not the cause (785: no DemonWare allocation failed). Its page is
+// made read-only; each write to the three words logs the new words and the
+// host frames (exe offsets, for llvm-symbolizer --relative-address), each
+// distinct chain once; the write then goes through (one instruction stepped,
+// the page locked again).
+namespace PeerTrap
+{
+    constexpr uint32_t Watched = 0x826F9BA0u, WatchedBytes = 12;
+    uintptr_t g_from = 0, g_page = 0, g_exeFrom = 0, g_exeTo = 0;
+    uint8_t* g_base = nullptr;
+    thread_local bool t_relock = false, t_report = false;
+    std::atomic<int> g_hits{ 0 };
+    LONG CALLBACK Handler(EXCEPTION_POINTERS* info)
+    {
+        const DWORD code = info->ExceptionRecord->ExceptionCode;
+        if (code == EXCEPTION_SINGLE_STEP && t_relock)
+        {
+            t_relock = false;
+            DWORD old; VirtualProtect(reinterpret_cast<void*>(g_page), 4096, PAGE_READONLY, &old);
+            if (t_report && g_base)
+            {
+                printf("peertrap: now %08X %08X %08X\n", Guest::Read32(g_base, Watched), Guest::Read32(g_base, Watched + 4), Guest::Read32(g_base, Watched + 8));
+                fflush(stdout);
+            }
+            t_report = false;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+        if (code != EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->NumberParameters < 2 || info->ExceptionRecord->ExceptionInformation[0] != 1)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const uintptr_t at = info->ExceptionRecord->ExceptionInformation[1];
+        if ((at & ~uintptr_t(4095)) != g_page) return EXCEPTION_CONTINUE_SEARCH;
+        if (at + 8 > g_from && at < g_from + WatchedBytes && g_hits.fetch_add(1) < 400)
+        {
+            t_report = true;
+            void* frames[32] = {};
+            const USHORT n = RtlCaptureStackBackTrace(0, 32, frames, nullptr);
+            std::string chain;
+            char t[32];
+            snprintf(t, sizeof(t), " rip %llx |", (unsigned long long)(info->ContextRecord->Rip - g_exeFrom));
+            chain += t;
+            int shown = 0;
+            for (USHORT i = 0; i < n && shown < 18; i++)
+            {
+                const uintptr_t pc = reinterpret_cast<uintptr_t>(frames[i]);
+                if (pc < g_exeFrom || pc >= g_exeTo) continue;
+                snprintf(t, sizeof(t), " %llx", (unsigned long long)(pc - g_exeFrom));
+                chain += t;
+                shown++;
+            }
+            static std::vector<std::string> seen;
+            bool fresh = true;
+            for (const std::string& s : seen) if (s == chain) fresh = false;
+            printf("peertrap: write at +%d (map %s, before %08X %08X %08X)%s\n", int(at - g_from), Kernel::CurrentMap().c_str(),
+                   Guest::Read32(g_base, Watched), Guest::Read32(g_base, Watched + 4), Guest::Read32(g_base, Watched + 8),
+                   fresh ? chain.c_str() : " (a chain seen before)");
+            fflush(stdout);
+            if (fresh && seen.size() < 60) seen.push_back(chain);
+        }
+        DWORD old; VirtualProtect(reinterpret_cast<void*>(g_page), 4096, PAGE_READWRITE, &old);
+        t_relock = true;
+        info->ContextRecord->EFlags |= 0x100;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    void Arm(uint8_t* base)
+    {
+        static bool armed = false;
+        if (armed) return;
+        armed = true;
+        const char* v = getenv("COD3_PEERTRAP");
+        if (!v || v[0] != '1') return;
+        g_base = base;
+        g_from = reinterpret_cast<uintptr_t>(base + Watched);
+        g_page = g_from & ~uintptr_t(4095);
+        HMODULE exe = GetModuleHandleW(nullptr);
+        g_exeFrom = reinterpret_cast<uintptr_t>(exe);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(reinterpret_cast<const uint8_t*>(exe) + dos->e_lfanew);
+        g_exeTo = g_exeFrom + nt->OptionalHeader.SizeOfImage;
+        AddVectoredExceptionHandler(1, Handler);
+        DWORD old; VirtualProtect(reinterpret_cast<void*>(g_page), 4096, PAGE_READONLY, &old);
+        printf("peertrap: armed on %08X (now %08X %08X %08X)\n", Watched, Guest::Read32(base, Watched), Guest::Read32(base, Watched + 4), Guest::Read32(base, Watched + 8));
+        fflush(stdout);
+    }
+}
+
 void MpFixesLoadVehicleArchive(PPCContext& saved, uint8_t* base, uint32_t manager, uint32_t bank)
 {
+    PeerTrap::Arm(base);   // 0.5.786: COD3_PEERTRAP=1 only
     const std::string map = Kernel::CurrentMap();
     const bool ownVehicles = map == "mp_merv" || map == "poissons";
     // Merville's, for vehicles on a map without (vehicles_everywhere 1: big,
     // 133 MB). The Kangaroo needs a WC51 to be copied from: on Merville and
     // Poissons, or with vehicles_everywhere.
     g_merville.active = -1;
-    if (!map.empty() && !ownVehicles && g_vehiclesEverywhere.load()) LoadExtra(saved, base, manager, bank, g_merville, map);
+    g_vehiclePack.active = -1;
+    g_tankFile.active = -1;   // 0.5.769
+    g_vehicleFxFile.active = -1;   // 0.5.773
+    g_vehicleFxArchive = -1;
+    // 0.5.730: a map with vehicles saved for it (vehicles.txt) gets them
+    // without vehicles_everywhere; the vehicles' pack (20 banks, Seelow has
+    // 25 free) in Merville's place (45) when it has been made.
+    std::string lower = map;
+    for (char& c : lower) c = char(tolower(static_cast<unsigned char>(c)));
+    bool saved_here = false;
+    for (const Placed& p : ReadPlacements()) if (p.map == lower) saved_here = true;
+    // 0.5.790: the vehicles' packs (effects, database) and the Panzer IV's cut
+    // loaded with the FIRST map, whatever it is, when a map other than
+    // Merville or Poissons has vehicles saved, and kept for the maps after;
+    // used only on a map with tanks. Loaded first on a later map they met the
+    // last map's memory still held: Seelow after Merville loaded them with the
+    // game heap at 602-603.6 of 608 MB and once got only part of the database
+    // (35 of its 76 entries, 2 kinds of 8, no tanks; mervseelow6).
+    {
+        bool savedElsewhere = false;
+        for (const Placed& p : ReadPlacements()) if (p.map != "mp_merv" && p.map != "poissons") savedElsewhere = true;
+        std::error_code error;
+        const bool usedHere = !ownVehicles && (g_vehiclesEverywhere.load() || saved_here);
+        if (!map.empty() && !usedHere && savedElsewhere && std::filesystem::exists(Guest::GameRoot / "mp" / "mp_merv" / "mp_merv_vehicles.cod", error))
+        {
+            if (std::filesystem::exists(Guest::GameRoot / "sp" / "vehfx" / "mp_merv_vehiclefx.cod", error))
+                LoadExtra(saved, base, manager, bank, g_vehicleFxFile, map);
+            LoadExtra(saved, base, manager, bank, g_vehiclePack, map);
+            if (!g_tankFile.guestPath && std::filesystem::exists(Guest::GameRoot / "sp" / "saint_lo" / "vehicles_panzer.cod", error))
+            {
+                g_tankFile.path = "sp\\saint_lo\\vehicles_panzer.cod";
+                g_tankFile.label = "Saint-Lo's tanks (its cut)";
+            }
+            if (_stricmp(g_tankFile.path, "sp\\saint_lo\\vehicles_panzer.cod") == 0) LoadExtra(saved, base, manager, bank, g_tankFile, map);
+            printf("vehicles: the vehicles' packs kept loaded for a map with tanks (not used on %s)\n", map.c_str());
+            fflush(stdout);
+            g_vehicleFxFile.active = -1;
+            g_vehiclePack.active = -1;
+            g_tankFile.active = -1;   // (on Merville and Poissons the Kangaroo's load below takes it again)
+        }
+    }
+    if (!map.empty() && !ownVehicles && (g_vehiclesEverywhere.load() || saved_here))
+    {
+        std::error_code error;
+        if (std::filesystem::exists(Guest::GameRoot / "mp" / "mp_merv" / "mp_merv_vehicles.cod", error))
+        {
+            g_vehicleFxFile.active = -1;   // 0.5.773: the effects first, in the lists before the database is set up
+            if (std::filesystem::exists(Guest::GameRoot / "sp" / "vehfx" / "mp_merv_vehiclefx.cod", error))
+                LoadExtra(saved, base, manager, bank, g_vehicleFxFile, map);
+            g_vehicleFxArchive = g_vehicleFxFile.active;
+            LoadExtra(saved, base, manager, bank, g_vehiclePack, map);
+            g_tankFile.active = -1;
+            // 0.5.785: the Panzer IV's cut of Saint-Lo's (seelow_install.sh:
+            // its models, wreck, skeleton, shaders, the shell; 4 blocks, not 8)
+            // when installed. The whole one left the game heap 4.5 MB short of
+            // full on Seelow (603.5 of 608 MB): the next map's DemonWare session
+            // (bdSession::leave, sub_821C08B0) then walked a list it could not
+            // allocate (tests mapchain2, seelowseelow1, mervseelow1-4). The
+            // Sherman's model is in Laison's vehicles.cod (the mortar's, loaded
+            // on every map) and Crossroads' (the Stuka's).
+            if (!g_tankFile.guestPath && std::filesystem::exists(Guest::GameRoot / "sp" / "saint_lo" / "vehicles_panzer.cod", error))
+            {
+                g_tankFile.path = "sp\\saint_lo\\vehicles_panzer.cod";
+                g_tankFile.label = "Saint-Lo's tanks (its cut)";
+            }
+            if (g_vehiclePack.active >= 0) LoadExtra(saved, base, manager, bank, g_tankFile, map);   // 0.5.769
+        }
+        else
+        {
+            // 0.5.768: Merville's archive carries a level of its own, and loading
+            // it made Merville THE level (its level handler sub_824346C8: the
+            // current level at 0x82BCC894, the "a level is in" block from
+            // 0x82C9A040, the level's name at 0x82C8A1C0): Seelow's level, loaded
+            // after, met a level already in, and none of Seelow's cells (houses,
+            // walls, ground) were drawn (tests seelowveh1-17 against the
+            // baseline seelowbase3). Those are put back as they were before
+            // Merville's archive, here, after it has loaded (no new hook: hooks
+            // on the loaders broke loading, 764 and 766). COD3_MERV_LEVEL=1: as 767.
+            static const bool keepLevel = [] { const char* t = getenv("COD3_MERV_LEVEL"); return t && t[0] == '1'; }();
+            const uint32_t level = Guest::Read32(base, 0x82BCC894);
+            std::vector<uint8_t> block(660), name(268);
+            for (uint32_t i = 0; i < block.size(); i++) block[i] = Guest::Read8(base, 0x82C9A040 + i);
+            for (uint32_t i = 0; i < name.size(); i++) name[i] = Guest::Read8(base, 0x82C8A1C0 + i);
+            LoadExtra(saved, base, manager, bank, g_merville, map);
+            const uint32_t mervLevel = Guest::Read32(base, 0x82BCC894), mervFlag = Guest::Read32(base, 0x82C9A044);
+            if (!keepLevel)
+            {
+                Guest::Write32(base, 0x82BCC894, level);
+                for (uint32_t i = 0; i < block.size(); i++) Guest::Write8(base, 0x82C9A040 + i, block[i]);
+                for (uint32_t i = 0; i < name.size(); i++) Guest::Write8(base, 0x82C8A1C0 + i, name[i]);
+            }
+            printf("vehicles: the level before Merville's archive %08X, after it %08X (%s), \"a level is in\" %u -> %u\n",
+                level, mervLevel, keepLevel ? "kept" : "put back", uint32_t(block[4]) << 24 | uint32_t(block[5]) << 16 | uint32_t(block[6]) << 8 | block[7],
+                mervFlag);
+            fflush(stdout);
+        }
+    }
+    const int32_t vehicleSource = g_vehiclePack.active >= 0 ? g_vehiclePack.active : g_merville.active;
+    g_vehicleArchiveWhole = g_vehiclePack.active < 0 && g_merville.active >= 0;   // 0.5.771
     g_kangarooFile.active = -1;
     // 0.5.85: on Merville and Poissons the Kangaroo's archive waits for the
     // map's own (MpFixesLoadKangarooAfterMap): its treads and wheels are
     // drawn by v_tracked_tread and v_tracked_wheel, which only the map's
     // archive has (Mace 2 loads them from its vehicles.cod). Loaded before
     // the map, the Kangaroo found neither and drew without both.
-    if (!map.empty() && g_kangaroo.load() && !ownVehicles && g_merville.active >= 0) LoadExtra(saved, base, manager, bank, g_kangarooFile, map);
+    // 0.5.788: the Panzer IV's cut of Saint-Lo's has both shaders: on Merville
+    // and Poissons it is loaded first and the Kangaroo's archive after it,
+    // before the map, as on Seelow. Loaded after Merville's map the Kangaroo's
+    // archive was in Merville's banks: Seelow after Merville took it as "still
+    // loaded" (13) and crashed setting up its vehicles, a call through
+    // 0x82704190 (test mervseelow5, 0.5.787). The after-map load stays only for
+    // an install without the cut.
+    std::error_code tankError;
+    if (!map.empty() && g_kangaroo.load() && ownVehicles && g_tankFile.active < 0 &&
+        std::filesystem::exists(Guest::GameRoot / "sp" / "saint_lo" / "vehicles_panzer.cod", tankError))
+    {
+        if (!g_tankFile.guestPath)
+        {
+            g_tankFile.path = "sp\\saint_lo\\vehicles_panzer.cod";
+            g_tankFile.label = "Saint-Lo's tanks (its cut)";
+        }
+        if (_stricmp(g_tankFile.path, "sp\\saint_lo\\vehicles_panzer.cod") == 0) LoadExtra(saved, base, manager, bank, g_tankFile, map);
+    }
+    // 0.5.815: the tanks' archive (Saint-Lo's cut: v_tracked_tread and
+    // v_tracked_wheel) in the lookup lists BEFORE the Kangaroo's loads (it was
+    // set only at the end, after: the Kangaroo's treads and wheels found no
+    // shaders and were not drawn on Merville, the user's play of 0.5.814)
+    g_tankArchive = g_tankFile.active;
+    g_vehicleFxArchive = g_vehicleFxFile.active;
+    if (!map.empty() && g_kangaroo.load() && (ownVehicles ? g_tankFile.active >= 0 : vehicleSource >= 0)) LoadExtra(saved, base, manager, bank, g_kangarooFile, map);
     g_kangarooPending = false;
-    if (!map.empty() && g_kangaroo.load() && ownVehicles)
+    if (!map.empty() && g_kangaroo.load() && ownVehicles && g_kangarooFile.active < 0)
     {
         if (!g_kangarooBank) g_kangarooBank = Guest::AllocatePhysical(0x40);
         memcpy(base + g_kangarooBank, base + bank, 0x30);
         g_kangarooManager = manager;
         g_kangarooPending = true;
     }
-    g_vehicleArchive = g_merville.active;
+    g_vehicleArchive = vehicleSource;
+    g_tankArchive = g_tankFile.active;   // 0.5.769
+    g_vehicleFxArchive = g_vehicleFxFile.active;   // 0.5.773
     g_kangarooArchive = g_kangarooFile.active;
 }
 // 0.5.253: the UAV's planes, on every map. 0.5.255: loaded last, after the
@@ -6901,10 +9250,13 @@ PPC_FUNC(sub_82564520)
                 moved++;
                 printf("vehicles: the map's %s moved to %.0f %.0f %.0f for a saved %s\n", kind.c_str(), p.x, p.y, p.z, p.kind.c_str());
             }
-            else if (SpawnVehicleAt(ctx, base, p.kind, p.x, p.y, p.z, p.yaw))
+            else
             {
-                made++;
-                printf("vehicles: no %s of the map's left: a new one made (not drivable yet)\n", kind.c_str());
+                // 0.5.731: none made from nothing any more: never drivable, and on
+                // Seelow (no vehicles of its own) the first crashed its start
+                // (test seelow20tanks, sub_824427C0 walking a bad model). The
+                // vehicles' pack brings a scene of 22 (vehicle_scene.py).
+                printf("vehicles: no %s of the map's left for a saved one at %.0f %.0f %.0f: skipped\n", p.kind.c_str(), p.x, p.y, p.z);
             }
         }
         g_inMapStart = false;
@@ -7618,7 +9970,18 @@ PPC_FUNC(sub_825683D8)
         fflush(stdout);
         if (!wanted || Guest::Read16(base, 0x82B34594) >= 31) return;
     }
+    // 0.5.789: each vehicle file read, and the kinds before and after
+    const std::string fileName = ReadText(base, ctx.r3.u32, 40);
+    const int kindsBefore = int(int16_t(Guest::Read16(base, 0x82B34594)));
     __imp__sub_825683D8(ctx, base);
+    static int said = 0;
+    if (said++ < 120)
+    {
+        printf("vehicles: vehicle file %s read on %s: kinds %d -> %d\n", fileName.c_str(), Kernel::CurrentMap().c_str(), kindsBefore,
+               int(int16_t(Guest::Read16(base, 0x82B34594))));
+        fflush(stdout);
+    }
+    return;
 }
 
 // Room for more vehicles: the map's vehicle records (sub_82561838: how
@@ -7631,12 +9994,53 @@ extern "C" PPC_FUNC(__imp__sub_82561838);
 PPC_FUNC(sub_82561838)
 {
     const uint32_t asked = ctx.r3.u32 & 0xFFFF;
+    // 0.5.783: the vehicle files read ONCE a map load. The game calls this
+    // twice a map (at the load, "asked for 20", and again before the match,
+    // "asked for 10/8"), and every call read Merville's and the Kangaroo's
+    // vehicle files again: the kinds went 17 -> 31 -> 45 on Seelow, 14 -> 27 on
+    // Merville, past the game's table (the next map's vehicles then spawned
+    // from corrupted memory: Merville then Seelow, and Seelow then Seelow,
+    // crashed, tests mervseelow1-4, seelowseelow1). Read again only for a new
+    // load (the map's archive number) or when the game has reset the kinds
+    // below what our reads left (a map with vehicle files of its own re-reads
+    // them).
+    // 0.5.789: the vehicles' physics presets (a pool of 10 at 0x8267CD80:
+    // pointers +2080, count +2164; sub_8241A830 takes one, sub_82418520 finds
+    // one by name at +112, the first name wins) and the kinds, as each map
+    // makes its vehicles: are they the game's afresh each map, or kept from the
+    // last? (Merville then Seelow, 0.5.788: Seelow read 2 of the pack's 8 kinds.)
+    {
+        constexpr uint32_t pool = 0x8267CD80u;
+        const int presets = int(Guest::Read32(base, pool + 2164));
+        std::string names;
+        for (int i = 0; i < presets && i < 10; i++)
+        {
+            const uint32_t preset = Guest::Read32(base, pool + 2080 + 4 * uint32_t(i));
+            char t[24];
+            snprintf(t, sizeof(t), " %08X:", preset);
+            names += t;
+            names += preset ? ReadText(base, preset + 112, 32) : std::string("-");
+        }
+        printf("vehicles: as %s makes its vehicles (asked %u): kinds %d, physics presets %d:%s\n", Kernel::CurrentMap().c_str(), asked,
+               int(int16_t(Guest::Read16(base, 0x82B34594))), presets, names.c_str());
+        fflush(stdout);
+    }
+    static std::string readKey;
+    static int readCount = -1;
+    const std::string key = Kernel::CurrentMap() + "#" + std::to_string(g_mapArchive);
+    const int kindsNow = int(int16_t(Guest::Read16(base, 0x82B34594)));
+    const bool doReads = key != readKey || kindsNow < readCount;
+    if (!doReads)
+    {
+        printf("vehicles: the vehicle files already read for this map (%d kinds): not again\n", kindsNow);
+        fflush(stdout);
+    }
     // The map's vehicle files are read just before (in the map's start,
     // sub_82593FA8, which then makes the records here): Merville's are read
     // after them when its archive is here, then the Kangaroo made.
     // (0.5.62 waited for sub_8256CE08 to do it, which this map start does
     // not call.)
-    if (g_vehicleArchive >= 0)
+    if (doReads && g_vehicleArchive >= 0)
     {
         const uint32_t archives = Guest::Read32(base, 0x82BCBE1C);
         PPCContext call = ctx;
@@ -7654,7 +10058,7 @@ PPC_FUNC(sub_82561838)
     // 0.5.83: the Kangaroo's own archive's vehicle files too (the campaign's
     // "Kangaroo": its speed, seats, bounds, cameras and treads' scroll), read
     // as Merville's are; then mp_kangaroo is made (from the Horch's).
-    if (g_kangarooArchive >= 0)
+    if (doReads && g_kangarooArchive >= 0)
     {
         const uint32_t archives = Guest::Read32(base, 0x82BCBE1C);
         for (const auto& reader : { std::pair<uint32_t, uint32_t>{ 0x820658F0, 0x825683D8 }, std::pair<uint32_t, uint32_t>{ 0x820658FC, 0x8255F3A8 } })
@@ -7667,15 +10071,15 @@ PPC_FUNC(sub_82561838)
         printf("vehicles: the Kangaroo's archive's vehicle files read (%d kinds now)\n", int(int16_t(Guest::Read16(base, 0x82B34594))));
         fflush(stdout);
     }
-    if (g_kangarooArchive >= 0) MakeKangarooKind(ctx, base);
+    if (doReads && g_kangarooArchive >= 0) MakeKangarooKind(ctx, base);
     MpFixesLoadLaisonAfterMap(ctx, base);   // 0.5.296: Laison's archive after the map's
     // 0.5.291: the campaign mortar as a vehicle kind (Laison's
     // VEHICLEFILE:mortar_81mm, its turret mortar_81mm_turret), the other six
     // of Laison's vehicles left out (g_laisonVehicleFilter, sub_825683D8).
-    static std::string laisonVehiclesMap;   // 0.5.297: once a map (296 read it at each of the hook's calls: 3, 4, 5 kinds)
-    if (g_laisonArchive >= 0 && laisonVehiclesMap != Kernel::CurrentMap())
+    // (0.5.297 read it once a map by the map's name: a second load of the same
+    // map skipped it. 0.5.783: with the others, once a map load.)
+    if (doReads && g_laisonArchive >= 0)
     {
-        laisonVehiclesMap = Kernel::CurrentMap();
         PPCContext call = ctx;
         call.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
         call.r3.u64 = Guest::Read32(base, 0x82BCBE1C); call.r4.u64 = uint32_t(g_laisonArchive); call.r5.u64 = 0x820658F0; call.r6.u64 = 0x825683D8; call.lr = 0;
@@ -7685,6 +10089,7 @@ PPC_FUNC(sub_82561838)
         printf("mortar: Laison's vehicle files read (%d kinds now)\n", int(int16_t(Guest::Read16(base, 0x82B34594))));
         fflush(stdout);
     }
+    if (doReads) { readKey = key; readCount = int(int16_t(Guest::Read16(base, 0x82B34594))); }
     ctx.r3.u64 = std::min<uint32_t>(asked + 16, 64);
     printf("vehicles: room for %u vehicles (the map asked for %u)\n", ctx.r3.u32, asked);
     fflush(stdout);
@@ -7715,6 +10120,17 @@ PPC_FUNC(sub_8247DD38)
     // is loaded once and used again by the maps after.)
     __imp__sub_8247DD38(ctx, base);
     const uint32_t result = ctx.r3.u32;
+    // 0.5.837: Seelow Night's arms lit by moonlight, not Rouen's light grid's afternoon
+    // (COD3_NIGHT_ARMS="r,g,b" the scale, "1,1,1" or "0" off)
+    if (weapons)
+    {
+        float scale[3] = { 0.20f, 0.22f, 0.32f };
+        if (const char* e = getenv("COD3_NIGHT_ARMS")) { if (sscanf(e, "%f,%f,%f", &scale[0], &scale[1], &scale[2]) != 3) scale[0] = scale[1] = scale[2] = 1.0f; }
+        const bool night = _stricmp(Kernel::CurrentMap().c_str(), "seelownight") == 0 && !(scale[0] == 1.0f && scale[1] == 1.0f && scale[2] == 1.0f);
+        Render::SetNightLight(night, scale);
+        printf("night light: map %s: the arms' light %s (%.2f %.2f %.2f)\n", Kernel::CurrentMap().c_str(), night ? "scaled to moonlight" : "as the light grid has it", scale[0], scale[1], scale[2]);
+        fflush(stdout);
+    }
     if (weapons) MpFixesLoadVehicleArchive(saved, base, manager, bank);
     ctx.r3.u64 = result;
     if (weapons && !Settings::Get().campaignGuns) MpFixesLoadMortarArchive(saved, base, manager, bank);   // 0.5.285
@@ -7791,7 +10207,8 @@ PPC_FUNC(sub_8247DD38)
         g_archiveActive[which] = index;
         g_archiveLoaded[which] = index;
         g_archiveObject[which] = Guest::Read32(base, manager + 4 * uint32_t(index + 11));
-        printf("weapons: campaign weapons archive loaded (%08X)\n", g_archiveObject[which]);
+        printf("weapons: campaign weapons archive loaded (%08X); game heap %.1f MB used\n", g_archiveObject[which],
+               Guest::Read32(base, 0x82A84120u + 1160) / 1048576.0);   // 0.5.785
         fflush(stdout);
     }
     MpFixesLoadPlaneArchives(saved, base, manager, bank);   // 0.5.255: after the guns
@@ -7827,6 +10244,56 @@ PPC_FUNC(sub_82477B50)
         printf("archives: %s opened as %d (kind %u); bank bitmaps %d and %d set\n", ReadText(base, path, 80).c_str(), int32_t(ctx.r3.u32), kind, first, second);
         fflush(stdout);
     }
+}
+// 0.5.785: DemonWare's allocations (bdMemory::allocate, sub_821AD880: the
+// title's function at 0x82A97E94, then a failure handler). A map change after
+// Seelow with its tanks crashed in bdSession::leave (sub_821C08B0 walking a
+// list with no memory under it) with the game heap at 603 of 608 MB: a failed
+// one is logged, to see whether that is the cause.
+extern "C" PPC_FUNC(__imp__sub_821AD880);
+PPC_FUNC(sub_821AD880)
+{
+    const uint32_t size = ctx.r3.u32;
+    __imp__sub_821AD880(ctx, base);
+    static int said = 0;
+    if (ctx.r3.u32 == 0 && said++ < 20)
+    {
+        printf("demonware: an allocation of %u bytes failed (game heap %.1f of %.1f MB used)\n", size,
+               Guest::Read32(base, 0x82A84120u + 1160) / 1048576.0, Guest::Read32(base, 0x82A84120u + 1156) / 1048576.0);
+        fflush(stdout);
+    }
+}
+// 0.5.787: DemonWare's "take this one out of a list" (sub_821C08B0: r3 the
+// list {data, capacity, count}, r4 the item; it walks count words of data).
+// bdSession::leave (sub_821C1758) calls it, through sub_821B1DC8, for each peer
+// in the session (the peer's list at +80, the session's +4 the item). A map
+// change from Seelow with its tanks to Merville crashed there, always 8 s in
+// (mapchain2/3, peertrap1; Rouen then Merville did not, rouenmerv1): one of the
+// session's peers is a pointer to static memory (0x826F9B50), not a peer: its
+// "+80 list" is {0x10, 0x70, 0x6F} and climbing, written by DemonWare's other
+// code (peertrap1), so the walk read from 0x10 up through all memory. A list
+// that cannot be one (its data outside memory the game allocates from, or its
+// count above its capacity or absurd) is left alone, and logged.
+extern "C" PPC_FUNC(__imp__sub_821C08B0);
+PPC_FUNC(sub_821C08B0)
+{
+    const uint32_t list = ctx.r3.u32;
+    const uint32_t data = Guest::Read32(base, list), capacity = Guest::Read32(base, list + 4), count = Guest::Read32(base, list + 8);
+    const bool dataOk = (data >= 0x40000000u && data < 0x80000000u) || (data >= 0x82000000u && data < 0x83000000u);
+    const bool ok = count == 0 || (dataOk && count <= capacity && capacity <= 0x10000u);
+    static int said = 0;
+    if (!ok || said < 12)
+    {
+        if (said++ < 60)
+        {
+            printf("demonware: %s list %08X (data %08X, capacity %u, count %u), item %08X, from %08X\n",
+                   ok ? "a peer taken out of" : "guard: NOT walked: a peer's list that cannot be one,", list, data, capacity, count,
+                   ctx.r4.u32, uint32_t(ctx.lr));
+            fflush(stdout);
+        }
+    }
+    if (!ok) return;
+    __imp__sub_821C08B0(ctx, base);
 }
 extern "C" PPC_FUNC(__imp__sub_8246EA50);
 PPC_FUNC(sub_8246EA50)
@@ -7931,12 +10398,52 @@ PPC_FUNC(sub_820E0158)
 // as the level starts; a campaign gun, made after, is set up here once the
 // player is in the game.
 #ifdef COD3_MP
+namespace
+{
+    // 0.5.633: Isle already has an animation entry called "mg42", for a
+    // mounted gun (13 items, no resolved handheld animations). Our new
+    // weapon must borrow mg34's 25-item view/arms tables even on a hit.
+    // Scope this override to our appended handheld weapon's drawing setup;
+    // other users of the native mounted-gun entry must keep their table.
+    thread_local unsigned g_handheldMg42AnimationSetup = 0;
+    bool IsHandheldMg42(uint32_t weapon)
+    {
+        for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); ++i)
+            if (g_campaignWeapon[i] > 0 && uint32_t(g_campaignWeapon[i]) == weapon &&
+                strcmp(Guns[i].name, "mg42") == 0) return true;
+        return false;
+    }
+    struct HandheldMg42AnimationScope
+    {
+        bool on;
+        explicit HandheldMg42AnimationScope(uint32_t weapon) : on(IsHandheldMg42(weapon))
+        { if (on) ++g_handheldMg42AnimationSetup; }
+        ~HandheldMg42AnimationScope() { if (on) --g_handheldMg42AnimationSetup; }
+    };
+}
+extern "C" PPC_FUNC(__imp__sub_8245E720);
+PPC_FUNC(sub_8245E720)
+{
+    HandheldMg42AnimationScope scope(ctx.r3.u32);
+    __imp__sub_8245E720(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_82465920);
+PPC_FUNC(sub_82465920)
+{
+    HandheldMg42AnimationScope scope(ctx.r4.u32);
+    __imp__sub_82465920(ctx, base);
+}
+
 void MpFixesCampaignGuns(PPCContext& ctx, uint8_t* base)
 {
     const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
     const uint32_t own = entities ? Guest::Read32(base, entities + 4) : 0;
     if (!own || !Guest::Read32(base, own + 512)) return;
     MpFixesMg42View(base, Guest::Read32(base, Guest::Read32(base, own + 512) + 164));
+    MpFixesWebleyView(base, Guest::Read32(base, Guest::Read32(base, own + 512) + 164), Guest::Read32(base, own + 512));   // 0.5.653
+    MpFixesDualView(base, Guest::Read32(base, Guest::Read32(base, own + 512) + 164));   // 0.5.809
+    MpFixesFlameView(base, Guest::Read32(base, Guest::Read32(base, own + 512) + 164), Guest::Read32(base, own + 512));    // 0.5.681
+    MpFixesMosinView(base, Guest::Read32(base, Guest::Read32(base, own + 512) + 164));    // 0.5.726
     const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
     // 0.5.303: and Laison's mortar weapons (302's crash: mortar_shell held
     // with no drawing set-up, its arms' animation tree never made: garbage
@@ -8077,8 +10584,18 @@ PPC_FUNC(sub_820D1320)
     const uint32_t table = ctx.r3.u32, name = ctx.r4.u32;
     PPCContext saved = ctx;
     __imp__sub_820D1320(ctx, base);
-    if (ctx.r3.u32 || !name) return;
+    if (!name) return;
+    const uint32_t nativeEntry = ctx.r3.u32;
+    if (nativeEntry && !g_handheldMg42AnimationSetup) return;
     const std::string text = ReadText(base, name, 40);
+    if (nativeEntry)
+    {
+        if (text != "mg42" && text != "mg42_arms") return;
+        // This routine also searches unrelated named tables. Only the
+        // animation table used by 8245E720/82465920 gets the override.
+        const uint32_t manager = Guest::Read32(base, 0x82BCBED8);
+        if (!manager || table != Guest::Read32(base, manager + 4)) return;
+    }
     // Two entries a weapon: by its name, and by its name with "_arms" (the
     // drawing set-up, sub_82465920, makes that one with "%s%s"); each taken
     // from the copied gun's, under the same ending.
@@ -8093,6 +10610,14 @@ PPC_FUNC(sub_820D1320)
             again.r3.u64 = table;
             again.r4.u64 = alias;
             __imp__sub_820D1320(again, base);
+            if (nativeEntry)
+            {
+                printf("mg42 animations: handheld %s overrides native entry %08X (%u items) with %s %08X (%u items)\n",
+                    text.c_str(), nativeEntry, Guest::Read32(base, nativeEntry + 4),
+                    ReadText(base, alias).c_str(), again.r3.u32,
+                    again.r3.u32 ? Guest::Read32(base, again.r3.u32 + 4) : 0);
+                fflush(stdout);
+            }
             static int said = 0;
             if ((said < 10 && said++ < 10))
             {
@@ -8121,6 +10646,7 @@ PPC_FUNC(sub_820D1320)
 // passes its weapon's +8). A campaign gun has no events of its own, so it
 // plays the ones of the gun it is a copy of.
 #ifdef COD3_MP
+float BotsFlameTrace(PPCContext& ctx, uint8_t* base, uint32_t ignored, const float from[3], const float to[3]);   // bots.cpp (0.5.703)
 namespace
 {
     // 0.5.265: the queued plane sound (MpFixesQueuePlaneSound), played the
@@ -8153,6 +10679,71 @@ namespace
         }
     }
 
+    // 0.5.703: a flamethrower shot's stream: ours stops at the first wall
+    // along our view (Flame::OwnReach); another's is drawn in the world from
+    // his gun (his eye, 12 down, 30 ahead along his aim, 7 to his right: the
+    // world model at the hip) along his aim to the first wall, hidden while
+    // a wall stands between our eye and both his gun and his flame's middle.
+    // Each shooter's traces at most every 60 ms (a shot raises up to four
+    // events).
+    void FlameStream(PPCContext& ctx, uint8_t* base, uint32_t shooter, uint32_t own)
+    {
+        static std::map<uint32_t, uint64_t> lastAt;
+        const uint64_t now = GetTickCount64();
+        uint64_t& last = lastAt[shooter];
+        if (now - last < 60) return;
+        last = now;
+        float eye[3];
+        const bool haveView = Flame::Eye(eye);
+        const uint32_t rec = Guest::Read32(base, shooter + 512);
+        float at[3], pitch, yaw, height = 60.0f;
+        if (rec >= 0x40000000u && rec < 0xA0000000u)
+        {
+            for (int k = 0; k < 3; k++) at[k] = PlaneReadF(base, rec + 4 * k);
+            pitch = PlaneReadF(base, rec + 204); yaw = PlaneReadF(base, rec + 208);
+            const float vh = PlaneReadF(base, rec + 220);
+            if (std::isfinite(vh) && vh > 8.0f && vh < 80.0f) height = vh;
+        }
+        else   // (no record on this machine: his entity's place and angles)
+        {
+            for (int k = 0; k < 3; k++) at[k] = PlaneReadF(base, shooter + 336 + 4 * k);
+            pitch = PlaneReadF(base, shooter + 352); yaw = PlaneReadF(base, shooter + 356);
+        }
+        if (!std::isfinite(at[0]) || !std::isfinite(pitch) || !std::isfinite(yaw)) return;
+        const float p = pitch * 0.0174533f, y = yaw * 0.0174533f;
+        const float dir[3] = { cosf(p) * cosf(y), cosf(p) * sinf(y), -sinf(p) };
+        const float right[3] = { sinf(y), -cosf(y), 0.0f };
+        if (shooter == own)
+        {
+            if (!haveView) return;
+            const float to[3] = { eye[0] + dir[0] * 600.0f, eye[1] + dir[1] * 600.0f, eye[2] + dir[2] * 600.0f };
+            const float reach = 600.0f * BotsFlameTrace(ctx, base, own, eye, to);
+            Flame::OwnReach(reach);
+            static int told = 0;
+            if (told < 6) { told++; printf("flamethrower: your flame runs %.0f units to a wall (view %.1f %.1f)\n", reach, pitch, yaw); fflush(stdout); }
+            return;
+        }
+        float muzzle[3];
+        for (int k = 0; k < 3; k++) muzzle[k] = at[k] + dir[k] * 30.0f + right[k] * 7.0f;
+        muzzle[2] += height - 12.0f;
+        const float to[3] = { muzzle[0] + dir[0] * 450.0f, muzzle[1] + dir[1] * 450.0f, muzzle[2] + dir[2] * 450.0f };
+        const float reach = 450.0f * BotsFlameTrace(ctx, base, shooter, muzzle, to);
+        // seen: his gun in our sight, or both the middle and the end of his
+        // flame (0.5.711: the middle alone let flames show through walls, the
+        // user: "from far away"; a flame's leftovers follow it, flamethrower.cpp)
+        bool visible = !own || !haveView;
+        if (!visible)
+        {
+            visible = BotsFlameTrace(ctx, base, own, eye, muzzle) > 0.97f;
+            const float mid[3] = { muzzle[0] + dir[0] * reach * 0.5f, muzzle[1] + dir[1] * reach * 0.5f, muzzle[2] + dir[2] * reach * 0.5f };
+            const float end[3] = { muzzle[0] + dir[0] * reach * 0.9f, muzzle[1] + dir[1] * reach * 0.9f, muzzle[2] + dir[2] * reach * 0.9f };
+            if (!visible) visible = BotsFlameTrace(ctx, base, own, eye, mid) > 0.97f && BotsFlameTrace(ctx, base, own, eye, end) > 0.97f;
+        }
+        Flame::OtherStream(shooter, muzzle, dir, reach, visible);
+        static int told = 0;
+        if (told < 12) { told++; printf("flamethrower: another's flame from %.0f %.0f %.0f along %.2f %.2f %.2f, %.0f units to a wall, %s\n", muzzle[0], muzzle[1], muzzle[2], dir[0], dir[1], dir[2], reach, visible ? "seen" : "hidden"); fflush(stdout); }
+    }
+
     void CampaignEventName(uint8_t* base, PPCContext& ctx, uint32_t function)
     {
         PlaneSoundFromEvent(base, ctx, function);
@@ -8183,6 +10774,224 @@ namespace
         }
         if (!ctx.r5.u32) return;
         const std::string text = ReadText(base, ctx.r5.u32, 40);
+        // 0.5.780: the tank guns' own NAMED events. A weapon event (name +
+        // number) is made by sub_82555160, which first finds the weapon's event
+        // set in the map's table: Rouen's has no tank guns, so it stops there
+        // and never reaches sub_82554BA0 (779's switch to Merville's table never
+        // came: no "tank event" line in the user's play). A named event, queued
+        // by sub_82556868 (as the Hellfire's explosions are), goes straight to
+        // sub_82554BA0, where 779 makes it from Merville's table. So for a tank
+        // gun's shot (cannon event 25, an MG round event 2) and its shell's
+        // explosion (event 56) the port queues Merville's own named events:
+        // weapon_<gun>_weapon_fire_1st|3rd (+ _world_flash for the cannon) and
+        // projexplode_<turret>_dirt at the shell's place. COD3_TANK_EVENTS=0: off.
+        if ((function == 0x82556180u || function == 0x82556508u || function == 0x825563D0u) && g_vehicleArchive >= 0 && !g_vehicleArchiveWhole &&
+            ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0xA0000000u)
+        {
+            // 0.5.792: off unless COD3_TANK_STANDIN=1: the game's own weapon
+            // events now come from Merville's table (sub_82555160, below), as
+            // on Merville; these hand-made ones would play twice.
+            static const bool off = [] { const char* t = getenv("COD3_TANK_STANDIN"); return !(t && t[0] == '1'); }();
+            std::string gun = text;
+            for (char& c : gun) c = char(tolower(static_cast<unsigned char>(c)));
+            const bool turret = gun == "panzeriv_turret" || gun == "sherman_turret";
+            const bool tankMg = gun.find("_sherman_tank") != std::string::npos || gun.find("_gunner") != std::string::npos;
+            const uint32_t event = ctx.r6.u32;
+            // 0.5.804: a tank machine gun's shot (event 2), when its set had no rule
+            // for it (g_tankMgNoRule): Merville's own named events at the gunner,
+            // made from Merville's table (sub_82554BA0's switch, by the names): its
+            // fire (1st for this machine's player, else 3rd) and its world flash
+            // 0.5.807: the round itself is event 25 (82591174, ~10 a second while
+            // firing; 806's event 2 is the bullet's HIT, bullethit_<surface>, which
+            // matched only on some surfaces: seelowcheck2). Each round's own fire and
+            // flash, unless the game's own shot event (8, as the cannon's, from
+            // 8246A5D8) came for a machine gun within the last half second.
+            static uint64_t nativeShotAt = 0;
+            if (tankMg && event == 8) nativeShotAt = GetTickCount64();
+            // 0.5.808: event 25 comes every FRAME while the gun fires (mgcheck1: every
+            // 7 ms, 1121 in 8 bursts): one round each 110 ms a gunner (the .50 cal's
+            // ~550 a minute)
+            static std::map<uint32_t, uint64_t> lastRound;
+            const uint64_t roundNow = GetTickCount64();
+            const bool round = tankMg && event == 25 && function == 0x82556180u && roundNow - lastRound[ctx.r4.u32] >= 110;
+            if (round) lastRound[ctx.r4.u32] = roundNow;
+            if (round && roundNow - nativeShotAt > 500)
+            {
+                const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+                const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+                bool mine = own && ctx.r4.u32 == own;
+                if (!mine && own)
+                {
+                    const float dx = PlaneReadF(base, ctx.r4.u32 + 336) - PlaneReadF(base, own + 336), dy = PlaneReadF(base, ctx.r4.u32 + 340) - PlaneReadF(base, own + 340);
+                    mine = std::isfinite(dx) && std::isfinite(dy) && sqrtf(dx * dx + dy * dy) < 200.0f && Guest::Read32(base, own + 900) != 0;   // this machine's player in that vehicle (+900: his vehicle link)
+                }
+                PlaneSound(ctx, base, ctx.r4.u32, ("weapon_" + gun + (mine ? "_weapon_fire_1st" : "_weapon_fire_3rd")).c_str());
+                PlaneSound(ctx, base, ctx.r4.u32, ("weapon_" + gun + "_weapon_world_flash").c_str());
+                static int told = 0;
+                if (told < 6) { told++; printf("vehicles: %s's shot: weapon_%s_weapon_fire_%s and its world flash by name\n", gun.c_str(), gun.c_str(), mine ? "1st" : "3rd"); fflush(stdout); }
+            }
+            if (!off && (turret || tankMg) && (event == 25 || event == 2 || event == 56))
+            {
+                const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+                const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+                bool mine = own && ctx.r4.u32 == own;
+                if (!mine && own)
+                {
+                    const float dx = PlaneReadF(base, ctx.r4.u32 + 336) - PlaneReadF(base, own + 336), dy = PlaneReadF(base, ctx.r4.u32 + 340) - PlaneReadF(base, own + 340),
+                                dz = PlaneReadF(base, ctx.r4.u32 + 344) - PlaneReadF(base, own + 344);
+                    const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                    mine = std::isfinite(d) && d < 250.0f;
+                }
+                if ((turret && event == 25) || (tankMg && event == 2))
+                {
+                    // The shot's sound: Merville's own cue, played as 778's were
+                    // (heard): the first a loaded bank has (sub_8212B268: -1 when
+                    // none). Its flash: Merville's named event at the gun.
+                    const std::string view = mine ? "_FIRE_1ST" : "_FIRE_3RD";
+                    std::vector<std::string> cues;
+                    if (turret) cues = { (gun == "panzeriv_turret" ? "PANZERIV" : "SHERMAN") + view, "PANZERIV" + view };
+                    else if (gun.find("mg30cal") != std::string::npos) cues = { "MG30cal" + view };
+                    else cues = { "MG50CAL" + view };
+                    static std::map<std::string, std::string> chosen;
+                    const std::string key = gun + view;
+                    if (!chosen.count(key))
+                    {
+                        std::string pick;
+                        for (const std::string& c : cues)
+                        {
+                            const uint32_t t = GuestText(base, c);
+                            PPCContext look = ctx;
+                            look.r1.u32 = (ctx.r1.u32 - 0x400) & ~0xFu;
+                            look.r3.u64 = t; look.lr = 0;
+                            Guest::Lookup(0x8212B268)(look, base);
+                            if (int32_t(look.r3.u32) != -1) { pick = c; break; }
+                        }
+                        chosen[key] = pick;
+                        printf("vehicles: %s's shot cue (%s): %s\n", text.c_str(), mine ? "yours" : "another's", pick.empty() ? "none found" : pick.c_str());
+                        fflush(stdout);
+                    }
+                    if (!chosen[key].empty())
+                    {
+                        const float gunAt[3] = { PlaneReadF(base, ctx.r4.u32 + 336), PlaneReadF(base, ctx.r4.u32 + 340), PlaneReadF(base, ctx.r4.u32 + 344) };
+                        MpFixesPlayCue(ctx, base, chosen[key].c_str(), mine ? nullptr : gunAt);
+                    }
+                    if (turret) PlaneSound(ctx, base, ctx.r4.u32, ("weapon_" + gun + "_weapon_world_flash").c_str());
+                }
+                if (turret && event == 56 && !g_killcamFxPlaying)
+                {
+                    const float at[3] = { PlaneReadF(base, ctx.r4.u32 + 336), PlaneReadF(base, ctx.r4.u32 + 340), PlaneReadF(base, ctx.r4.u32 + 344) };
+                    if (std::isfinite(at[0]) && std::isfinite(at[1]) && std::isfinite(at[2])) MpFixesQueueTankBlast(at, ("projexplode_" + gun + "_dirt").c_str());
+                }
+            }
+        }
+        // 0.5.653: CoD2's Webley's gunshot (custom\webley\wpnfire_webley.wav,
+        // from the user's CoD2) on its shot events (1, 3, 7, 53): yours full,
+        // another's fainter with distance (none past 4000 units)
+        // 0.5.811: the dual Colts' shot (event 1, the muzzle flash): the Colt's
+        // own flash again at the left gun's muzzle (MpFixesDualFlash)
+        if (text == "colt_dual" && (function == 0x82556180u || function == 0x82556508u) && ctx.r6.u32 == 1 &&
+            ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0xA0000000u)
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+            const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+            static uint64_t lastAt = 0;
+            const uint64_t now = GetTickCount64();
+            if (own && ctx.r4.u32 == own && now - lastAt > 60)
+            {
+                lastAt = now;
+                // 0.5.824: the Colt's own flash moved with the right gun and mirrored at
+                // the left by the renderer (Render::DualFlashFor); the flash made on a
+                // script_origin (0.5.811, its place a guess) only with COD3_DUAL_SCRIPT_FLASH=1
+                Render::DualFlashFor(150);
+                if (getenv("COD3_DUAL_SCRIPT_FLASH")) MpFixesDualFlash(ctx, base, own);
+                // 0.5.821: DIAGNOSTIC: COD3_FLASH_DRAWS=1: the draws of the 80 ms after the
+                // first three shots logged (which are the Colt's own muzzle flash)
+                static int windows = 0;
+                if (getenv("COD3_FLASH_DRAWS") && windows < 3) { windows++; Render::LogDrawsFor(150); printf("draws: a dual Colt shot: the next 150 ms logged, and 400-550 ms after\n"); fflush(stdout); }
+            }
+        }
+        if (text == "webley" && (function == 0x82556180u || function == 0x82556508u) &&
+            (ctx.r6.u32 == 1 || ctx.r6.u32 == 3 || ctx.r6.u32 == 7 || ctx.r6.u32 == 53) && ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0x90000000u)
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+            const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+            float gain = 0.9f;
+            if (ctx.r4.u32 != own && own)
+            {
+                const float dx = PlaneReadF(base, ctx.r4.u32 + 336) - PlaneReadF(base, own + 336), dy = PlaneReadF(base, ctx.r4.u32 + 340) - PlaneReadF(base, own + 340);
+                gain = 0.6f * std::max(0.0f, 1.0f - sqrtf(dx * dx + dy * dy) / 4000.0f);
+            }
+            static uint64_t lastAt = 0; static uint32_t lastEnt = 0;
+            const uint64_t now = GetTickCount64();
+            if (!(lastEnt == ctx.r4.u32 && now - lastAt < 60))   // one shot's events once
+            {
+                lastAt = now; lastEnt = ctx.r4.u32;
+                Audio::PlayClip(WebleyDir() + "wpnfire_webley.wav", gain);
+                static int told = 0;
+                if (told < 10) { told++; printf("webley: CoD2's shot (event %u, %s, gain %.2f)\n", ctx.r6.u32, ctx.r4.u32 == own ? "yours" : "another's", gain); fflush(stdout); }
+            }
+        }
+        // 0.5.726: CoD2's scoped Mosin's shot (custom\mosin\nagant_sniper.wav) on
+        // its shot events (1, 3, 7, 13, 53; once a shot): yours full, another's
+        // fainter with distance (none past 4000 units)
+        if (text == "mosin_scoped" && (function == 0x82556180u || function == 0x82556508u) &&
+            (ctx.r6.u32 == 1 || ctx.r6.u32 == 3 || ctx.r6.u32 == 7 || ctx.r6.u32 == 13 || ctx.r6.u32 == 53) && ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0x90000000u)
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+            const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+            float gain = 0.9f;
+            if (ctx.r4.u32 != own && own)
+            {
+                const float dx = PlaneReadF(base, ctx.r4.u32 + 336) - PlaneReadF(base, own + 336), dy = PlaneReadF(base, ctx.r4.u32 + 340) - PlaneReadF(base, own + 340);
+                gain = 0.7f * std::max(0.0f, 1.0f - sqrtf(dx * dx + dy * dy) / 4000.0f);
+            }
+            // 0.5.728: one shot's events once, within 900 ms: event 3 comes ~250-300 ms
+            // after event 1 (the bolt), and with 200 ms each shot played CoD2's sound
+            // twice (the user: "two bullet sounds"; their log: event 1 then event 3 a
+            // shot). The bolt-action Mosin cannot fire again sooner.
+            static std::map<uint32_t, uint64_t> lastAt;
+            const uint64_t now = GetTickCount64();
+            if (now - lastAt[ctx.r4.u32] > 900 && gain > 0.01f)
+            {
+                lastAt[ctx.r4.u32] = now;
+                Audio::PlayClip(MosinShotFile(), gain);
+                static int told = 0;
+                if (told < 10) { told++; printf("mosin: CoD2's shot (event %u, %s, gain %.2f)\n", ctx.r6.u32, ctx.r4.u32 == own ? "yours" : "another's", gain); fflush(stdout); }
+            }
+        }
+        // 0.5.681: the flamethrower's shots (silent as the Thompson's: no table
+        // has its name): ours light and keep the flame and its sounds
+        // (flamethrower.cpp), another's burning loop is heard, fainter with
+        // distance (none past 3000 units)
+        if (text == "flamethrower" && (function == 0x82556180u || function == 0x82556508u) &&
+            (ctx.r6.u32 == 1 || ctx.r6.u32 == 3 || ctx.r6.u32 == 7 || ctx.r6.u32 == 53) && ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0x90000000u)
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+            const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+            if (ctx.r4.u32 == own) Flame::OwnShot();
+            else if (own)
+            {
+                // 0.5.726: a close sound (the user: "i hear alot of other bots or players
+                // flame throwers when ... not even near these players"): full within 200,
+                // ((1000 - d) / 800) squared, none past 1000 (was a straight fade to 3000)
+                const float dx = PlaneReadF(base, ctx.r4.u32 + 336) - PlaneReadF(base, own + 336), dy = PlaneReadF(base, ctx.r4.u32 + 340) - PlaneReadF(base, own + 340);
+                const float dz = PlaneReadF(base, ctx.r4.u32 + 344) - PlaneReadF(base, own + 344);
+                const float near_ = std::clamp((1000.0f - sqrtf(dx * dx + dy * dy + dz * dz)) / 800.0f, 0.0f, 1.0f);
+                Flame::OtherShot(ctx.r4.u32, 0.7f * near_ * near_);
+            }
+            FlameStream(ctx, base, ctx.r4.u32, own);   // 0.5.703: where it is seen, where it stops
+            static int told = 0;
+            if (told < 10) { told++; printf("flamethrower: shot (event %u, %s)\n", ctx.r6.u32, ctx.r4.u32 == own ? "yours" : "another's"); fflush(stdout); }
+        }
+        // 0.5.703: fire, not bullets: its shots' other effects (event 1 the
+        // muzzle flash, 2 and 8 with every shot: the brass and the shot's
+        // other effects; 3, 7, 53 the shot's sound) keep its own name, which
+        // finds nothing: no Thompson flash or brass. Its own flame and sounds
+        // are ours above. COD3_FLAME_BULLET_FX=1: the Thompson's, as before.
+        static const bool bulletFx = getenv("COD3_FLAME_BULLET_FX") != nullptr;
+        if (!bulletFx && text == "flamethrower" && (function == 0x82556180u || function == 0x82556508u || function == 0x825563D0u) &&
+            (ctx.r6.u32 == 1 || ctx.r6.u32 == 2 || ctx.r6.u32 == 3 || ctx.r6.u32 == 7 || ctx.r6.u32 == 8 || ctx.r6.u32 == 53))
+            return;
         // Every weapon event but a shot's (1, 3, 7, 53: thousands), with the
         // time in milliseconds: when a reload's sounds start against the
         // reload itself (the Sten's still feels out of step, 0.5.31).
@@ -8325,9 +11134,140 @@ namespace
     }
 }
 extern "C" PPC_FUNC(__imp__sub_82556180);
-PPC_FUNC(sub_82556180) { CampaignEventName(base, ctx, 0x82556180); __imp__sub_82556180(ctx, base); }
+void BotsKillcamNoteEvent(uint8_t* base, uint32_t entity, uint32_t weapon, uint32_t event);   // bots.cpp (0.5.634)
+PPC_FUNC(sub_82556180)
+{
+    // 0.5.739: the signal flare's fuse out (its weapon's event 56, the smoke's
+    // cloud): it lights where it lies (flare.cpp), no cloud. The weapon's name
+    // is r5's text, the grenade's entity r4 (+336 its place). (0.5.741: the
+    // name lies in the physical memory's view, 0xAA6110E4 in 740's log: 739
+    // and 740 asked for under 0xA0000000 and never saw it)
+    // 0.5.746: event 56 comes as the grenade leaves the hand (745's flares all
+    // lit 10 units from the thrower's eye): it is followed (FlareSight) and
+    // lights after World at War's fuse (fuseTime 1), where it is then.
+    if (ctx.r6.u32 == 56 && ctx.r5.u32 && ReadText(base, ctx.r5.u32, 16) == "signal_flare")
+    {
+        if (!g_killcamFxPlaying && ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0xA0000000u)
+        {
+            const float at[3] = { PlaneReadF(base, ctx.r4.u32 + 336), PlaneReadF(base, ctx.r4.u32 + 340), PlaneReadF(base, ctx.r4.u32 + 344) };
+            // 0.5.753: its thrower: the player nearest the grenade as it leaves the
+            // hand (within 120: it is ~10 ahead of his eye), for its burns' credit
+            uint32_t thrower = 0;
+            float nearest = 120.0f;
+            if (const uint32_t list = Guest::Read32(base, 0x82BCC7FC))
+                for (uint32_t i = 0; i < MpCapClients; i++)
+                {
+                    const uint32_t e = Guest::Read32(base, list + 4 * (i + 1));
+                    if (e < 0x40000000u || e >= 0xA0000000u) continue;
+                    const float dx = PlaneReadF(base, e + 336) - at[0], dy = PlaneReadF(base, e + 340) - at[1], dz = PlaneReadF(base, e + 344) + 60.0f - at[2];
+                    const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                    if (std::isfinite(d) && d < nearest) { nearest = d; thrower = e; }
+                }
+            MpFixesFollowFlare(Flare::Ignite(at, 1.0f), ctx.r4.u32, at, thrower);
+        }
+        return;
+    }
+    // 0.5.800: where a tank shell or mortar round goes off (its entity's place)
+    if (ctx.r6.u32 == 56 && ctx.r5.u32 && ctx.r4.u32 >= 0x40000000u && ctx.r4.u32 < 0xA0000000u)
+    {
+        std::string gun = ReadText(base, ctx.r5.u32, 32);
+        for (char& c : gun) c = char(tolower(static_cast<unsigned char>(c)));
+        if (gun == "panzeriv_turret" || gun == "sherman_turret" || gun == "mortar_shell")
+        {
+            static int said = 0;
+            if (said < 40) { said++; printf("vehicles: %s's shell goes off at %.0f %.0f %.0f\n", gun.c_str(), PlaneReadF(base, ctx.r4.u32 + 336), PlaneReadF(base, ctx.r4.u32 + 340), PlaneReadF(base, ctx.r4.u32 + 344)); fflush(stdout); }
+            // 0.5.803: the gun's weapon definition, once a run, to compare Merville's
+            // (shells fly) with Seelow's (they burst at the muzzle): words in hex
+            static std::set<std::string> dumped;
+            if (gun != "mortar_shell" && dumped.insert(gun).second)
+            {
+                const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+                const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+                for (int32_t k = 1; list && k <= count && k < 128; k++)
+                {
+                    const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+                    const uint32_t text = def >= 0x40000000u && def < 0xA0000000u ? Guest::Read32(base, def + 8) : 0;
+                    if (text < 0x40000000u || text >= 0xA0000000u) continue;
+                    std::string n = ReadText(base, text, 32);
+                    for (char& c : n) c = char(tolower(static_cast<unsigned char>(c)));
+                    if (n != gun) continue;
+                    printf("vehicles: %s's weapon definition (weapon %d, %08X):\n", gun.c_str(), k, def);
+                    for (uint32_t at = 0; at < 2400; at += 32)
+                    {
+                        printf("wdef %s +%04u:", gun.c_str(), at);
+                        for (uint32_t w = 0; w < 32; w += 4) printf(" %08X", Guest::Read32(base, def + at + w));
+                        printf("\n");
+                    }
+                    fflush(stdout);
+                    break;
+                }
+            }
+        }
+    }
+    CampaignEventName(base, ctx, 0x82556180);
+    if (ctx.r6.u32 == 56 && !g_killcamFxPlaying) BotsKillcamNoteEvent(base, ctx.r4.u32, ctx.r5.u32, 56);   // 0.5.634: an explosion, for the killcam
+    __imp__sub_82556180(ctx, base);
+}
 extern "C" PPC_FUNC(__imp__sub_82556508);
 PPC_FUNC(sub_82556508) { CampaignEventName(base, ctx, 0x82556508); __imp__sub_82556508(ctx, base); }
+
+// 0.5.651: THE RENDER LIST'S PATCH BLOCK, CHECKED BEFORE IT IS APPLIED (the crash
+// of 643 at 3m45s; the same worker ran away in 0.5.340 and 0.5.596). nglListSend
+// (sub_82142248, the render worker's thread sub_821424B0) applies a list's patch
+// block with sub_8216DF98 (r3 the list, its +48 the block): +0 a count of 32-byte
+// entries (+0 where, then 7 words written there), +4 a count of 12-byte entries
+// after them (+0 where, +8 how many 16-byte vectors) whose vectors follow, 16-
+// aligned. 643: memory already damaged (calls through non-functions from 218 s),
+// one block sent it writing from 0x061D0000 and reading from 0x732E0000 until it
+// passed 2 GB. A block with a count past 16384, a place outside guest memory or
+// vectors running past it is not applied (logged, the first 20).
+namespace
+{
+    // the heap and stacks, the image (0x82..0x83, by its top byte: the MP host's
+    // build maps every 0x82 literal), the physical memory's view
+    bool PatchPlace(uint32_t a) { return (a >= 0x40000000u && a < 0x80000000u) || (a >> 24 == 0x82u || a >> 24 == 0x83u) || (a >= 0xA0000000u && a < 0xC0000000u); }
+    const char* PatchBlockBad(uint8_t* base, uint32_t list, uint32_t& block, uint32_t& n0, uint32_t& n1, uint32_t& where)
+    {
+        block = n0 = n1 = where = 0;
+        if (!PatchPlace(list)) return "the list is outside guest memory";
+        block = Guest::Read32(base, list + 48);
+        if (!PatchPlace(block)) return "its block is outside guest memory";
+        n0 = Guest::Read32(base, block);
+        n1 = Guest::Read32(base, block + 4);
+        if (n0 > 16384 || n1 > 16384) return "a count is too large";
+        for (uint32_t i = 0; i < n0; i++)
+            if (!PatchPlace(where = Guest::Read32(base, block + 8 + 32 * i)) || !PatchPlace(where + 28)) return "a 32-byte entry writes outside guest memory";
+        const uint32_t entries = block + 8 + 32 * n0, end = entries + 12 * n1;
+        uint64_t vectors = 0;
+        for (uint32_t j = 0; j < n1; j++)
+        {
+            const int32_t count = int32_t(Guest::Read32(base, entries + 12 * j + 8));
+            if (count <= 0) continue;
+            where = Guest::Read32(base, entries + 12 * j);
+            if (count > 65536 || !PatchPlace(where) || !PatchPlace(where + uint32_t(count) * 16 - 1)) return "a vector entry writes outside guest memory";
+            vectors += uint64_t(count);
+        }
+        const uint64_t source = ((uint64_t(end) + 15) & ~15ull) + vectors * 16;
+        if (!PatchPlace(end) || source >= 0x100000000ull || !PatchPlace(uint32_t(source - (vectors ? 1 : 0)))) return "its vectors run outside guest memory";
+        return nullptr;
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_8216DF98);
+PPC_FUNC(sub_8216DF98)
+{
+    uint32_t block, n0, n1, where;
+    if (const char* why = PatchBlockBad(base, ctx.r3.u32, block, n0, n1, where))
+    {
+        static std::atomic<int> told{ 0 };
+        if (told.fetch_add(1) < 20)
+        {
+            printf("render guard: a render list's patch block not applied (%s): list %08X, block %08X, %u and %u entries, place %08X\n", why, ctx.r3.u32, block, n0, n1, where);
+            fflush(stdout);
+        }
+        return;
+    }
+    __imp__sub_8216DF98(ctx, base);
+}
 extern "C" PPC_FUNC(__imp__sub_825563D0);
 PPC_FUNC(sub_825563D0) { CampaignEventName(base, ctx, 0x825563D0); __imp__sub_825563D0(ctx, base); }
 // The other senders that take a weapon's name (r5), the same way.
@@ -8387,6 +11327,20 @@ PPC_FUNC(sub_824964E8)
 {
     PPCContext saved = ctx;
     const std::string path = ctx.r5.u32 ? ReadText(base, ctx.r5.u32, 200) : std::string();
+    // 0.5.774: Merville's bank named by the vehicles' packs has no drive in its
+    // path (mp\mp_merv\mp_merv.wbk): beside a DLC map it was looked for on the
+    // map's drive (dlc5:\mp\mp_merv\mp_merv.wbk NOT FOUND, test seelowfx4) and
+    // never opened. Given the game's drive, as the campaign banks are.
+    {
+        std::string l = path;
+        for (char& c : l) c = char(tolower(static_cast<unsigned char>(c)));
+        if (l == "mp\\mp_merv\\mp_merv.wbk" && Kernel::CurrentMap() != "mp_merv")
+        {
+            static uint32_t fixed = 0;
+            if (!fixed) fixed = GuestText(base, "D:\\mp\\mp_merv\\mp_merv.wbk");
+            ctx.r5.u64 = fixed;
+        }
+    }
     __imp__sub_824964E8(ctx, base);
     const uint32_t result = ctx.r3.u32;
     {
@@ -8399,6 +11353,47 @@ PPC_FUNC(sub_824964E8)
     }
     std::string lower = path;
     for (char& c : lower) c = char(tolower(static_cast<unsigned char>(c)));
+    // 0.5.775: Merville's sound bank beside another map, for the vehicles' sounds
+    // (the tanks were silent: cues sherman_idle, Sherman_Move, Tank_Suspension,
+    // SHELL_EXPLO_DIRT_TANK, TANK_HATCH_OPEN -> -1). 0.5.773/774 asked for it as
+    // the vehicles' packs registered it, early (while the weapons' archive
+    // loads): it opened (774, from D:) but its cues stayed -1, the request lost
+    // before the map's banks are set up. Now loaded exactly as the campaign banks
+    // are (below), when the map's own bank registers: registered with the map's
+    // kind and archive under the key mp_merv.wbk, path D:\mp\mp_merv\mp_merv.wbk,
+    // then asked to load (sub_824AE270), queued as a campaign bank (searched after
+    // the map's own). Only with the vehicles' packs beside the map.
+    const bool mapBank = lower.find("mp\\") != std::string::npos && lower.find("global") == std::string::npos &&
+                         lower.size() > 4 && lower.compare(lower.size() - 4, 4, ".wbk") == 0 && lower.find("mp_merv.wbk") == std::string::npos;
+    if (mapBank && Kernel::CurrentMap() != "mp_merv" && (g_vehicleFxArchive >= 0 || (g_vehicleArchive >= 0 && !g_vehicleArchiveWhole)))
+    {
+        const std::string name = "mp_merv.wbk";
+        const std::string full = "D:\\mp\\mp_merv\\mp_merv.wbk";
+        PPCContext call = saved;
+        call.r1.u32 = (saved.r1.u32 - 0x800) & ~0xFu;
+        const uint32_t nameBuffer = call.r1.u32 + 0x200, keyBuffer = call.r1.u32 + 0x300, pathBuffer = call.r1.u32 + 0x400;
+        for (uint32_t i = 0; i < 0x300; i += 4) Guest::Write32(base, nameBuffer + i, 0);
+        for (size_t i = 0; i < name.size(); i++) Guest::Write8(base, nameBuffer + uint32_t(i), uint8_t(name[i]));
+        Guest::Write8(base, nameBuffer + 127, uint8_t(name.size()));
+        for (size_t i = 0; i <= full.size(); i++) Guest::Write8(base, pathBuffer + uint32_t(i), i < full.size() ? uint8_t(full[i]) : 0);
+        call.r3.u64 = keyBuffer; call.r4.u64 = nameBuffer; call.r5.u64 = 1; call.lr = 0;
+        Guest::Lookup(0x820B5170)(call, base);
+        call.r3.u64 = saved.r3.u64; call.r4.u64 = keyBuffer; call.r5.u64 = pathBuffer; call.r6.u64 = saved.r6.u64; call.r7.u64 = saved.r7.u64; call.lr = 0;
+        __imp__sub_824964E8(call, base);
+        const uint32_t record = call.r3.u32;
+        const uint32_t manager = Guest::Read32(base, 0x82BCBF7Cu);
+        if (g_campaignBanksLoaded && manager)
+        {
+            PPCContext load = call;
+            load.r3.u64 = manager; load.r4.u64 = keyBuffer; load.r5.u64 = 1; load.lr = 0;
+            g_queueingCampaign = true;
+            Guest::Lookup(0x824AE270)(load, base);
+            g_queueingCampaign = false;
+        }
+        printf("sounds: Merville's bank %s registered beside %s -> %08X, %s\n", full.c_str(), path.c_str(), record,
+               g_campaignBanksLoaded && manager ? "asked to load (the vehicles' sounds)" : "NOT asked to load (no bank memory yet)");
+        fflush(stdout);
+    }
     const size_t at = lower.find("mp\\");
     if (!Settings::Get().campaignGuns || !Settings::Get().campaignSounds || at == std::string::npos || lower.find("global") != std::string::npos ||
         lower.size() < 4 || lower.compare(lower.size() - 4, 4, ".wbk") != 0)
@@ -8413,8 +11408,12 @@ PPC_FUNC(sub_824964E8)
         const std::string name = level + ".wbk";
         // (A DLC map's bank is on its own drive, dlcs:\mp\...: the
         // campaign's are always on the game's, D:.)
-        std::string prefix = path.substr(0, at);
-        if (prefix.find(':') != std::string::npos && lower.compare(0, 2, "d:") != 0) prefix = "D:\\";
+        // 0.5.805: always D: (the map's bank path comes with no drive, so the
+        // prefix was empty and the campaign bank's path relative: on a map
+        // pack the game put it on the pack's drive, "dlc5:\sp\forest\forest.wbk
+        // NOT FOUND", and Seelow had none of Forest's, Laison's or Mace 2's
+        // sounds: the mortar's Mortar_Slide/Fire/Miss -> -1, mortarreal1)
+        const std::string prefix = "D:\\";
         const std::string full = prefix + "sp\\" + level + "\\" + name;
         // The key, as the game makes it: the name in a 128-byte buffer (its
         // length in the last byte), through sub_820B5170.
@@ -8460,10 +11459,10 @@ namespace
         for (char& c : lower) c = char(tolower(static_cast<unsigned char>(c)));
         for (const CampaignGun& gun : Guns)
         {
-            std::string world = gun.worldModel, hud = gun.hud;
+            std::string world = gun.worldModel ? gun.worldModel : "", hud = gun.hud ? gun.hud : "";   // 0.5.653: the Webley has neither
             for (char& c : world) c = char(tolower(static_cast<unsigned char>(c)));
             for (char& c : hud) c = char(tolower(static_cast<unsigned char>(c)));
-            if (lower == world || lower == hud) return true;
+            if ((!world.empty() && lower == world) || (!hud.empty() && lower == hud)) return true;
         }
         // models a campaign gun's file names besides its own: the scoped
         // Lee-Enfield's scope (attach1Model), only in Laison's archive
@@ -8542,15 +11541,136 @@ PPC_FUNC(sub_824408E0)
 // gun's world model not found that way: looked for with each campaign
 // archive's own list too. Logged either way.
 extern "C" PPC_FUNC(__imp__sub_82446EA0);
+namespace { uint32_t WebleyWorldModel(uint8_t* base, uint32_t colt); }   // below (0.5.661)
+namespace { uint32_t FlameWorldModel(uint8_t* base, uint32_t tommy); }   // below (0.5.683)
+namespace { uint32_t FlareWorldModel(uint8_t* base, uint32_t smoke); }   // below (0.5.742)
+namespace { uint32_t DualColtWorldModel(uint8_t* base, uint32_t colt); }   // below (0.5.835)
+namespace { uint32_t MosinWorldModel(uint8_t* base, uint32_t k98); std::string MosinDir(); }   // below (0.5.726)
 PPC_FUNC(sub_82446EA0)
 {
     const std::string name = ctx.r6.u32 ? ReadText(base, ctx.r6.u32, 64) : std::string();
+    // 0.5.661: the Webley's world model: the Colt's looked up, a copy of it
+    // with CoD2's world mesh given (WebleyWorldModel); the Colt's if that
+    // cannot be made
+    if (ctx.r3.u32 && _stricmp(name.c_str(), "w_brit_webley_WORLD") == 0)
+    {
+        const uint32_t holder = ctx.r3.u32;
+        static uint32_t coltName = 0;
+        if (!coltName) coltName = GuestText(base, "w_us_pist_WORLD");
+        ctx.r6.u64 = coltName;
+        __imp__sub_82446EA0(ctx, base);
+        const uint32_t colt = Guest::Read32(base, holder);
+        const uint32_t ours = colt && !getenv("COD3_WEBLEY_NO_WORLD") ? WebleyWorldModel(base, colt) : 0;
+        if (ours) Guest::Write32(base, holder, ours);
+        static int said = 0;
+        if (said < 6) { said++; printf("webley world: %s looked up as the Colt's (%08X): %08X given\n", name.c_str(), colt, Guest::Read32(base, holder)); fflush(stdout); }
+        ctx.r3.u64 = holder;
+        return;
+    }
+    // 0.5.726: the scoped Mosin's world model: the scoped Kar98's looked up, a
+    // copy of it with CoD2's world mesh given (MosinWorldModel)
+    if (ctx.r3.u32 && _stricmp(name.c_str(), "w_mosin_scoped_WORLD") == 0)
+    {
+        const uint32_t holder = ctx.r3.u32;
+        static uint32_t karName = 0;
+        if (!karName) karName = GuestText(base, "w_ge_SNIP_WORLD");
+        ctx.r6.u64 = karName;
+        __imp__sub_82446EA0(ctx, base);
+        const uint32_t kar = Guest::Read32(base, holder);
+        const uint32_t ours = kar && !getenv("COD3_MOSIN_NO_WORLD") ? MosinWorldModel(base, kar) : 0;
+        if (ours) Guest::Write32(base, holder, ours);
+        static int said = 0;
+        if (said < 6) { said++; printf("mosin world: %s looked up as the scoped Kar98's (%08X): %08X given\n", name.c_str(), kar, Guest::Read32(base, holder)); fflush(stdout); }
+        ctx.r3.u64 = holder;
+        return;
+    }
+    // 0.5.683: the flamethrower's world model: the Thompson's looked up, a
+    // copy of it with World at War's world mesh given (FlameWorldModel); the
+    // Thompson's if that cannot be made
+    if (ctx.r3.u32 && _stricmp(name.c_str(), "w_usa_flamethrower_WORLD") == 0)
+    {
+        const uint32_t holder = ctx.r3.u32;
+        static uint32_t tommyName = 0;
+        if (!tommyName) tommyName = GuestText(base, "w_ussmg_world");
+        ctx.r6.u64 = tommyName;
+        __imp__sub_82446EA0(ctx, base);
+        const uint32_t tommy = Guest::Read32(base, holder);
+        const uint32_t ours = tommy && !getenv("COD3_FLAME_NO_WORLD") ? FlameWorldModel(base, tommy) : 0;
+        if (ours) Guest::Write32(base, holder, ours);
+        static int said = 0;
+        if (said < 6) { said++; printf("flamethrower world: %s looked up as the Thompson's (%08X): %08X given\n", name.c_str(), tommy, Guest::Read32(base, holder)); fflush(stdout); }
+        ctx.r3.u64 = holder;
+        return;
+    }
+    // 0.5.835: the dual Colts' world model: the Colt's looked up, a copy of it
+    // with its body drawn twice (DualColtWorldModel); the Colt's if that fails
+    if (ctx.r3.u32 && _stricmp(name.c_str(), "w_us_pist_dual_WORLD") == 0)
+    {
+        const uint32_t holder = ctx.r3.u32;
+        static uint32_t coltName = 0;
+        if (!coltName) coltName = GuestText(base, "w_us_pist_WORLD");
+        ctx.r6.u64 = coltName;
+        __imp__sub_82446EA0(ctx, base);
+        const uint32_t colt = Guest::Read32(base, holder);
+        const uint32_t ours = colt && !getenv("COD3_DUAL_NO_WORLD") ? DualColtWorldModel(base, colt) : 0;
+        if (ours) Guest::Write32(base, holder, ours);
+        static int said = 0;
+        if (said < 6) { said++; printf("dual world: %s looked up as the Colt's (%08X): %08X given\n", name.c_str(), colt, Guest::Read32(base, holder)); fflush(stdout); }
+        ctx.r3.u64 = holder;
+        return;
+    }
+    // 0.5.742: the signal flare's world model (in the hand, thrown, lying): the
+    // American smoke's looked up, a copy of it with World at War's flare stick
+    // (FlareWorldModel); the smoke's if that cannot be made
+    if (ctx.r3.u32 && _stricmp(name.c_str(), "w_signal_flare_WORLD") == 0)
+    {
+        const uint32_t holder = ctx.r3.u32;
+        static uint32_t smokeName = 0;
+        if (!smokeName) smokeName = GuestText(base, "w_us_smoke_grenade_WORLD");
+        ctx.r6.u64 = smokeName;
+        __imp__sub_82446EA0(ctx, base);
+        const uint32_t smoke = Guest::Read32(base, holder);
+        const uint32_t ours = smoke && !getenv("COD3_FLARE_NO_WORLD") ? FlareWorldModel(base, smoke) : 0;
+        if (ours) Guest::Write32(base, holder, ours);
+        static int said = 0;
+        if (said < 6) { said++; printf("flare world: %s looked up as the smoke's (%08X): %08X given\n", name.c_str(), smoke, Guest::Read32(base, holder)); fflush(stdout); }
+        ctx.r3.u64 = holder;
+        return;
+    }
     PPCContext saved = ctx;
     const uint32_t holder = ctx.r3.u32;
     __imp__sub_82446EA0(ctx, base);
     // First-person meshes can also be absent from the MP map's own banks.
     // The G43 is wholly in Forest; resolving only its world model leaves
     // the player holding empty hands despite owning a valid weapon.
+    // 0.5.660: THE WEBLEY'S WORLD MODEL PROBE: what the Colt's world model
+    // look-up gives (to make a Webley one beside it): the result, the caller,
+    // and the words the result and what it points at hold
+    if (_stricmp(name.c_str(), "w_us_pist_WORLD") == 0)
+    {
+        static int told = 0;
+        if (told < 6)
+        {
+            told++;
+            const uint32_t got = holder ? Guest::Read32(base, holder) : 0;
+            printf("webley world probe: %s (bank %d, from %08X) -> %08X\n", name.c_str(), saved.r5.s32, uint32_t(saved.lr), got);
+            auto words = [&](const char* what, uint32_t from, int n) {
+                printf("webley world probe:   %s %08X:", what, from);
+                for (int w = 0; w < n; w++) printf(" %08X", Guest::Read32(base, from + 4u * uint32_t(w)));
+                printf("\n");
+            };
+            if (got >= 0x40000000u && got < 0xA0000000u)
+            {
+                words("model", got, 32);
+                for (int w = 0; w < 32; w++)
+                {
+                    const uint32_t to = Guest::Read32(base, got + 4u * uint32_t(w));
+                    if (to >= 0x40000000u && to < 0xA0000000u && to != got) { char what[32]; snprintf(what, sizeof what, "+%d ->", w * 4); words(what, to, 16); printf("webley world probe:     \"%s\"\n", ReadText(base, to, 40).c_str()); }
+                }
+            }
+            fflush(stdout);
+        }
+    }
     bool campaignView = false;
     for (const CampaignGun& gun : Guns)
         if (gun.viewModel && _stricmp(name.c_str(), gun.viewModel) == 0) campaignView = true;
@@ -8583,6 +11703,7 @@ namespace
     // COD3_RELOAD_SHOTS=1: screenshots every quarter second for 4.5 s from
     // when a reload sound (GR_*) is looked up (lining sound up with motion).
     std::atomic<long long> g_reloadShotsFrom{ -1 };
+    std::atomic<long long> g_eventShotsFrom{ -1 };   // 0.5.811: COD3_EVENT_SHOTS
     long long SoundMs() { static const auto start = std::chrono::steady_clock::now(); return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count(); }
 }
 // A model's parts and their meshes (sub_82446AB8: r25 a list, +16 count,
@@ -8597,6 +11718,18 @@ namespace
 {
     uint32_t g_mg34BodySlot = 0, g_mg34Body = 0, g_mg42Body = 0;
     std::vector<uint32_t> g_mg34Bodies;   // every MG34 view body seen (one per bank that loads it)
+    // 0.5.653: the Colt's view parts (the Webley's swap, MpFixesWebleyView): its
+    // body, colt.w_us_pist_VM, and its hammer, slide and magazine
+    std::vector<uint32_t> g_coltBodies, g_coltParts;
+    // 0.5.809: the first-person arms' meshes (<side>_arms.viewmodel_hands_<side>),
+    // mirrored with the Colt's for the dual Colts' left arm (MpFixesDualView)
+    std::vector<uint32_t> g_armsMeshes;
+    // 0.5.681: the Thompson's (the flamethrower's swap, MpFixesFlameView): its
+    // body, w_tommy.w_usSMG_VM, and its magazine, round and charging handle
+    std::vector<uint32_t> g_tommyBodies, g_tommyParts;
+    // 0.5.726: the Kar98's (the scoped Mosin's swap, MpFixesMosinView): its body,
+    // k98.w_ge_RFL_VM, and its bolt, clips and the scope model's parts
+    std::vector<uint32_t> g_k98Bodies, g_k98Parts;
     // The MG34 view parts not drawn while the MG42 is in hand (the bipod,
     // which the handheld MG42 has none of): their triangle and index counts
     // (+28, +0x40+104) set to none, and put back.
@@ -8614,6 +11747,7 @@ namespace
     std::mutex g_bodyLock;
 }
 static void WorldFitSeeMesh(uint8_t* base, const std::string& mesh, uint32_t at);   // below MakeMg42Body
+namespace { bool MeshBuffer(uint8_t* base, uint32_t mesh, uint32_t& buffer, uint32_t& vertices, uint32_t& stride); }   // below (0.5.652: the Webley's probe)
 extern "C" PPC_FUNC(__imp__sub_82446AB8);
 PPC_FUNC(sub_82446AB8)
 {
@@ -8638,11 +11772,100 @@ PPC_FUNC(sub_82446AB8)
             const std::string mesh = ReadText(base, Guest::Read32(base, names + 4 * i), 64);
             const uint32_t slot = found + 4 * i;
             WorldFitSeeMesh(base, mesh, Guest::Read32(base, slot));
+            // 0.5.652: THE WEBLEY'S PROBE: the pistols' meshes (the Colt's and
+            // the P38's parts), their layout and their first vertices, to put
+            // CoD2's Webley in a pistol's place: the declaration (+0xC0, the
+            // vertex elements), the piece (+0x40) and two 52-byte vertices
+            {
+                std::string lower = mesh;
+                for (char& c : lower) c = char(tolower((unsigned char)c));
+                static int told = 0;
+                const uint32_t at = Guest::Read32(base, slot);
+                if (told < 40 && at >= 0x40000000u && at < 0xA0000000u &&
+                    (lower.find("pst") != std::string::npos || lower.find("colt") != std::string::npos || lower.find("p38") != std::string::npos || lower.find("pistol") != std::string::npos))
+                {
+                    told++;
+                    auto words = [&](const char* what, uint32_t from, int n) {
+                        printf("webley probe: %s %08X:", what, from);
+                        for (int w = 0; w < n; w++) printf(" %08X", Guest::Read32(base, from + 4u * uint32_t(w)));
+                        printf("\n");
+                    };
+                    printf("webley probe: mesh %s at %08X (model \"%s\")\n", mesh.c_str(), at, ReadText(base, Guest::Read32(base, model + 52), 64).c_str());
+                    words("  mesh", at, 32);
+                    words("  piece", at + 0x40, 32);
+                    words("  decl", at + 0xC0, 30);
+                    words("  vdesc", at + 0x138, 16);
+                    uint32_t buffer = 0, vertices = 0, stride = 0;
+                    if (MeshBuffer(base, at, buffer, vertices, stride))
+                    {
+                        printf("webley probe:   %u vertices of %u bytes at %08X\n", vertices, stride, buffer);
+                        words("  vertex 0", buffer, int(stride / 4));
+                        words("  vertex 1", buffer + stride, int(stride / 4));
+                        words("  vertex 2", buffer + 2 * stride, int(stride / 4));
+                    }
+                    fflush(stdout);
+                }
+            }
             if (HiddenPart(mesh))
             {
                 std::lock_guard<std::mutex> guard(g_bodyLock);
                 const uint32_t part = Guest::Read32(base, slot);
                 if (part && std::find(g_mg34Hidden.begin(), g_mg34Hidden.end(), part) == g_mg34Hidden.end()) g_mg34Hidden.push_back(part);
+            }
+            if (_stricmp(mesh.c_str(), "colt.w_us_pist_VM") == 0 || _stricmp(mesh.c_str(), "colt_hammer.w_us_pist_VM") == 0 ||
+                _stricmp(mesh.c_str(), "colt_slide.w_us_pist_VM") == 0 || _stricmp(mesh.c_str(), "colt_mag.w_us_pist_VM") == 0)
+            {
+                std::lock_guard<std::mutex> guard(g_bodyLock);
+                const uint32_t part = Guest::Read32(base, slot);
+                std::vector<uint32_t>& into = _stricmp(mesh.c_str(), "colt.w_us_pist_VM") == 0 ? g_coltBodies : g_coltParts;
+                if (part && std::find(into.begin(), into.end(), part) == into.end()) into.push_back(part);
+            }
+            {
+                std::string lowerMesh = mesh;
+                for (char& c : lowerMesh) c = char(tolower((unsigned char)c));
+                if (lowerMesh.find(".viewmodel_hands") != std::string::npos)
+                {
+                    std::lock_guard<std::mutex> guard(g_bodyLock);
+                    const uint32_t part = Guest::Read32(base, slot);
+                    if (part && std::find(g_armsMeshes.begin(), g_armsMeshes.end(), part) == g_armsMeshes.end())
+                    {
+                        g_armsMeshes.push_back(part);
+                        printf("dual colts: the arms' mesh %s at %08X\n", mesh.c_str(), part);
+                        fflush(stdout);
+                    }
+                }
+            }
+            if (_stricmp(mesh.c_str(), "w_tommy.w_usSMG_VM") == 0 || _stricmp(mesh.c_str(), "w_mag.w_usSMG_VM") == 0 ||
+                _stricmp(mesh.c_str(), "w_bullet.w_usSMG_VM") == 0 || _stricmp(mesh.c_str(), "w_charging_handle.w_usSMG_VM") == 0)
+            {
+                std::lock_guard<std::mutex> guard(g_bodyLock);
+                const uint32_t part = Guest::Read32(base, slot);
+                std::vector<uint32_t>& into = _stricmp(mesh.c_str(), "w_tommy.w_usSMG_VM") == 0 ? g_tommyBodies : g_tommyParts;
+                if (part && std::find(into.begin(), into.end(), part) == into.end())
+                {
+                    into.push_back(part);
+                    printf("flamethrower: the Thompson's view mesh %s at %08X\n", mesh.c_str(), part);
+                    fflush(stdout);
+                }
+            }
+            {
+                static const char* const K98Parts[] = { "bolt.w_ge_RFL_VM", "k98_bolt_handle.w_ge_RFL_VM", "k98_mag.w_ge_RFL_VM", "k98_mag_first.w_ge_RFL_VM",
+                                                         "k98_mag_stripper.w_ge_RFL_VM", "stripper.w_ge_RFL_VM", "scope.w_ge_RFL_SCOPE" };
+                const bool body = _stricmp(mesh.c_str(), "k98.w_ge_RFL_VM") == 0;
+                bool part = false;
+                for (const char* k : K98Parts) part = part || _stricmp(mesh.c_str(), k) == 0;
+                if (body || part)
+                {
+                    std::lock_guard<std::mutex> guard(g_bodyLock);
+                    const uint32_t at = Guest::Read32(base, slot);
+                    std::vector<uint32_t>& into = body ? g_k98Bodies : g_k98Parts;
+                    if (at && std::find(into.begin(), into.end(), at) == into.end())
+                    {
+                        into.push_back(at);
+                        printf("mosin: the Kar98's view mesh %s at %08X\n", mesh.c_str(), at);
+                        fflush(stdout);
+                    }
+                }
             }
             if (_stricmp(mesh.c_str(), "w_lee_enfield.lee_enfield") == 0)
             {
@@ -9389,17 +12612,39 @@ void MpFixesMg42View(uint8_t* base, uint32_t held)
             if (next <= 18 && since >= next * 250) { Overlay::RequestScreenshot(); printf("sound times: %lld reload screenshot %d (+%lld ms)\n", SoundMs(), next, since); fflush(stdout); next++; }
         }
     }
+    // 0.5.811: COD3_EVENT_SHOTS=<part of an event's name>: screenshots every
+    // 100 ms for 1.5 s from when such an event is made (a tank shell's hit)
+    {
+        const long long from = g_eventShotsFrom.load();
+        static long long last = -1; static int next = 0;
+        if (from >= 0)
+        {
+            if (from != last) { last = from; next = 0; }
+            const long long since = SoundMs() - from;
+            static const int step = [] { const char* t = getenv("COD3_EVENT_SHOTS_STEP"); return t ? std::max(50, atoi(t)) : 100; }();
+            static const int count = [] { const char* t = getenv("COD3_EVENT_SHOTS_COUNT"); return t ? std::max(1, atoi(t)) : 15; }();
+            if (next <= count && since >= (long long)next * step) { Overlay::RequestScreenshot(); printf("sound times: %lld event screenshot %d (+%lld ms)\n", SoundMs(), next, since); fflush(stdout); next++; }
+        }
+    }
     // COD3_SHOTS="12 20 30": screenshots that many seconds after the first
-    // frame in a match (testing the MG42's look unattended).
+    // frame in a match (testing the MG42's look unattended). 0.5.733:
+    // COD3_SHOTS_DRAWS=1 also logs each one's frame, its draws pictured, as
+    // the screenshot key does (with COD3_FRAME_LOGS=1; Seelow Night's haze).
     if (const char* shots = getenv("COD3_SHOTS"))
     {
         static const auto start = std::chrono::steady_clock::now();
         static std::vector<double> at;
         static bool parsed = false;
+        static const bool draws = getenv("COD3_SHOTS_DRAWS") != nullptr;
         if (!parsed) { parsed = true; for (const char* t = shots; *t;) { char* end; const double v = strtod(t, &end); if (end == t) break; at.push_back(v); t = end; } }
         const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
         for (size_t i = 0; i < at.size(); i++)
-            if (now >= at[i]) { Overlay::RequestScreenshot(); printf("mg42 view: screenshot at %.1f s (held %u)\n", now, held); fflush(stdout); at.erase(at.begin() + long(i)); break; }
+            if (now >= at[i])
+            {
+                Overlay::RequestScreenshot();
+                if (draws) Render::LogNextFrame();
+                printf("mg42 view: screenshot at %.1f s (held %u)\n", now, held); fflush(stdout); at.erase(at.begin() + long(i)); break;
+            }
     }
     static int32_t mg42 = -1;
     if (mg42 < 0)
@@ -9593,6 +12838,43 @@ void MpFixesMg42View(uint8_t* base, uint32_t held)
     std::array<uint32_t, FieldCount> theirs{};
     for (size_t f = 0; f < FieldCount; f++) theirs[f] = Guest::Read32(base, drawn + Fields[f]);
     const bool on = g_campaignWeapon[mg42] > 0 && held == uint32_t(g_campaignWeapon[mg42]) && !g_cycleMg34;
+    // 0.5.632: isolate the body replacement from the bipod suppression.
+    // Opt-in only; ordinary play keeps the existing behavior. Hold the MG42
+    // for 30 seconds: plain, body only, bipod only, both, then plain again.
+    // Capture after two seconds in each phase, after the writes below.
+    static const bool diagnose = getenv("COD3_MG42_DIAG") != nullptr;
+    static auto diagnosticStart = std::chrono::steady_clock::now();
+    static bool diagnosticHolding = false;
+    static int diagnosticSaid = -1, diagnosticShot = -1, diagnosticIndex = 0;
+    int diagnosticPhase = -1;
+    bool diagnosticCapture = false;
+    bool bodyOn = on, bipodOn = on;
+    if (diagnose)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (!on) { diagnosticHolding = false; diagnosticSaid = -1; diagnosticShot = -1; }
+        else
+        {
+            if (!diagnosticHolding) { diagnosticHolding = true; diagnosticStart = now; diagnosticIndex = 0; }
+            double seconds = std::chrono::duration<double>(now - diagnosticStart).count();
+            // Frame captures may stall. Never skip a phase when a frame
+            // takes longer than six seconds; give every phase its own time.
+            if (seconds >= 6.0 && diagnosticIndex < 4) { ++diagnosticIndex; diagnosticStart = now; seconds = 0; }
+            diagnosticPhase = diagnosticIndex;
+            bodyOn = diagnosticPhase == 1 || diagnosticPhase == 3;
+            bipodOn = diagnosticPhase == 2 || diagnosticPhase == 3;
+            if (diagnosticSaid != diagnosticPhase)
+            {
+                diagnosticSaid = diagnosticPhase;
+                printf("mg42 isolate: phase %d (%s), body %s, bipod %s; hold still\n",
+                    diagnosticPhase, diagnosticPhase == 0 || diagnosticPhase == 4 ? "plain" :
+                    diagnosticPhase == 1 ? "body only" : diagnosticPhase == 2 ? "bipod only" : "both",
+                    bodyOn ? "MG42" : "MG34", bipodOn ? "hidden" : "visible");
+                fflush(stdout);
+            }
+            diagnosticCapture = diagnosticShot != diagnosticPhase && seconds >= 2.0;
+        }
+    }
     for (size_t b = 0; b < g_mg34Bodies.size();)
     {
         const uint32_t body = g_mg34Bodies[b];
@@ -9606,12 +12888,12 @@ void MpFixesMg42View(uint8_t* base, uint32_t held)
         for (uint32_t m : { made, madeAds })
             if (m) { bool same = true; for (size_t f = 0; f < FieldCount; f++) if (now[f] != Guest::Read32(base, m + Fields[f])) same = false; ours = ours || same; }
         if (now != saved[body] && !ours) { saved[body] = now; }   // something new loaded there
-        const auto& want = on ? theirs : saved[body];
+        const auto& want = bodyOn ? theirs : saved[body];
         if (now != want)
         {
             for (size_t f = 0; f < FieldCount; f++) Guest::Write32(base, body + Fields[f], want[f]);
             static int said = 0;
-            if ((said < 20 && said++ < 20)) { printf("mg42 view: the gun body %08X in view is now the %s\n", body, on ? "MG42's" : "MG34's"); fflush(stdout); }
+            if ((said < 20 && said++ < 20)) { printf("mg42 view: the gun body %08X in view is now the %s\n", body, bodyOn ? "MG42's" : "MG34's"); fflush(stdout); }
         }
         b++;
     }
@@ -9627,14 +12909,2440 @@ void MpFixesMg42View(uint8_t* base, uint32_t held)
         for (int f = 0; f < 4; f++) now[f] = Guest::Read32(base, part + HideFields[f]);
         const std::array<uint32_t, 4> none{};
         if (!counts.count(part) || (now != none && now != counts[part])) counts[part] = now;
-        const std::array<uint32_t, 4> want = on ? none : counts[part];
+        const std::array<uint32_t, 4> want = bipodOn ? none : counts[part];
         if (now != want)
         {
             for (int f = 0; f < 4; f++) Guest::Write32(base, part + HideFields[f], want[f]);
             static int said = 0;
-            if ((said < 20 && said++ < 20)) { printf("mg42 view: part %08X %s\n", part, on ? "hidden" : "shown again"); fflush(stdout); }
+            if ((said < 20 && said++ < 20)) { printf("mg42 view: part %08X %s\n", part, bipodOn ? "hidden" : "shown again"); fflush(stdout); }
         }
         h++;
+    }
+    if (diagnosticCapture)
+    {
+        diagnosticShot = diagnosticPhase;
+        // Small, bounded metadata dump: compare complete mesh/vertex-layout
+        // and buffer descriptors, not only the eight fields we overwrite.
+        auto describe = [&](const char* name, uint32_t mesh)
+        {
+            printf("mg42 isolate: phase %d %s %08X:", diagnosticPhase, name, mesh);
+            for (uint32_t w = 0; w < 0x180; w += 4) printf(" %08X", Guest::Read32(base, mesh + w));
+            printf("\n");
+        };
+        for (uint32_t body : g_mg34Bodies) describe("view body", body);
+        describe("source world body", g_mg42Body);
+        describe("replacement body", drawn);
+        printf("mg42 isolate: phase %d capture requested (frame log and screenshot)\n", diagnosticPhase);
+        fflush(stdout);
+        Render::LogNextFrame(); Overlay::RequestScreenshot();
+    }
+    // 0.5.630 (user, 629: "i cant see the mg42 anymore in my hands ... it shoots
+    // but i cant see it"; bots with it "looked weird when shooting"). Once a
+    // run, 2 s into holding it: the body drawn's fields (its buffers) and
+    // the next frame's draws logged (find its buffers in them), a screenshot.
+    {
+        static uint64_t holdingSince = 0; static bool pictured = false;
+        const uint64_t nowMs = GetTickCount64();
+        if (!on) holdingSince = 0;
+        else if (!holdingSince) holdingSince = nowMs;
+        else if (!diagnose && !pictured && nowMs - holdingSince > 2000)
+        {
+            pictured = true;
+            printf("mg42 view: held 2 s: the body drawn %08X (fields", drawn);
+            for (size_t f = 0; f < FieldCount; f++) printf(" +%X %08X", Fields[f], theirs[f]);
+            printf("); MG34 bodies %zu, parts hidden %zu; the next frame's draws and a screenshot\n", g_mg34Bodies.size(), g_mg34Hidden.size());
+            fflush(stdout);
+            Render::LogNextFrame(); Overlay::RequestScreenshot();
+        }
+    }
+}
+
+// 0.5.653: THE WEBLEY'S VIEW. CoD2's first-person Webley (xmodel viewmodel_webley,
+// its part viewmodel_webley2), read from the user's own CoD2 install by
+// tools/cod2import/cod2import.py into custom\webley\viewmodel_webley.mesh beside
+// the game (vertices with their bones applied, in CoD2's inches: barrel along
+// +x, up +z), is put in the Colt's body's place while the Webley is held, as
+// the MG42's body is in the MG34's (MpFixesMg42View): the Colt body mesh's
+// counts and vertex and index buffers (+28, +0x40+88, +0x40+104, +0x138+24/28,
+// +0x158+24/28) are ours while held and its own again after; the Colt's
+// hammer, slide and magazine are not drawn (their counts 0). The Colt's
+// vertices are 52 bytes (0.5.652's probe, its declaration): position, a
+// packed normal +12, three texture coordinate pairs +16/+24/+32 (the same),
+// a colour +40, a packed tangent +44 and binormal +48. Its material stays
+// the Colt's; the renderer gives these draws CoD2's texture instead
+// (custom\webley\webley_c.png, Render::SetMeshTexture). The speed-loader and
+// its rounds (CoD2's reload's, bones j_quickloader*) are left out.
+// Turned so its barrel runs along the Colt's (-y), scaled to the Colt body's
+// length, its back end and bottom on the Colt body's. COD3_WEBLEY_FIT="scale
+// x y z" (scale 0: as fitted) moves it from there, for fitting by screenshot.
+namespace
+{
+    struct WebleyVertex { float p[3], n[3], uv[2]; uint32_t bone; };
+    std::vector<WebleyVertex> g_webleyVerts;
+    std::vector<uint16_t> g_webleyIndices;
+    std::vector<std::string> g_webleyBoneNames;   // the mesh's bones (its vertices' bone is an index into these)
+    bool g_webleyLoaded = false, g_webleyTried = false;
+    std::string g_webleyDir;
+
+    std::string WebleyDir()
+    {
+        if (g_webleyDir.empty())
+        {
+            char path[MAX_PATH] = {};
+            GetModuleFileNameA(nullptr, path, MAX_PATH);
+            std::string dir(path);
+            const size_t slash = dir.find_last_of("\\/");
+            g_webleyDir = (slash == std::string::npos ? std::string(".") : dir.substr(0, slash)) + "\\custom\\webley\\";
+        }
+        return g_webleyDir;
+    }
+
+    bool LoadWebley()
+    {
+        if (g_webleyTried) return g_webleyLoaded;
+        g_webleyTried = true;
+        const std::string file = WebleyDir() + "viewmodel_webley.mesh";
+        FILE* f = fopen(file.c_str(), "rb");
+        if (!f) { printf("webley: %s not found (tools/cod2import makes it from CoD2)\n", file.c_str()); fflush(stdout); return false; }
+        std::vector<uint8_t> d;
+        uint8_t chunk[65536];
+        for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) d.insert(d.end(), chunk, chunk + n);
+        fclose(f);
+        auto u32 = [&](size_t at) { uint32_t v = 0; if (at + 4 <= d.size()) memcpy(&v, &d[at], 4); return v; };
+        if (d.size() < 20 || memcmp(d.data(), "C2MS", 4) != 0 || u32(4) != 1) { printf("webley: %s is not a mesh of cod2import's\n", file.c_str()); return false; }
+        const uint32_t nv = u32(8), nt = u32(12), ns = u32(16);
+        size_t at = 20;
+        if (nv > 65535 || at + size_t(nv) * 36 + size_t(nt) * 6 > d.size()) { printf("webley: %s is cut short\n", file.c_str()); return false; }
+        std::vector<WebleyVertex> verts(nv);
+        for (uint32_t i = 0; i < nv; i++, at += 36) memcpy(&verts[i], &d[at], 36);
+        std::vector<uint16_t> tris(size_t(nt) * 3);
+        memcpy(tris.data(), &d[at], size_t(nt) * 6);
+        at += size_t(nt) * 6;
+        for (uint32_t i = 0; i < ns && at + 12 <= d.size(); i++) at += 12 + u32(at + 8);
+        std::vector<std::string> bones;
+        const uint32_t nb = u32(at); at += 4;
+        for (uint32_t i = 0; i < nb && at + 4 <= d.size(); i++) { const uint32_t n = u32(at); bones.push_back(std::string((const char*)&d[at + 4], std::min<size_t>(n, d.size() - at - 4))); at += 4 + n + 12; }
+        // 0.5.674: the speed-loader and its rounds are kept (the reload shows
+        // them); at rest they are drawn folded to a point (PoseWebley)
+        g_webleyBoneNames = bones;
+        // the triangles kept, their vertices renumbered
+        std::vector<int> remap(nv, -1);
+        for (uint32_t t = 0; t < nt; t++)
+        {
+            const uint16_t* tri = &tris[size_t(t) * 3];
+            if (tri[0] >= nv || tri[1] >= nv || tri[2] >= nv) continue;
+            for (int k = 0; k < 3; k++)
+            {
+                if (remap[tri[k]] < 0) { remap[tri[k]] = int(g_webleyVerts.size()); g_webleyVerts.push_back(verts[tri[k]]); }
+                g_webleyIndices.push_back(uint16_t(remap[tri[k]]));
+            }
+        }
+        g_webleyLoaded = !g_webleyIndices.empty();
+        printf("webley: %s: %u of %u vertices, %zu of %u triangles, %zu bones\n", file.c_str(), unsigned(g_webleyVerts.size()), nv, g_webleyIndices.size() / 3, nt, bones.size());
+        fflush(stdout);
+        return g_webleyLoaded;
+    }
+
+    // 0.5.664: the textures for the Webley draws' other slots (the Colt's
+    // normal and specular maps drew its panels on it): COD3_WEBLEY_TEX=
+    // "6=flat_n.png 3=black.png" (files in custom\webley), else
+    // custom\webley\slots.txt's one line of the same
+    void WebleySlotTextures(uint32_t buffer)
+    {
+        std::string spec = getenv("COD3_WEBLEY_TEX") ? getenv("COD3_WEBLEY_TEX") : "";
+        if (spec.empty())
+            if (FILE* f = fopen((WebleyDir() + "slots.txt").c_str(), "rb")) { char line[512] = {}; if (fgets(line, sizeof line, f)) spec = line; fclose(f); }
+        std::istringstream words(spec);
+        for (std::string word; words >> word;)
+        {
+            const size_t eq = word.find('=');
+            if (eq == std::string::npos) continue;
+            const int slot = atoi(word.substr(0, eq).c_str());
+            Render::SetMeshSlotTexture(buffer, slot, (WebleyDir() + word.substr(eq + 1)).c_str());
+            printf("webley: slot %d of %08X's draws: %s\n", slot, buffer, word.substr(eq + 1).c_str());
+        }
+        fflush(stdout);
+    }
+
+    uint32_t PackDirection(const float v[3], bool reversed)
+    {
+        auto q = [](float f) { return uint32_t(int(std::lround(std::clamp(f, -1.0f, 1.0f) * 511.0f)) & 0x3FF); };
+        return reversed ? (q(v[2]) | (q(v[1]) << 10) | (q(v[0]) << 20)) : (q(v[0]) | (q(v[1]) << 10) | (q(v[2]) << 20));
+    }
+
+    // CoD3's buffers for the Webley, fitted to this Colt body (made again when
+    // the fit changes): its vertex and index buffers and counts
+    struct WebleyBuffers
+    {
+        uint32_t vertices = 0, indices = 0, vertexCount = 0, indexCount = 0; std::string madeFor;
+        float scale = 1.0f, ox = 0.0f, oy = 0.0f, oz = 0.0f; bool reversed = false;   // the fit (0.5.674: kept for PoseWebley)
+    };
+    WebleyBuffers g_webleyBuffers;
+
+    // 0.5.674: the speed-loader and its rounds: put away at rest (CoD2 parks them off the gun)
+    bool WebleyPartAway(uint32_t bone) { return bone < g_webleyBoneNames.size() && g_webleyBoneNames[bone].rfind("j_quickloader", 0) == 0; }
+
+    // The Webley's vertices written into its buffer, fitted onto the Colt's
+    // body: as the mesh was made (moves null: the idle pose, the speed-loader
+    // put away) or with each of the mesh's bones moved (moves: 12 floats a
+    // bone, its turn's x, y, z columns then its shift, in CoD2's j_gun
+    // space; shown: whether each bone's part is drawn). A part put away is
+    // folded to a point (its triangles draw nothing).
+    void PoseWebley(uint8_t* base, const float* moves, const uint8_t* shown)
+    {
+        const WebleyBuffers& wb = g_webleyBuffers;
+        const uint32_t vcount = uint32_t(g_webleyVerts.size()), bones = uint32_t(g_webleyBoneNames.size());
+        for (uint32_t i = 0; i < vcount; i++)
+        {
+            const WebleyVertex& v = g_webleyVerts[i];
+            float p[3] = { v.p[0], v.p[1], v.p[2] }, m[3] = { v.n[0], v.n[1], v.n[2] };
+            const bool has = v.bone < bones;
+            if (moves && has)
+            {
+                const float* d = moves + 12 * v.bone;
+                for (int c = 0; c < 3; c++)
+                {
+                    p[c] = v.p[0] * d[c] + v.p[1] * d[3 + c] + v.p[2] * d[6 + c] + d[9 + c];
+                    m[c] = v.n[0] * d[c] + v.n[1] * d[3 + c] + v.n[2] * d[6 + c];
+                }
+            }
+            if (shown ? (has && !shown[v.bone]) : WebleyPartAway(v.bone)) p[0] = p[1] = p[2] = 0.0f;
+            const uint32_t at = wb.vertices + 52 * i;
+            const float n[3] = { m[1], -m[0], m[2] };
+            // a tangent across the normal, and the binormal from both
+            float t[3] = { n[1], -n[0], 0.0f };
+            float tl = sqrtf(t[0] * t[0] + t[1] * t[1]);
+            if (tl < 0.1f) { t[0] = 1.0f; t[1] = 0.0f; t[2] = 0.0f; tl = 1.0f; }
+            for (float& c : t) c /= tl;
+            const float b[3] = { n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0] };
+            WriteFloat(base, at + 0, p[1] * wb.scale + wb.ox);
+            WriteFloat(base, at + 4, -p[0] * wb.scale + wb.oy);
+            WriteFloat(base, at + 8, p[2] * wb.scale + wb.oz);
+            Guest::Write32(base, at + 12, PackDirection(n, wb.reversed));
+            for (uint32_t uv = 16; uv <= 32; uv += 8) { WriteFloat(base, at + uv, v.uv[0]); WriteFloat(base, at + uv + 4, v.uv[1]); }
+            Guest::Write32(base, at + 40, 0xFFFFFFFFu);
+            Guest::Write32(base, at + 44, PackDirection(t, wb.reversed));
+            Guest::Write32(base, at + 48, PackDirection(b, wb.reversed));
+        }
+    }
+
+    bool MakeWebley(uint8_t* base, uint32_t colt)
+    {
+        if (!LoadWebley()) return false;
+        float lo[3], hi[3];
+        for (int c = 0; c < 3; c++) { lo[c] = ReadFloat(base, colt + 0x40 + 32 + 4 * c); hi[c] = ReadFloat(base, colt + 0x40 + 48 + 4 * c); }
+        float wlo[3] = { 1e9f, 1e9f, 1e9f }, whi[3] = { -1e9f, -1e9f, -1e9f };
+        // (0.5.674: the speed-loader, parked off the gun at rest, not counted)
+        for (const WebleyVertex& v : g_webleyVerts) if (!WebleyPartAway(v.bone)) for (int c = 0; c < 3; c++) { wlo[c] = std::min(wlo[c], v.p[c]); whi[c] = std::max(whi[c], v.p[c]); }
+        float user[4] = { 0, 0, 0, 0 };
+        if (const char* t = getenv("COD3_WEBLEY_FIT")) sscanf(t, "%f %f %f %f", &user[0], &user[1], &user[2], &user[3]);
+        // CoD2's +x (barrel) is the Colt's -y (its muzzle at y -4.14, its grip
+        // at the +y end; 0.5.657 had it backwards), CoD2's +y its +x, +z up in
+        // both
+        // 0.5.666: scaled to the Colt body's height (its grip's bottom to its
+        // sights' top), not its length: by length the longer Webley came out
+        // 11% small, its sights 0.25-0.32 below the Colt's (the aimed view
+        // looks along the Colt's); the barrel now reaches a little further on
+        const float scale = user[0] > 0.0f ? user[0] : (hi[2] - lo[2]) / std::max(0.01f, whi[2] - wlo[2]);
+        const float ox = (lo[0] + hi[0]) * 0.5f - (wlo[1] + whi[1]) * 0.5f * scale + user[1];
+        const float oy = hi[1] + wlo[0] * scale + user[2];
+        const float oz = lo[2] - wlo[2] * scale + user[3];
+        char key[160];
+        snprintf(key, sizeof key, "%.4f %.4f %.4f %.4f", scale, ox, oy, oz);
+        if (g_webleyBuffers.vertices && g_webleyBuffers.madeFor == key) return true;
+        // which way round the Colt's packed normals are: the one its triangles agree with
+        // 0.5.662: and which way round its triangles face (CoD2's: counter-
+        // clockwise to their normals): the other way, the Webley's outside
+        // was culled and its inside seen through it ("two guns merged", user)
+        bool reversed = false, clockwise = false;
+        {
+            uint32_t buffer = 0, count = 0, stride = 0;
+            const uint32_t indices = Guest::Read32(base, colt + 0x158 + 24), bytes = Guest::Read32(base, colt + 0x158 + 28);
+            if (MeshBuffer(base, colt, buffer, count, stride) && stride == 52)
+            {
+                double agree[2] = {}, facing[2] = {};
+                for (uint32_t t = 0; t + 6 <= bytes && t < 6 * 400; t += 6)
+                {
+                    uint32_t vi[3]; float p[3][3]; bool ok = true;
+                    for (int k = 0; k < 3 && ok; k++) { vi[k] = Guest::Read16(base, indices + t + 2 * k); ok = vi[k] < count; if (ok) for (int c = 0; c < 3; c++) p[k][c] = ReadFloat(base, buffer + 52 * vi[k] + 4 * c); }
+                    if (!ok) continue;
+                    const float a[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] }, b[3] = { p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2] };
+                    const float n[3] = { a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
+                    const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                    if (len < 1e-6f) continue;
+                    const uint32_t w = Guest::Read32(base, buffer + 52 * vi[0] + 12);
+                    for (int r = 0; r < 2; r++)
+                    {
+                        const float m[3] = { float(Field10(w, r ? 20 : 0)), float(Field10(w, 10)), float(Field10(w, r ? 0 : 20)) };
+                        const float ml = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+                        if (ml > 0) { const double d = (n[0] * m[0] + n[1] * m[1] + n[2] * m[2]) / (len * ml); agree[r] += fabs(d); facing[r] += d; }
+                    }
+                }
+                reversed = agree[1] > agree[0];
+                clockwise = facing[reversed ? 1 : 0] < 0;
+                if (const char* t = getenv("COD3_WEBLEY_CLOCKWISE")) clockwise = atoi(t) != 0;
+                printf("webley: the Colt's normals %s (agreement %.0f / %.0f), its triangles face %s (%.0f)\n", reversed ? "z-low" : "x-low", agree[0], agree[1],
+                       clockwise ? "clockwise: the Webley's turned round" : "counter-clockwise", facing[reversed ? 1 : 0]);
+            }
+        }
+        const uint32_t vcount = uint32_t(g_webleyVerts.size()), icount = uint32_t(g_webleyIndices.size());
+        static uint32_t vroom = 0, iroom = 0;
+        if (vcount * 52 > vroom) { vroom = (vcount * 52 + 0xFFFFu) & ~0xFFFFu; g_webleyBuffers.vertices = Guest::AllocateExtended(vroom); }
+        if (icount * 2 > iroom) { iroom = (icount * 2 + 0xFFFFu) & ~0xFFFFu; g_webleyBuffers.indices = Guest::AllocateExtended(iroom); }
+        if (!g_webleyBuffers.vertices || !g_webleyBuffers.indices) { printf("webley: no memory for its buffers\n"); return false; }
+        g_webleyBuffers.scale = scale; g_webleyBuffers.ox = ox; g_webleyBuffers.oy = oy; g_webleyBuffers.oz = oz; g_webleyBuffers.reversed = reversed;
+        PoseWebley(base, nullptr, nullptr);
+        for (uint32_t i = 0; i < icount; i++) Guest::Write16(base, g_webleyBuffers.indices + 2 * i, g_webleyIndices[clockwise && i % 3 ? (i % 3 == 1 ? i + 1 : i - 1) : i]);
+        g_webleyBuffers.vertexCount = vcount; g_webleyBuffers.indexCount = icount; g_webleyBuffers.madeFor = key;
+        Render::SetMeshTexture(g_webleyBuffers.vertices, (WebleyDir() + "webley_c.png").c_str());
+        WebleySlotTextures(g_webleyBuffers.vertices);
+        // DIAGNOSTIC (0.5.663): COD3_WEBLEY_DUMP=1: the Colt body's and the
+        // Webley's positions and triangles as drawn, to custom\webley\fit_dump.bin
+        // (u32 count, then floats xyz; u32 count, then u16 indices; twice: the
+        // Colt's, then ours), for comparing the fit offline
+        if (getenv("COD3_WEBLEY_DUMP"))
+            if (FILE* f = fopen((WebleyDir() + "fit_dump.bin").c_str(), "wb"))
+            {
+                uint32_t buffer = 0, count = 0, stride = 0;
+                const uint32_t indices = Guest::Read32(base, colt + 0x158 + 24), ibytes = Guest::Read32(base, colt + 0x158 + 28);
+                if (!MeshBuffer(base, colt, buffer, count, stride)) count = 0;
+                auto dump = [&](uint32_t vb, uint32_t vn, uint32_t vstride, uint32_t ib, uint32_t in)
+                {
+                    fwrite(&vn, 4, 1, f);
+                    for (uint32_t v = 0; v < vn; v++) for (int c = 0; c < 3; c++) { const float x = ReadFloat(base, vb + vstride * v + 4 * c); fwrite(&x, 4, 1, f); }
+                    fwrite(&in, 4, 1, f);
+                    for (uint32_t i = 0; i < in; i++) { const uint16_t x = Guest::Read16(base, ib + 2 * i); fwrite(&x, 2, 1, f); }
+                };
+                dump(buffer, count, stride, indices, count ? ibytes / 2 : 0);
+                dump(g_webleyBuffers.vertices, vcount, 52, g_webleyBuffers.indices, icount);
+                fclose(f);
+                printf("webley: the fit dumped (%u Colt vertices, %u ours)\n", count, vcount);
+            }
+        printf("webley: made at %08X (%u vertices) and %08X (%u indices): scale %.3f, by %.2f %.2f %.2f; the Colt body's box %.2f %.2f %.2f .. %.2f %.2f %.2f\n",
+               g_webleyBuffers.vertices, vcount, g_webleyBuffers.indices, icount, scale, ox, oy, oz, lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]);
+        fflush(stdout);
+        return true;
+    }
+
+    // 0.5.661: THE WEBLEY'S WORLD MODEL, what others see in its holder's
+    // hands (and dropped). The Colt's world model is shared by every Colt
+    // holder, so the Webley gets one of its own: its world model's name
+    // (w_brit_webley_WORLD, the weapon's +1432/+1436) is looked up as the
+    // Colt's (sub_82446EA0) and given a copy of it with CoD2's world mesh
+    // (custom\webley\weapon_webley.mesh). The 0.5.660 probe's layout: the
+    // handle (+32 and +88 the model, +36 a record at +0x50 of it, +72/+84
+    // its name); the model (+32/+36 its meshes' names, +40/+44 the meshes,
+    // 4 of them); a mesh (+20/+24 its detail levels, +28 triangles; its piece
+    // at +0x40: +80 the vertex description, +88 vertices, +96 the index
+    // description, +104 indices; 24-byte vertices: position, packed normal,
+    // uv). The body (the mesh with most triangles) gets CoD2's vertices,
+    // turned and scaled onto the Colt's box; the Colt's other parts are not
+    // drawn; no detail levels (the nearest's mesh at any distance).
+    std::vector<WebleyVertex> g_webleyWorldVerts;
+    std::vector<uint16_t> g_webleyWorldIndices;
+
+    bool LoadMeshFile(const std::string& file, std::vector<WebleyVertex>& verts, std::vector<uint16_t>& indices)
+    {
+        FILE* f = fopen(file.c_str(), "rb");
+        if (!f) return false;
+        std::vector<uint8_t> d;
+        uint8_t chunk[65536];
+        for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) d.insert(d.end(), chunk, chunk + n);
+        fclose(f);
+        auto u32 = [&](size_t at) { uint32_t v = 0; if (at + 4 <= d.size()) memcpy(&v, &d[at], 4); return v; };
+        if (d.size() < 20 || memcmp(d.data(), "C2MS", 4) != 0) return false;
+        const uint32_t nv = u32(8), nt = u32(12);
+        if (nv > 65535 || 20 + size_t(nv) * 36 + size_t(nt) * 6 > d.size()) return false;
+        verts.resize(nv);
+        for (uint32_t i = 0; i < nv; i++) memcpy(&verts[i], &d[20 + 36 * size_t(i)], 36);
+        indices.resize(size_t(nt) * 3);
+        memcpy(indices.data(), &d[20 + 36 * size_t(nv)], size_t(nt) * 6);
+        for (uint16_t i : indices) if (i >= nv) return false;
+        return nt > 0;
+    }
+
+    uint32_t WebleyWorldModel(uint8_t* base, uint32_t colt)
+    {
+        static std::map<uint32_t, uint32_t> made;   // the Colt's handle: ours
+        if (const auto hit = made.find(colt); hit != made.end()) return hit->second;
+        static bool loaded = false, tried = false;
+        if (!tried)
+        {
+            tried = true;
+            loaded = LoadMeshFile(WebleyDir() + "weapon_webley.mesh", g_webleyWorldVerts, g_webleyWorldIndices);
+            printf("webley world: %sweapon_webley.mesh %s (%zu vertices, %zu triangles)\n", WebleyDir().c_str(), loaded ? "read" : "NOT read",
+                   g_webleyWorldVerts.size(), g_webleyWorldIndices.size() / 3);
+        }
+        auto inGuest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+        const uint32_t model = Guest::Read32(base, colt + 32);
+        if (!loaded || !inGuest(colt) || !inGuest(model) || Guest::Read32(base, colt + 88) != model) { printf("webley world: the Colt's world model %08X is not as the probe had it\n", colt); fflush(stdout); return 0; }
+        const uint32_t count = Guest::Read32(base, model + 40), meshes = Guest::Read32(base, model + 44), names = Guest::Read32(base, model + 36);
+        if (count == 0 || count > 16 || !inGuest(meshes)) { printf("webley world: the Colt's world model has %u meshes at %08X\n", count, meshes); fflush(stdout); return 0; }
+        // the body: the mesh with most triangles (and a vertex buffer of 24-byte vertices)
+        uint32_t body = 0, most = 0, buffer = 0, vertices = 0, stride = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i);
+            uint32_t b = 0, v = 0, s = 0;
+            const bool ok = MeshBuffer(base, mesh, b, v, s);
+            printf("webley world: the Colt's mesh %u %s at %08X: %u triangles, %s %u vertices of %u bytes\n", i,
+                   inGuest(names) ? ReadText(base, Guest::Read32(base, names + 4 * i), 64).c_str() : "?", mesh, ok ? Guest::Read32(base, mesh + 28) : 0, ok ? "buffer of" : "no buffer,", v, s);
+            if (ok && s == 24 && Guest::Read32(base, mesh + 28) > most) { most = Guest::Read32(base, mesh + 28); body = mesh; buffer = b; vertices = v; stride = s; }
+        }
+        if (!body) { printf("webley world: no body mesh of 24-byte vertices\n"); fflush(stdout); return 0; }
+        // the Colt body's box and where its vertices gather (which way is
+        // the muzzle, which way the grip hangs)
+        float lo[3] = { 1e9f, 1e9f, 1e9f }, hi[3] = { -1e9f, -1e9f, -1e9f }, mean[3] = {};
+        for (uint32_t v = 0; v < vertices; v++)
+            for (int c = 0; c < 3; c++) { const float f = ReadFloat(base, buffer + stride * v + 4 * c); lo[c] = std::min(lo[c], f); hi[c] = std::max(hi[c], f); mean[c] += f / float(vertices); }
+        float wlo[3] = { 1e9f, 1e9f, 1e9f }, whi[3] = { -1e9f, -1e9f, -1e9f }, wmean[3] = {};
+        for (const WebleyVertex& v : g_webleyWorldVerts) for (int c = 0; c < 3; c++) { wlo[c] = std::min(wlo[c], v.p[c]); whi[c] = std::max(whi[c], v.p[c]); wmean[c] += v.p[c] / float(g_webleyWorldVerts.size()); }
+        // CoD2's world model: x along the barrel, z up, y across; the Colt's:
+        // x along the barrel, y up, z across (its box: 9.7 by 5.9 by 1.0).
+        // Signs from where the vertices gather (the grip's end), the across
+        // axis's so the turn is not a mirror (det +1: winding kept).
+        auto skew = [](float m, float l, float h) { return m - (l + h) * 0.5f; };
+        float sx = (skew(mean[0], lo[0], hi[0]) >= 0) == (skew(wmean[0], wlo[0], whi[0]) >= 0) ? 1.0f : -1.0f;
+        float sy = (skew(mean[1], lo[1], hi[1]) >= 0) == (skew(wmean[2], wlo[2], whi[2]) >= 0) ? 1.0f : -1.0f;
+        if (const char* t = getenv("COD3_WEBLEY_WORLD_SIGNS")) sscanf(t, "%f %f", &sx, &sy);
+        const float sz = -sx * sy;
+        const float scale = (hi[0] - lo[0]) / std::max(0.01f, whi[0] - wlo[0]);
+        auto place = [&](const float p[3], float out[3])
+        {
+            const float q[3] = { sx * p[0], sy * p[2], sz * p[1] };
+            const float qlo[3] = { std::min(sx * wlo[0], sx * whi[0]), std::min(sy * wlo[2], sy * whi[2]), std::min(sz * wlo[1], sz * whi[1]) };
+            const float qhi[3] = { std::max(sx * wlo[0], sx * whi[0]), std::max(sy * wlo[2], sy * whi[2]), std::max(sz * wlo[1], sz * whi[1]) };
+            for (int c = 0; c < 3; c++) out[c] = (q[c] - (qlo[c] + qhi[c]) * 0.5f) * scale + (lo[c] + hi[c]) * 0.5f;
+        };
+        // which way round the Colt's packed normals are (as for the view: the
+        // one its triangles agree with)
+        // one its triangles agree with), and which way round they face (0.5.662)
+        bool reversed = false, clockwise = false;
+        {
+            const uint32_t idesc = Guest::Read32(base, body + 0x40 + 96);
+            const uint32_t indices = idesc > body && idesc < body + 0x400 ? Guest::Read32(base, idesc + 24) : 0, bytes = indices ? Guest::Read32(base, idesc + 28) : 0;
+            double agree[2] = {}, facing[2] = {};
+            for (uint32_t t = 0; indices && t + 6 <= bytes && t < 6 * 400; t += 6)
+            {
+                uint32_t vi[3]; float p[3][3]; bool ok = true;
+                for (int k = 0; k < 3 && ok; k++) { vi[k] = Guest::Read16(base, indices + t + 2 * k); ok = vi[k] < vertices; if (ok) for (int c = 0; c < 3; c++) p[k][c] = ReadFloat(base, buffer + stride * vi[k] + 4 * c); }
+                if (!ok) continue;
+                const float a[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] }, b[3] = { p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2] };
+                const float n[3] = { a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
+                const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+                if (len < 1e-6f) continue;
+                const uint32_t w = Guest::Read32(base, buffer + stride * vi[0] + 12);
+                for (int r = 0; r < 2; r++)
+                {
+                    const float m[3] = { float(Field10(w, r ? 20 : 0)), float(Field10(w, 10)), float(Field10(w, r ? 0 : 20)) };
+                    const float ml = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+                    if (ml > 0) { const double d = (n[0] * m[0] + n[1] * m[1] + n[2] * m[2]) / (len * ml); agree[r] += fabs(d); facing[r] += d; }
+                }
+            }
+            reversed = agree[1] > agree[0];
+            clockwise = facing[reversed ? 1 : 0] < 0;
+            if (const char* t = getenv("COD3_WEBLEY_CLOCKWISE")) clockwise = atoi(t) != 0;
+        }
+        // the memory: one block for the copies (made once, used again for a
+        // new map's Colt), and the vertices and indices
+        static uint32_t block = 0, vbuf = 0, ibuf = 0;
+        const uint32_t vcount = uint32_t(g_webleyWorldVerts.size()), icount = uint32_t(g_webleyWorldIndices.size());
+        if (!block) block = Guest::AllocateExtended(0x10000);
+        if (!vbuf) vbuf = Guest::AllocateExtended(vcount * 24);
+        if (!ibuf) ibuf = Guest::AllocateExtended(icount * 2);
+        if (!block || !vbuf || !ibuf) { printf("webley world: no memory\n"); fflush(stdout); return 0; }
+        float olo[3] = { 1e9f, 1e9f, 1e9f }, ohi[3] = { -1e9f, -1e9f, -1e9f };
+        for (uint32_t i = 0; i < vcount; i++)
+        {
+            const WebleyVertex& v = g_webleyWorldVerts[i];
+            float p[3];
+            place(v.p, p);
+            const float n[3] = { sx * v.n[0], sy * v.n[2], sz * v.n[1] };
+            const uint32_t at = vbuf + 24 * i;
+            for (int c = 0; c < 3; c++) { WriteFloat(base, at + 4 * c, p[c]); olo[c] = std::min(olo[c], p[c]); ohi[c] = std::max(ohi[c], p[c]); }
+            Guest::Write32(base, at + 12, PackDirection(n, reversed));
+            WriteFloat(base, at + 16, v.uv[0]); WriteFloat(base, at + 20, v.uv[1]);
+        }
+        for (uint32_t i = 0; i < icount; i++) Guest::Write16(base, ibuf + 2 * i, g_webleyWorldIndices[clockwise && i % 3 ? (i % 3 == 1 ? i + 1 : i - 1) : i]);
+        // copies: a range of guest words, the pointers into it moved with it
+        auto copy = [&](uint32_t from, uint32_t to, uint32_t bytes)
+        {
+            for (uint32_t o = 0; o < bytes; o += 4)
+            {
+                uint32_t w = Guest::Read32(base, from + o);
+                if (w >= from && w < from + bytes) w = w - from + to;
+                Guest::Write32(base, to + o, w);
+            }
+        };
+        // 0.5.665: the model copied whole, with the arrays after it (its six
+        // count/pointer pairs: 0.5.661 copied only its header and mesh list,
+        // and its copy was never drawn: the draws reach the meshes another
+        // way), every word in it that is one of the Colt's meshes then made
+        // the copy's
+        uint32_t span = 0x40;
+        for (uint32_t w = 0; w < 12; w++)
+        {
+            const uint32_t to = Guest::Read32(base, model + 4 * w);
+            if (to > model && to < model + 0x1000) span = std::max(span, to - model + 0x40);
+        }
+        span = (span + 3) & ~3u;
+        const uint32_t handle = block, ownModel = block + 0x100, meshAt = block + 0x2000;
+        copy(colt, handle, 0xA0);
+        copy(model, ownModel, span);
+        const uint32_t ownMeshes = Guest::Read32(base, ownModel + 44);   // the copy's own list (moved with it), or the Colt's
+        Guest::Write32(base, handle + 32, ownModel);
+        Guest::Write32(base, handle + 88, ownModel);
+        const uint32_t name = GuestText(base, "w_brit_webley_WORLD");
+        Guest::Write32(base, handle + 72, name);
+        Guest::Write32(base, handle + 84, name);
+        if (ownMeshes < ownModel || ownMeshes >= ownModel + span) { printf("webley world: the Colt's mesh list %08X is not after its model\n", meshes); fflush(stdout); return 0; }
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i), own = meshAt + 0x400 * i;
+            if (!inGuest(mesh)) continue;
+            copy(mesh, own, 0x400);
+            int swapped = 0;
+            for (uint32_t o = 0; o < span; o += 4) if (Guest::Read32(base, ownModel + o) == mesh) { Guest::Write32(base, ownModel + o, own); swapped++; }
+            for (uint32_t o = 0; o < 0xA0; o += 4) if (Guest::Read32(base, handle + o) == mesh) { Guest::Write32(base, handle + o, own); swapped++; }
+            printf("webley world: the Colt's mesh %08X copied to %08X (%d references to it moved; the model's %u bytes copied)\n", mesh, own, swapped, span);
+            Guest::Write32(base, own + 20, 0);   // no detail levels
+            const uint32_t piece = own + 0x40;
+            if (mesh != body) { Guest::Write32(base, own + 28, 0); Guest::Write32(base, piece + 104, 0); continue; }   // the Colt's other parts
+            const uint32_t vdesc = Guest::Read32(base, piece + 80), idesc = Guest::Read32(base, piece + 96);
+            if (vdesc < own || vdesc >= own + 0x400 || idesc < own || idesc >= own + 0x400) { printf("webley world: the body's descriptions are not inside it\n"); fflush(stdout); return 0; }
+            Guest::Write32(base, own + 28, icount / 3);
+            Guest::Write32(base, piece + 88, vcount);
+            Guest::Write32(base, piece + 104, icount);
+            const uint32_t vword = Guest::Read32(base, vdesc + 28);
+            Guest::Write32(base, vdesc + 24, vbuf | (Guest::Read32(base, vdesc + 24) & 3u));
+            Guest::Write32(base, vdesc + 28, (vword & ~(0xFFFFFFu << 2)) | ((vcount * 6u & 0xFFFFFFu) << 2));
+            Guest::Write32(base, idesc + 24, ibuf);
+            Guest::Write32(base, idesc + 28, icount * 2);
+            // its bounds: the sphere (+32 and the piece's +16) and the box (the piece's +32, +48)
+            float centre[3], radius = 0;
+            for (int c = 0; c < 3; c++) { centre[c] = (olo[c] + ohi[c]) * 0.5f; radius += (ohi[c] - olo[c]) * (ohi[c] - olo[c]) * 0.25f; }
+            radius = sqrtf(radius);
+            for (const uint32_t at : { own + 32, piece + 16 }) { for (int c = 0; c < 3; c++) WriteFloat(base, at + 4 * c, centre[c]); WriteFloat(base, at + 12, radius); }
+            for (int c = 0; c < 3; c++) { WriteFloat(base, piece + 32 + 4 * c, olo[c]); WriteFloat(base, piece + 48 + 4 * c, ohi[c]); }
+        }
+        Render::SetMeshTexture(vbuf, (WebleyDir() + "webley_c.png").c_str(), getenv("COD3_WEBLEY_WORLD_SLOT") ? atoi(getenv("COD3_WEBLEY_WORLD_SLOT")) : -2);
+        WebleySlotTextures(vbuf);
+        // DIAGNOSTIC: COD3_WEBLEY_MARK_COLT=1: the Colt's own world model drawn
+        // white (its draws logged as the mesh-texture ones), to see which is drawn
+        if (getenv("COD3_WEBLEY_MARK_COLT")) Render::SetMeshTexture(buffer, (WebleyDir() + "white.png").c_str(), -2);
+        made[colt] = handle;
+        printf("webley world: made %08X for the Colt's %08X: body %08X, %u vertices at %08X, scale %.3f, signs %.0f %.0f %.0f, normals %s%s; the Colt's box %.2f %.2f %.2f .. %.2f %.2f %.2f, gathered at %.2f %.2f %.2f\n",
+               handle, colt, body, vcount, vbuf, scale, sx, sy, sz, reversed ? "z-low" : "x-low", clockwise ? ", triangles turned round (the Colt's clockwise)" : "", lo[0], lo[1], lo[2], hi[0], hi[1], hi[2], mean[0], mean[1], mean[2]);
+        fflush(stdout);
+        return handle;
+    }
+
+    // 0.5.683: THE FLAMETHROWER'S WORLD MODEL, what others see in its
+    // holder's hands (and dropped), made as the Webley's is (WebleyWorldModel):
+    // its name (w_usa_flamethrower_WORLD) looked up as the Thompson's
+    // (w_ussmg_world) and given a copy of it whose body (m1a1_0, its most
+    // triangles; 52-byte vertices, as a view's) draws World at War's
+    // weapon_usa_flamethrower (custom\flamethrower\weapon_flamethrower.mesh,
+    // texture flamethrower_world_c.png); the Thompson's other meshes (its
+    // farther detail levels) are not drawn, no detail levels. Both models
+    // have x along the barrel (the muzzle +x), y across and z up, and both
+    // origins are where the hand holds (tag_weapon): the M2's rear grip is
+    // 10 units behind it and its front grip 5 ahead, the Thompson's pistol
+    // grip 8 behind and its handguard 4 to 12 ahead (weapusge.cod block 13,
+    // xemesh.py). So it is drawn as World at War has it: not turned, not
+    // scaled, not moved. COD3_FLAME_NO_WORLD=1: the Thompson's.
+    bool BodyPacking(uint8_t* base, uint32_t body, bool& reversed, bool& clockwise);   // with the flamethrower's view, below
+    // 0.5.742: the same, for any weapon (WorldSwap: its mesh, texture and
+    // name): the flamethrower's (the Thompson's copied) and the signal flare's
+    // (the American smoke's, w_us_smoke_grenade_WORLD: 52-byte vertices too)
+    struct WorldSwap
+    {
+        const char* what;            // the log's lines start with it
+        const char* source;          // whose model is copied ("the Thompson's")
+        std::string (*dir)();
+        const char* mesh;            // the C2MS mesh in dir
+        const char* texture;         // its colour map in dir
+        int slot;                    // the draws' colour slot (Render::SetMeshTexture)
+        const char* name;            // the copy's own name
+        const char* slots;           // dir's file of other slots' textures ("2=a.png 3=b.png"), or null
+        std::map<uint32_t, uint32_t> made;   // the source's handle: ours
+        bool tried = false, loaded = false, ourClockwise = false;
+        std::vector<WebleyVertex> verts;
+        std::vector<uint16_t> indices;
+        uint32_t block = 0, vbuf = 0, ibuf = 0;
+    };
+
+    uint32_t SwapWorldModel(uint8_t* base, uint32_t tommy, WorldSwap& s)
+    {
+        if (const auto hit = s.made.find(tommy); hit != s.made.end()) return hit->second;
+        if (!s.tried)
+        {
+            s.tried = true;
+            s.loaded = LoadMeshFile(s.dir() + s.mesh, s.verts, s.indices);
+            double facing = 0;
+            for (size_t t = 0; s.loaded && t + 2 < s.indices.size(); t += 3)
+            {
+                const WebleyVertex& a = s.verts[s.indices[t]];
+                const WebleyVertex& b = s.verts[s.indices[t + 1]];
+                const WebleyVertex& c = s.verts[s.indices[t + 2]];
+                const float u[3] = { b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2] }, v[3] = { c.p[0] - a.p[0], c.p[1] - a.p[1], c.p[2] - a.p[2] };
+                const float n[3] = { u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0] };
+                facing += n[0] * a.n[0] + n[1] * a.n[1] + n[2] * a.n[2];
+            }
+            s.ourClockwise = facing < 0;
+            printf("%s: %s%s %s (%zu vertices, %zu triangles, %s to its normals)\n", s.what, s.dir().c_str(), s.mesh, s.loaded ? "read" : "NOT read",
+                   s.verts.size(), s.indices.size() / 3, s.ourClockwise ? "clockwise" : "counter-clockwise");
+            fflush(stdout);
+        }
+        const bool loaded = s.loaded, ourClockwise = s.ourClockwise;
+        auto inGuest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+        const uint32_t model = Guest::Read32(base, tommy + 32);
+        if (!loaded || !inGuest(tommy) || !inGuest(model) || Guest::Read32(base, tommy + 88) != model) { printf("%s: %s world model %08X is not as the Colt's was\n", s.what, s.source, tommy); fflush(stdout); return 0; }
+        const uint32_t count = Guest::Read32(base, model + 40), meshes = Guest::Read32(base, model + 44), names = Guest::Read32(base, model + 36);
+        if (count == 0 || count > 16 || !inGuest(meshes)) { printf("%s: %s world model has %u meshes at %08X\n", s.what, s.source, count, meshes); fflush(stdout); return 0; }
+        uint32_t body = 0, most = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i);
+            uint32_t b = 0, v = 0, stride = 0;
+            const bool ok = MeshBuffer(base, mesh, b, v, stride);
+            printf("%s: %s mesh %u %s at %08X: %u triangles, %s %u vertices of %u bytes\n", s.what, s.source, i,
+                   inGuest(names) ? ReadText(base, Guest::Read32(base, names + 4 * i), 64).c_str() : "?", mesh, ok ? Guest::Read32(base, mesh + 28) : 0, ok ? "buffer of" : "no buffer,", v, stride);
+            if (ok && stride == 52 && Guest::Read32(base, mesh + 28) > most) { most = Guest::Read32(base, mesh + 28); body = mesh; }
+        }
+        if (!body) { printf("%s: no body mesh of 52-byte vertices\n", s.what); fflush(stdout); return 0; }
+        bool reversed = false, clockwise = false;
+        if (!BodyPacking(base, body, reversed, clockwise)) { printf("%s: the body's vertices are not as expected\n", s.what); fflush(stdout); return 0; }
+        const bool flip = clockwise != ourClockwise;
+        uint32_t& block = s.block, & vbuf = s.vbuf, & ibuf = s.ibuf;
+        const uint32_t vcount = uint32_t(s.verts.size()), icount = uint32_t(s.indices.size());
+        if (!block) block = Guest::AllocateExtended(0x10000);
+        if (!vbuf) vbuf = Guest::AllocateExtended((vcount * 52 + 0xFFFFu) & ~0xFFFFu);
+        if (!ibuf) ibuf = Guest::AllocateExtended((icount * 2 + 0xFFFFu) & ~0xFFFFu);
+        if (!block || !vbuf || !ibuf) { printf("%s: no memory\n", s.what); fflush(stdout); return 0; }
+        float olo[3] = { 1e9f, 1e9f, 1e9f }, ohi[3] = { -1e9f, -1e9f, -1e9f };
+        for (uint32_t i = 0; i < vcount; i++)
+        {
+            const WebleyVertex& v = s.verts[i];
+            const uint32_t at = vbuf + 52 * i;
+            float t[3] = { v.n[1], -v.n[0], 0.0f };
+            float tl = sqrtf(t[0] * t[0] + t[1] * t[1]);
+            if (tl < 0.1f) { t[0] = 1.0f; t[1] = 0.0f; t[2] = 0.0f; tl = 1.0f; }
+            for (float& c : t) c /= tl;
+            const float b[3] = { v.n[1] * t[2] - v.n[2] * t[1], v.n[2] * t[0] - v.n[0] * t[2], v.n[0] * t[1] - v.n[1] * t[0] };
+            for (int c = 0; c < 3; c++) { WriteFloat(base, at + 4 * c, v.p[c]); olo[c] = std::min(olo[c], v.p[c]); ohi[c] = std::max(ohi[c], v.p[c]); }
+            Guest::Write32(base, at + 12, PackDirection(v.n, reversed));
+            for (uint32_t uv = 16; uv <= 32; uv += 8) { WriteFloat(base, at + uv, v.uv[0]); WriteFloat(base, at + uv + 4, v.uv[1]); }
+            Guest::Write32(base, at + 40, 0xFFFFFFFFu);
+            Guest::Write32(base, at + 44, PackDirection(t, reversed));
+            Guest::Write32(base, at + 48, PackDirection(b, reversed));
+        }
+        for (uint32_t i = 0; i < icount; i++) Guest::Write16(base, ibuf + 2 * i, s.indices[flip && i % 3 ? (i % 3 == 1 ? i + 1 : i - 1) : i]);
+        auto copy = [&](uint32_t from, uint32_t to, uint32_t bytes)
+        {
+            for (uint32_t o = 0; o < bytes; o += 4)
+            {
+                uint32_t w = Guest::Read32(base, from + o);
+                if (w >= from && w < from + bytes) w = w - from + to;
+                Guest::Write32(base, to + o, w);
+            }
+        };
+        uint32_t span = 0x40;
+        for (uint32_t w = 0; w < 12; w++)
+        {
+            const uint32_t to = Guest::Read32(base, model + 4 * w);
+            if (to > model && to < model + 0x1000) span = std::max(span, to - model + 0x40);
+        }
+        span = (span + 3) & ~3u;
+        const uint32_t handle = block, ownModel = block + 0x100, meshAt = block + 0x2000;
+        copy(tommy, handle, 0xA0);
+        copy(model, ownModel, span);
+        const uint32_t ownMeshes = Guest::Read32(base, ownModel + 44);
+        Guest::Write32(base, handle + 32, ownModel);
+        Guest::Write32(base, handle + 88, ownModel);
+        const uint32_t name = GuestText(base, s.name);
+        Guest::Write32(base, handle + 72, name);
+        Guest::Write32(base, handle + 84, name);
+        if (ownMeshes < ownModel || ownMeshes >= ownModel + span) { printf("%s: %s mesh list %08X is not after its model\n", s.what, s.source, meshes); fflush(stdout); return 0; }
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i), own = meshAt + 0x400 * i;
+            if (!inGuest(mesh)) continue;
+            copy(mesh, own, 0x400);
+            int swapped = 0;
+            for (uint32_t o = 0; o < span; o += 4) if (Guest::Read32(base, ownModel + o) == mesh) { Guest::Write32(base, ownModel + o, own); swapped++; }
+            for (uint32_t o = 0; o < 0xA0; o += 4) if (Guest::Read32(base, handle + o) == mesh) { Guest::Write32(base, handle + o, own); swapped++; }
+            printf("%s: %s mesh %08X copied to %08X (%d references to it moved; the model's %u bytes copied)\n", s.what, s.source, mesh, own, swapped, span);
+            Guest::Write32(base, own + 20, 0);   // no detail levels
+            const uint32_t piece = own + 0x40;
+            if (mesh != body) { Guest::Write32(base, own + 28, 0); Guest::Write32(base, piece + 104, 0); continue; }
+            const uint32_t vdesc = Guest::Read32(base, piece + 80), idesc = Guest::Read32(base, piece + 96);
+            if (vdesc < own || vdesc >= own + 0x400 || idesc < own || idesc >= own + 0x400) { printf("%s: the body's descriptions are not inside it\n", s.what); fflush(stdout); return 0; }
+            Guest::Write32(base, own + 28, icount / 3);
+            Guest::Write32(base, piece + 88, vcount);
+            Guest::Write32(base, piece + 104, icount);
+            const uint32_t vword = Guest::Read32(base, vdesc + 28);
+            Guest::Write32(base, vdesc + 24, vbuf | (Guest::Read32(base, vdesc + 24) & 3u));
+            Guest::Write32(base, vdesc + 28, (vword & ~(0xFFFFFFu << 2)) | ((vcount * 13u & 0xFFFFFFu) << 2));
+            Guest::Write32(base, idesc + 24, ibuf);
+            Guest::Write32(base, idesc + 28, icount * 2);
+            float centre[3], radius = 0;
+            for (int c = 0; c < 3; c++) { centre[c] = (olo[c] + ohi[c]) * 0.5f; radius += (ohi[c] - olo[c]) * (ohi[c] - olo[c]) * 0.25f; }
+            radius = sqrtf(radius);
+            for (const uint32_t at : { own + 32, piece + 16 }) { for (int c = 0; c < 3; c++) WriteFloat(base, at + 4 * c, centre[c]); WriteFloat(base, at + 12, radius); }
+            for (int c = 0; c < 3; c++) { WriteFloat(base, piece + 32 + 4 * c, olo[c]); WriteFloat(base, piece + 48 + 4 * c, ohi[c]); }
+        }
+        Render::SetMeshTexture(vbuf, (s.dir() + s.texture).c_str(), s.slot);
+        if (FILE* f = s.slots ? fopen((s.dir() + s.slots).c_str(), "rb") : nullptr)
+        {
+            char line[512] = {};
+            const bool got = fgets(line, sizeof line, f) != nullptr;
+            fclose(f);
+            std::istringstream words(got ? line : "");
+            for (std::string word; words >> word;)
+            {
+                const size_t eq = word.find('=');
+                if (eq != std::string::npos) Render::SetMeshSlotTexture(vbuf, atoi(word.substr(0, eq).c_str()), (s.dir() + word.substr(eq + 1)).c_str());
+            }
+        }
+        s.made[tommy] = handle;
+        printf("%s: made %08X for %s %08X: body %08X, %u vertices at %08X, normals %s%s; box %.2f %.2f %.2f .. %.2f %.2f %.2f\n",
+               s.what, handle, s.source, tommy, body, vcount, vbuf, reversed ? "z-low" : "x-low", flip ? ", triangles turned round" : "", olo[0], olo[1], olo[2], ohi[0], ohi[1], ohi[2]);
+        fflush(stdout);
+        return handle;
+    }
+
+    uint32_t FlameWorldModel(uint8_t* base, uint32_t tommy)
+    {
+        static WorldSwap s{ "flamethrower world", "the Thompson's", Flame::Dir, "weapon_flamethrower.mesh", "flamethrower_world_c.png", 4,   // (as the view's: slot 4)
+                            "w_usa_flamethrower_WORLD", "world_slots.txt" };
+        return SwapWorldModel(base, tommy, s);
+    }
+
+    // 0.5.742: THE SIGNAL FLARE'S WORLD MODEL: World at War's flare stick
+    // (weapon_mp_flare_stick, custom\flare\weapon_flare.mesh) in a copy of the
+    // American smoke's (w_us_smoke_grenade_WORLD: in the thrower's hand, thrown
+    // and lying). Both are z up from the model's origin (the can 7.7 tall from
+    // its base, the stick 3.4 below its origin to 10.6 above): drawn as World
+    // at War has it, not turned, scaled or moved. The can's draws have three
+    // textures, in slots 2 (256x256), 3 (64x64) and 1 (128x128): the stick's
+    // colour map in all three (custom\flare\world_slots.txt "1=... 3=..."; test
+    // flaremodel5: its red paper, label and wooden grip; with 1 and 3 a flat
+    // normal and grey it drew plain grey). COD3_FLARE_WORLD_SLOT=n: another
+    // main slot. COD3_FLARE_NO_WORLD=1: the smoke's.
+    uint32_t FlareWorldModel(uint8_t* base, uint32_t smoke)
+    {
+        static WorldSwap s{ "flare world", "the smoke's", Flare::Dir, "weapon_flare.mesh", "flare_world_c.png",
+                            getenv("COD3_FLARE_WORLD_SLOT") ? atoi(getenv("COD3_FLARE_WORLD_SLOT")) : 2, "w_signal_flare_WORLD", "world_slots.txt" };
+        return SwapWorldModel(base, smoke, s);
+    }
+
+    // 0.5.835: THE DUAL COLTS' WORLD MODEL (others see one Colt): a copy of the
+    // Colt's (w_us_pist_WORLD) whose body draws the Colt's own vertices twice,
+    // the second set moved COD3_DUAL_WORLD_Y (5) along y (to the holder's left:
+    // the world models have x along the barrel, y across, z up) and
+    // COD3_DUAL_WORLD_X (-1) along the barrel: a Colt in each hand of the
+    // pistol's two-handed hold. The vertices are copied as they are (same
+    // packing, same winding), so the Colt's own material draws both.
+    uint32_t DualColtWorldModel(uint8_t* base, uint32_t colt)
+    {
+        static std::map<uint32_t, uint32_t> made;
+        if (const auto hit = made.find(colt); hit != made.end()) return hit->second;
+        auto inGuest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+        const uint32_t model = inGuest(colt) ? Guest::Read32(base, colt + 32) : 0;
+        if (!inGuest(model) || Guest::Read32(base, colt + 88) != model) { printf("dual world: the Colt's world model %08X is not as expected\n", colt); fflush(stdout); return 0; }
+        const uint32_t count = Guest::Read32(base, model + 40), meshes = Guest::Read32(base, model + 44);
+        if (count == 0 || count > 16 || !inGuest(meshes)) { printf("dual world: the Colt's model has %u meshes\n", count); fflush(stdout); return 0; }
+        uint32_t body = 0, most = 0, sbuf = 0, svcount = 0, sstride = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i);
+            uint32_t b = 0, v = 0, stride = 0;
+            if (MeshBuffer(base, mesh, b, v, stride) && Guest::Read32(base, mesh + 28) > most) { most = Guest::Read32(base, mesh + 28); body = mesh; sbuf = b; svcount = v; sstride = stride; }
+        }
+        if (!body) { printf("dual world: no body mesh\n"); fflush(stdout); return 0; }
+        const uint32_t bpiece = body + 0x40, bidesc = Guest::Read32(base, bpiece + 96);
+        const uint32_t sicount = Guest::Read32(base, bpiece + 104);
+        const uint32_t sibuf = (bidesc >= body && bidesc < body + 0x400) ? Guest::Read32(base, bidesc + 24) : 0;
+        if (!sibuf || sicount == 0 || sicount > 60000 || svcount * 2 > 65535) { printf("dual world: the body's indices are not as expected (%08X, %u)\n", sibuf, sicount); fflush(stdout); return 0; }
+        // 0.5.836: the Colt's world body lies flat in x (barrel, -4.7..6.1) and y (grip to slide,
+        // -3.0..2.9), z its thickness (0..1): across the hand is z (dualworld1: 0.5.835's 5 along y
+        // stacked the guns). Which way is up: the front's (the slide's) mean y. The holder's left is
+        // up x forward: -z with y up, +z with y down.
+        float frontY = 0, maxX = -1e9f; uint32_t front = 0;
+        for (uint32_t i = 0; i < svcount; i++) maxX = std::max(maxX, ReadFloat(base, sbuf + sstride * i));
+        for (uint32_t i = 0; i < svcount; i++) if (ReadFloat(base, sbuf + sstride * i) > 0.6f * maxX) { frontY += ReadFloat(base, sbuf + sstride * i + 4); front++; }
+        const bool yUp = front == 0 || frontY >= 0;
+        const float across = getenv("COD3_DUAL_WORLD_Z") ? float(atof(getenv("COD3_DUAL_WORLD_Z"))) : 5.0f;
+        const float dz = yUp ? -across : across;
+        const float dy = getenv("COD3_DUAL_WORLD_Y") ? float(atof(getenv("COD3_DUAL_WORLD_Y"))) : 0.0f;
+        const float dx = getenv("COD3_DUAL_WORLD_X") ? float(atof(getenv("COD3_DUAL_WORLD_X"))) : -1.0f;
+        printf("dual world: the Colt's front (%u vertices past x %.1f) at mean y %.2f: y is %s, the left gun %.1f along z\n", front, 0.6f * maxX, front ? frontY / front : 0.0f, yUp ? "up" : "down", dz);
+        const uint32_t vcount = svcount * 2, icount = sicount * 2;
+        const uint32_t block = Guest::AllocateExtended(0x10000);
+        const uint32_t vbuf = Guest::AllocateExtended((vcount * sstride + 0xFFFFu) & ~0xFFFFu);
+        const uint32_t ibuf = Guest::AllocateExtended((icount * 2 + 0xFFFFu) & ~0xFFFFu);
+        if (!block || !vbuf || !ibuf) { printf("dual world: no memory\n"); fflush(stdout); return 0; }
+        float olo[3] = { 1e9f, 1e9f, 1e9f }, ohi[3] = { -1e9f, -1e9f, -1e9f };
+        for (uint32_t copyNo = 0; copyNo < 2; copyNo++)
+            for (uint32_t i = 0; i < svcount; i++)
+            {
+                const uint32_t from = sbuf + sstride * i, to = vbuf + sstride * (i + copyNo * svcount);
+                for (uint32_t o = 0; o < sstride; o += 4) Guest::Write32(base, to + o, Guest::Read32(base, from + o));
+                float p[3] = { ReadFloat(base, from), ReadFloat(base, from + 4), ReadFloat(base, from + 8) };
+                if (copyNo) { p[0] += dx; p[1] += dy; p[2] += dz; for (int c = 0; c < 3; c++) WriteFloat(base, to + 4 * c, p[c]); }
+                for (int c = 0; c < 3; c++) { olo[c] = std::min(olo[c], p[c]); ohi[c] = std::max(ohi[c], p[c]); }
+            }
+        for (uint32_t copyNo = 0; copyNo < 2; copyNo++)
+            for (uint32_t i = 0; i < sicount; i++)
+                Guest::Write16(base, ibuf + 2 * (i + copyNo * sicount), uint16_t(Guest::Read16(base, sibuf + 2 * i) + copyNo * svcount));
+        auto copy = [&](uint32_t from, uint32_t to, uint32_t bytes)
+        {
+            for (uint32_t o = 0; o < bytes; o += 4)
+            {
+                uint32_t w = Guest::Read32(base, from + o);
+                if (w >= from && w < from + bytes) w = w - from + to;
+                Guest::Write32(base, to + o, w);
+            }
+        };
+        uint32_t span = 0x40;
+        for (uint32_t w = 0; w < 12; w++)
+        {
+            const uint32_t to = Guest::Read32(base, model + 4 * w);
+            if (to > model && to < model + 0x1000) span = std::max(span, to - model + 0x40);
+        }
+        span = (span + 3) & ~3u;
+        const uint32_t handle = block, ownModel = block + 0x100, meshAt = block + 0x2000;
+        copy(colt, handle, 0xA0);
+        copy(model, ownModel, span);
+        const uint32_t ownMeshes = Guest::Read32(base, ownModel + 44);
+        if (ownMeshes < ownModel || ownMeshes >= ownModel + span) { printf("dual world: the mesh list is not after the model\n"); fflush(stdout); return 0; }
+        Guest::Write32(base, handle + 32, ownModel);
+        Guest::Write32(base, handle + 88, ownModel);
+        const uint32_t name = GuestText(base, "w_us_pist_dual_WORLD");
+        Guest::Write32(base, handle + 72, name);
+        Guest::Write32(base, handle + 84, name);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i), own = meshAt + 0x400 * i;
+            if (!inGuest(mesh)) continue;
+            copy(mesh, own, 0x400);
+            for (uint32_t o = 0; o < span; o += 4) if (Guest::Read32(base, ownModel + o) == mesh) Guest::Write32(base, ownModel + o, own);
+            for (uint32_t o = 0; o < 0xA0; o += 4) if (Guest::Read32(base, handle + o) == mesh) Guest::Write32(base, handle + o, own);
+            Guest::Write32(base, own + 20, 0);   // no detail levels
+            const uint32_t piece = own + 0x40;
+            if (mesh != body) { Guest::Write32(base, own + 28, 0); Guest::Write32(base, piece + 104, 0); continue; }
+            const uint32_t vdesc = Guest::Read32(base, piece + 80), idesc = Guest::Read32(base, piece + 96);
+            if (vdesc < own || vdesc >= own + 0x400 || idesc < own || idesc >= own + 0x400) { printf("dual world: the body's descriptions are not inside it\n"); fflush(stdout); return 0; }
+            Guest::Write32(base, own + 28, icount / 3);
+            Guest::Write32(base, piece + 88, vcount);
+            Guest::Write32(base, piece + 104, icount);
+            const uint32_t vword = Guest::Read32(base, vdesc + 28);
+            Guest::Write32(base, vdesc + 24, vbuf | (Guest::Read32(base, vdesc + 24) & 3u));
+            Guest::Write32(base, vdesc + 28, (vword & ~(0xFFFFFFu << 2)) | (((vcount * sstride / 4) & 0xFFFFFFu) << 2));
+            Guest::Write32(base, idesc + 24, ibuf);
+            Guest::Write32(base, idesc + 28, icount * 2);
+            float centre[3], radius = 0;
+            for (int c = 0; c < 3; c++) { centre[c] = (olo[c] + ohi[c]) * 0.5f; radius += (ohi[c] - olo[c]) * (ohi[c] - olo[c]) * 0.25f; }
+            radius = sqrtf(radius);
+            for (const uint32_t at : { own + 32, piece + 16 }) { for (int c = 0; c < 3; c++) WriteFloat(base, at + 4 * c, centre[c]); WriteFloat(base, at + 12, radius); }
+            for (int c = 0; c < 3; c++) { WriteFloat(base, piece + 32 + 4 * c, olo[c]); WriteFloat(base, piece + 48 + 4 * c, ohi[c]); }
+        }
+        made[colt] = handle;
+        printf("dual world: made %08X for the Colt's %08X: body %08X twice (%u vertices of %u bytes, %u indices), the second %.1f along z, %.1f along y, %.1f along x; box %.2f %.2f %.2f .. %.2f %.2f %.2f\n",
+               handle, colt, body, vcount, sstride, icount, dz, dy, dx, olo[0], olo[1], olo[2], ohi[0], ohi[1], ohi[2]);
+        fflush(stdout);
+        return handle;
+    }
+
+    // 0.5.726: the scoped Mosin's world model: a copy of the scoped Kar98's
+    // (w_ge_SNIP_WORLD) with CoD2's weapon_mosinnagantscoped_cloth in its body
+    // (FlameWorldModel's way, made from it), its texture the view's atlas
+    std::vector<WebleyVertex> g_mosinWorldVerts;
+    std::vector<uint16_t> g_mosinWorldIndices;
+    uint32_t MosinWorldModel(uint8_t* base, uint32_t tommy)
+    {
+        static std::map<uint32_t, uint32_t> made;   // the scoped Kar98's handle: ours
+        if (const auto hit = made.find(tommy); hit != made.end()) return hit->second;
+        static bool loaded = false, tried = false, ourClockwise = false;
+        if (!tried)
+        {
+            tried = true;
+            loaded = LoadMeshFile(MosinDir() + "weapon_mosin.mesh", g_mosinWorldVerts, g_mosinWorldIndices);
+            double facing = 0;
+            for (size_t t = 0; loaded && t + 2 < g_mosinWorldIndices.size(); t += 3)
+            {
+                const WebleyVertex& a = g_mosinWorldVerts[g_mosinWorldIndices[t]];
+                const WebleyVertex& b = g_mosinWorldVerts[g_mosinWorldIndices[t + 1]];
+                const WebleyVertex& c = g_mosinWorldVerts[g_mosinWorldIndices[t + 2]];
+                const float u[3] = { b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2] }, v[3] = { c.p[0] - a.p[0], c.p[1] - a.p[1], c.p[2] - a.p[2] };
+                const float n[3] = { u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0] };
+                facing += n[0] * a.n[0] + n[1] * a.n[1] + n[2] * a.n[2];
+            }
+            ourClockwise = facing < 0;
+            printf("mosin world: %sweapon_mosin.mesh %s (%zu vertices, %zu triangles, %s to its normals)\n", MosinDir().c_str(), loaded ? "read" : "NOT read",
+                   g_mosinWorldVerts.size(), g_mosinWorldIndices.size() / 3, ourClockwise ? "clockwise" : "counter-clockwise");
+            fflush(stdout);
+        }
+        auto inGuest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+        // CoD2's world model has its origin mid-rifle, the Kar98's at the hand:
+        // CoD2's moved 11.5 ahead (its trigger hand on the Kar98's); COD3_MOSIN_WORLD_SHIFT
+        static const float shift = [] { const char* t = getenv("COD3_MOSIN_WORLD_SHIFT"); return t ? float(atof(t)) : 11.5f; }();
+        const uint32_t model = Guest::Read32(base, tommy + 32);
+        if (!loaded || !inGuest(tommy) || !inGuest(model) || Guest::Read32(base, tommy + 88) != model) { printf("mosin world: the scoped Kar98's world model %08X is not as the Thompson's was\n", tommy); fflush(stdout); return 0; }
+        const uint32_t count = Guest::Read32(base, model + 40), meshes = Guest::Read32(base, model + 44), names = Guest::Read32(base, model + 36);
+        if (count == 0 || count > 16 || !inGuest(meshes)) { printf("mosin world: the scoped Kar98's world model has %u meshes at %08X\n", count, meshes); fflush(stdout); return 0; }
+        uint32_t body = 0, most = 0;
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i);
+            uint32_t b = 0, v = 0, s = 0;
+            const bool ok = MeshBuffer(base, mesh, b, v, s);
+            printf("mosin world: the scoped Kar98's mesh %u %s at %08X: %u triangles, %s %u vertices of %u bytes\n", i,
+                   inGuest(names) ? ReadText(base, Guest::Read32(base, names + 4 * i), 64).c_str() : "?", mesh, ok ? Guest::Read32(base, mesh + 28) : 0, ok ? "buffer of" : "no buffer,", v, s);
+            if (ok && s == 52 && Guest::Read32(base, mesh + 28) > most) { most = Guest::Read32(base, mesh + 28); body = mesh; }
+        }
+        if (!body) { printf("mosin world: no body mesh of 52-byte vertices\n"); fflush(stdout); return 0; }
+        bool reversed = false, clockwise = false;
+        if (!BodyPacking(base, body, reversed, clockwise)) { printf("mosin world: the body's vertices are not as expected\n"); fflush(stdout); return 0; }
+        const bool flip = clockwise != ourClockwise;
+        static uint32_t block = 0, vbuf = 0, ibuf = 0;
+        const uint32_t vcount = uint32_t(g_mosinWorldVerts.size()), icount = uint32_t(g_mosinWorldIndices.size());
+        if (!block) block = Guest::AllocateExtended(0x10000);
+        if (!vbuf) vbuf = Guest::AllocateExtended((vcount * 52 + 0xFFFFu) & ~0xFFFFu);
+        if (!ibuf) ibuf = Guest::AllocateExtended((icount * 2 + 0xFFFFu) & ~0xFFFFu);
+        if (!block || !vbuf || !ibuf) { printf("mosin world: no memory\n"); fflush(stdout); return 0; }
+        float olo[3] = { 1e9f, 1e9f, 1e9f }, ohi[3] = { -1e9f, -1e9f, -1e9f };
+        for (uint32_t i = 0; i < vcount; i++)
+        {
+            const WebleyVertex& v = g_mosinWorldVerts[i];
+            const uint32_t at = vbuf + 52 * i;
+            float t[3] = { v.n[1], -v.n[0], 0.0f };
+            float tl = sqrtf(t[0] * t[0] + t[1] * t[1]);
+            if (tl < 0.1f) { t[0] = 1.0f; t[1] = 0.0f; t[2] = 0.0f; tl = 1.0f; }
+            for (float& c : t) c /= tl;
+            const float b[3] = { v.n[1] * t[2] - v.n[2] * t[1], v.n[2] * t[0] - v.n[0] * t[2], v.n[0] * t[1] - v.n[1] * t[0] };
+            for (int c = 0; c < 3; c++) { const float pc = v.p[c] + (c == 0 ? shift : 0.0f); WriteFloat(base, at + 4 * c, pc); olo[c] = std::min(olo[c], pc); ohi[c] = std::max(ohi[c], pc); }
+            Guest::Write32(base, at + 12, PackDirection(v.n, reversed));
+            for (uint32_t uv = 16; uv <= 32; uv += 8) { WriteFloat(base, at + uv, v.uv[0]); WriteFloat(base, at + uv + 4, v.uv[1]); }
+            Guest::Write32(base, at + 40, 0xFFFFFFFFu);
+            Guest::Write32(base, at + 44, PackDirection(t, reversed));
+            Guest::Write32(base, at + 48, PackDirection(b, reversed));
+        }
+        for (uint32_t i = 0; i < icount; i++) Guest::Write16(base, ibuf + 2 * i, g_mosinWorldIndices[flip && i % 3 ? (i % 3 == 1 ? i + 1 : i - 1) : i]);
+        auto copy = [&](uint32_t from, uint32_t to, uint32_t bytes)
+        {
+            for (uint32_t o = 0; o < bytes; o += 4)
+            {
+                uint32_t w = Guest::Read32(base, from + o);
+                if (w >= from && w < from + bytes) w = w - from + to;
+                Guest::Write32(base, to + o, w);
+            }
+        };
+        uint32_t span = 0x40;
+        for (uint32_t w = 0; w < 12; w++)
+        {
+            const uint32_t to = Guest::Read32(base, model + 4 * w);
+            if (to > model && to < model + 0x1000) span = std::max(span, to - model + 0x40);
+        }
+        span = (span + 3) & ~3u;
+        const uint32_t handle = block, ownModel = block + 0x100, meshAt = block + 0x2000;
+        copy(tommy, handle, 0xA0);
+        copy(model, ownModel, span);
+        const uint32_t ownMeshes = Guest::Read32(base, ownModel + 44);
+        Guest::Write32(base, handle + 32, ownModel);
+        Guest::Write32(base, handle + 88, ownModel);
+        const uint32_t name = GuestText(base, "w_mosin_scoped_WORLD");
+        Guest::Write32(base, handle + 72, name);
+        Guest::Write32(base, handle + 84, name);
+        if (ownMeshes < ownModel || ownMeshes >= ownModel + span) { printf("mosin world: the scoped Kar98's mesh list %08X is not after its model\n", meshes); fflush(stdout); return 0; }
+        for (uint32_t i = 0; i < count; i++)
+        {
+            const uint32_t mesh = Guest::Read32(base, meshes + 4 * i), own = meshAt + 0x400 * i;
+            if (!inGuest(mesh)) continue;
+            copy(mesh, own, 0x400);
+            int swapped = 0;
+            for (uint32_t o = 0; o < span; o += 4) if (Guest::Read32(base, ownModel + o) == mesh) { Guest::Write32(base, ownModel + o, own); swapped++; }
+            for (uint32_t o = 0; o < 0xA0; o += 4) if (Guest::Read32(base, handle + o) == mesh) { Guest::Write32(base, handle + o, own); swapped++; }
+            printf("mosin world: the scoped Kar98's mesh %08X copied to %08X (%d references to it moved; the model's %u bytes copied)\n", mesh, own, swapped, span);
+            Guest::Write32(base, own + 20, 0);   // no detail levels
+            const uint32_t piece = own + 0x40;
+            if (mesh != body) { Guest::Write32(base, own + 28, 0); Guest::Write32(base, piece + 104, 0); continue; }
+            const uint32_t vdesc = Guest::Read32(base, piece + 80), idesc = Guest::Read32(base, piece + 96);
+            if (vdesc < own || vdesc >= own + 0x400 || idesc < own || idesc >= own + 0x400) { printf("mosin world: the body's descriptions are not inside it\n"); fflush(stdout); return 0; }
+            Guest::Write32(base, own + 28, icount / 3);
+            Guest::Write32(base, piece + 88, vcount);
+            Guest::Write32(base, piece + 104, icount);
+            const uint32_t vword = Guest::Read32(base, vdesc + 28);
+            Guest::Write32(base, vdesc + 24, vbuf | (Guest::Read32(base, vdesc + 24) & 3u));
+            Guest::Write32(base, vdesc + 28, (vword & ~(0xFFFFFFu << 2)) | ((vcount * 13u & 0xFFFFFFu) << 2));
+            Guest::Write32(base, idesc + 24, ibuf);
+            Guest::Write32(base, idesc + 28, icount * 2);
+            float centre[3], radius = 0;
+            for (int c = 0; c < 3; c++) { centre[c] = (olo[c] + ohi[c]) * 0.5f; radius += (ohi[c] - olo[c]) * (ohi[c] - olo[c]) * 0.25f; }
+            radius = sqrtf(radius);
+            for (const uint32_t at : { own + 32, piece + 16 }) { for (int c = 0; c < 3; c++) WriteFloat(base, at + 4 * c, centre[c]); WriteFloat(base, at + 12, radius); }
+            for (int c = 0; c < 3; c++) { WriteFloat(base, piece + 32 + 4 * c, olo[c]); WriteFloat(base, piece + 48 + 4 * c, ohi[c]); }
+        }
+        Render::SetMeshTexture(vbuf, (MosinDir() + "mosin_c.png").c_str(), 4);   // (as the view's: slot 4)
+        if (FILE* f = fopen((MosinDir() + "slots.txt").c_str(), "rb"))
+        {
+            char line[512] = {};
+            const bool got = fgets(line, sizeof line, f) != nullptr;
+            fclose(f);
+            std::istringstream words(got ? line : "");
+            for (std::string word; words >> word;)
+            {
+                const size_t eq = word.find('=');
+                if (eq != std::string::npos) Render::SetMeshSlotTexture(vbuf, atoi(word.substr(0, eq).c_str()), (MosinDir() + word.substr(eq + 1)).c_str());
+            }
+        }
+        made[tommy] = handle;
+        printf("mosin world: made %08X for the scoped Kar98's %08X: body %08X, %u vertices at %08X, normals %s%s; box %.2f %.2f %.2f .. %.2f %.2f %.2f\n",
+               handle, tommy, body, vcount, vbuf, reversed ? "z-low" : "x-low", flip ? ", triangles turned round" : "", olo[0], olo[1], olo[2], ohi[0], ohi[1], ohi[2]);
+        fflush(stdout);
+        return handle;
+    }
+}
+
+// 0.5.673: THE WEBLEY'S RELOAD ON THE ARMS. CoD2's viewmodel_webley_reload
+// (151 frames at 30 fps, 5 s, the Webley's reload time) put onto CoD3's
+// first-person arms by tools\cod2import\retarget.py: custom\webley\
+// webley_reload_arms.bin holds, for every frame, each arms bone's matrix
+// (its x, y, z axes and position) relative to the pelvis at rest, and which
+// bones it plays (the arms, hands, fingers, forearm twists and the gun's
+// tag_weapon: the rest stay the game's). The game's pose function
+// (sub_82186740) writes each bone's model-space matrix, 64 bytes; for the
+// arms (the skeleton named viewmodel_hands) while the Webley reloads, the
+// played bones get the table's frame under the pelvis the game has this
+// frame (view sway and bob kept), the frames between keys blended, and the
+// first and last 0.12 s blended with the game's own pose. Started by our own
+// player's Webley reload sound (sub_82554BA0), ended after the table's
+// length or when the Webley is put away. COD3_WEBLEY_RELOADTEST="8 20":
+// plays it that many seconds after the Webley is first held (for tests:
+// a reload cannot be scripted). COD3_WEBLEY_NO_RELOAD=1: the Colt's.
+namespace
+{
+    struct WebleyReloadTable
+    {
+        uint32_t frames = 0, bones = 0;
+        float fps = 30.0f;
+        std::vector<uint8_t> played;
+        std::vector<float> m;   // frames x bones x 12
+    };
+    WebleyReloadTable g_reloadTable;
+    bool g_reloadTableTried = false;
+    std::atomic<bool> g_webleyHeld{ false };
+    std::atomic<double> g_webleyReloadAt{ -1.0 };   // seconds (ReloadClock) it began; < 0: none
+
+    double ReloadClock()
+    {
+        static const auto start = std::chrono::steady_clock::now();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    }
+
+    const WebleyReloadTable* ReloadTable()
+    {
+        if (g_reloadTableTried) return g_reloadTable.frames ? &g_reloadTable : nullptr;
+        g_reloadTableTried = true;
+        const std::string file = WebleyDir() + "webley_reload_arms.bin";
+        FILE* f = fopen(file.c_str(), "rb");
+        if (!f) { printf("webley reload: %s not found: the Colt's reload is played\n", file.c_str()); fflush(stdout); return nullptr; }
+        char magic[4] = {};
+        uint32_t version = 0, frames = 0, bones = 0;
+        float fps = 0;
+        bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, "WRLD", 4) == 0 && fread(&version, 4, 1, f) == 1 && version == 1 &&
+                  fread(&frames, 4, 1, f) == 1 && fread(&bones, 4, 1, f) == 1 && fread(&fps, 4, 1, f) == 1 &&
+                  frames >= 2 && frames < 2000 && bones >= 1 && bones <= 128 && fps > 1.0f && fps < 200.0f;
+        WebleyReloadTable t;
+        if (ok)
+        {
+            t.frames = frames; t.bones = bones; t.fps = fps;
+            t.played.resize(bones);
+            for (uint32_t i = 0; ok && i < bones; i++) { uint8_t rec[32]; ok = fread(rec, 1, 32, f) == 32; t.played[i] = rec[0]; }
+            float pelvis[12];
+            ok = ok && fread(pelvis, 4, 12, f) == 12;
+            t.m.resize(size_t(frames) * bones * 12);
+            ok = ok && fread(t.m.data(), 4, t.m.size(), f) == t.m.size();
+        }
+        fclose(f);
+        if (!ok) { printf("webley reload: %s is not a table of retarget.py's\n", file.c_str()); fflush(stdout); return nullptr; }
+        g_reloadTable = std::move(t);
+        uint32_t played = 0;
+        for (uint8_t p : g_reloadTable.played) played += p;
+        printf("webley reload: %s: %u frames at %.0f fps (%.2f s), %u bones, %u played\n", file.c_str(), frames, fps, frames / fps, bones, played);
+        fflush(stdout);
+        return &g_reloadTable;
+    }
+
+    // the x and y rows made a rotation again, z from them (right-handed)
+    void Orthonormal(float* r)
+    {
+        float* x = r; float* y = r + 3; float* z = r + 6;
+        float n = sqrtf(x[0] * x[0] + x[1] * x[1] + x[2] * x[2]);
+        if (n < 1e-6f) return;
+        for (int k = 0; k < 3; k++) x[k] /= n;
+        const float d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+        for (int k = 0; k < 3; k++) y[k] -= d * x[k];
+        n = sqrtf(y[0] * y[0] + y[1] * y[1] + y[2] * y[2]);
+        if (n < 1e-6f) return;
+        for (int k = 0; k < 3; k++) y[k] /= n;
+        z[0] = x[1] * y[2] - x[2] * y[1]; z[1] = x[2] * y[0] - x[0] * y[2]; z[2] = x[0] * y[1] - x[1] * y[0];
+    }
+
+    // The arms' pose (pose: 64 bytes a bone, rows x, y, z, position) with the
+    // table played on it, at time t (seconds into the reload)
+    void PlayWebleyReload(uint8_t* base, uint32_t pose, uint32_t bones, double t)
+    {
+        const WebleyReloadTable* table = ReloadTable();
+        if (!table || bones != table->bones) return;
+        const double length = (table->frames - 1) / double(table->fps);
+        const double at = std::clamp(t, 0.0, length) * table->fps;
+        const uint32_t f0 = std::min<uint32_t>(uint32_t(at), table->frames - 1), f1 = std::min<uint32_t>(f0 + 1, table->frames - 1);
+        const float u = float(at - f0);
+        constexpr double Blend = 0.12;
+        const float weight = float(std::clamp(std::min(t, length - t) / Blend, 0.0, 1.0));
+        // the pelvis this frame (bone 0)
+        float pel[12];
+        for (int k = 0; k < 3; k++) for (int c = 0; c < 3; c++) pel[3 * k + c] = ReadFloat(base, pose + 16 * k + 4 * c);
+        for (int c = 0; c < 3; c++) pel[9 + c] = ReadFloat(base, pose + 48 + 4 * c);
+        auto under = [&](const float* v, float* out, bool point)   // pelvis-relative -> model space
+        {
+            for (int c = 0; c < 3; c++) out[c] = v[0] * pel[c] + v[1] * pel[3 + c] + v[2] * pel[6 + c] + (point ? pel[9 + c] : 0.0f);
+        };
+        for (uint32_t b = 0; b < bones; b++)
+        {
+            if (!table->played[b]) continue;
+            const float* a = &table->m[(size_t(f0) * table->bones + b) * 12];
+            const float* z = &table->m[(size_t(f1) * table->bones + b) * 12];
+            float rel[12], ours[12], game[12];
+            for (int k = 0; k < 12; k++) rel[k] = a[k] + (z[k] - a[k]) * u;
+            for (int r = 0; r < 4; r++) under(rel + 3 * r, ours + 3 * r, r == 3);
+            Orthonormal(ours);
+            if (weight < 1.0f)
+            {
+                for (int r = 0; r < 4; r++) for (int c = 0; c < 3; c++) game[3 * r + c] = ReadFloat(base, pose + 64 * b + 16 * r + 4 * c);
+                for (int k = 0; k < 12; k++) ours[k] = game[k] + (ours[k] - game[k]) * weight;
+                Orthonormal(ours);
+            }
+            for (int r = 0; r < 4; r++) for (int c = 0; c < 3; c++) WriteFloat(base, pose + 64 * b + 16 * r + 4 * c, ours[3 * r + c]);
+        }
+    }
+}
+
+// 0.5.709: WORLD AT WAR'S FLAMETHROWER ANIMATIONS ON THE ARMS (the user: "we
+// need it exactly like the waw model and animation and the exact positioning
+// of the flame"). custom\flamethrower\flame_arms.bin (tools\waw\
+// make_flame_arms.py, from the user's own World at War: its arms, the M2's
+// bones, its idle, fire, pullout and putaway) holds, for every frame, each
+// arms bone's matrix in the camera's space as World at War's view has it
+// (scaled to the M2's fit, 0.532), which bones it plays (the arms, hands,
+// fingers, twists, tag_weapon and gizmo_weapon: the M2 on World at War's
+// j_gun), the nozzle (tag_flash) and the Thompson gun's bones at rest. While
+// the M2 is held our arms' pose (the skeleton named viewmodel_hands) gets the
+// frame under the game's own tag_camera this frame, squeezed along the view
+// by tan(32.5) / tan(fov / 2): CoD3 draws the arms with its world fov, World
+// at War with 65, and so they are seen as World at War shows them. Raise
+// (pullout, fitted to CoD3's 0.6 s) when it comes out, idle, fire while it
+// burns (0.08 s blends). The Thompson gun's bones are held at rest (its
+// animations moved the M2's body). The nozzle goes to the flame
+// (Flame::Nozzle). COD3_FLAME_NO_ARMS=1: the Thompson's moves, as before.
+namespace
+{
+    struct FlameArmsAnim { std::string name; uint32_t frames = 0; float fps = 30.0f; bool loop = false; std::vector<float> m; };
+    struct FlameArms
+    {
+        uint32_t bones = 0, gunBones = 0;
+        int32_t camera = -1;
+        std::vector<uint8_t> played;
+        std::vector<float> gun;            // gunBones x 12
+        float pelvis[12] = { 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };   // (version 2) the arms' pelvis at rest
+        bool hasPelvis = false;
+        std::vector<FlameArmsAnim> anims;  // each frames x (bones x 12 + 3)
+    };
+    FlameArms g_flameArms;
+    bool g_flameArmsTried = false;
+    std::atomic<bool> g_flameArmsHeld{ false };
+    std::atomic<double> g_flameRaisedAt{ -10.0 };
+    constexpr double FlameRaiseTime = 0.6;   // CoD3's raise for it (the log: raise time 600 ms)
+
+    const FlameArms* FlameArmsTable()
+    {
+        if (g_flameArmsTried) return g_flameArms.bones ? &g_flameArms : nullptr;
+        g_flameArmsTried = true;
+        if (getenv("COD3_FLAME_NO_ARMS")) return nullptr;
+        const std::string file = Flame::Dir() + "flame_arms.bin";
+        FILE* f = fopen(file.c_str(), "rb");
+        if (!f) { printf("flamethrower arms: %s not found: the Thompson's moves\n", file.c_str()); fflush(stdout); return nullptr; }
+        char magic[4] = {};
+        uint32_t head[4] = {};
+        FlameArms t;
+        bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, "FLAM", 4) == 0 && fread(head, 4, 4, f) == 4 && (head[0] == 1 || head[0] == 2) && head[1] && head[1] <= 128 && head[2] <= 16 && head[3] <= 64;
+        if (ok)
+        {
+            t.bones = head[1]; t.gunBones = head[3];
+            for (uint32_t b = 0; ok && b < t.bones; b++)
+            {
+                uint8_t rec[32] = {};
+                ok = fread(rec, 1, 32, f) == 32;
+                t.played.push_back(rec[0]);
+                if (strncmp(reinterpret_cast<const char*>(rec + 1), "tag_camera", 31) == 0) t.camera = int32_t(b);
+            }
+            t.gun.resize(size_t(t.gunBones) * 12);
+            ok = ok && fread(t.gun.data(), 4, t.gun.size(), f) == t.gun.size();
+            if (ok && head[0] >= 2) t.hasPelvis = ok = fread(t.pelvis, 4, 12, f) == 12;
+            for (uint32_t a = 0; ok && a < head[2]; a++)
+            {
+                char name[32] = {};
+                uint32_t frames = 0, loop = 0;
+                float fps = 0;
+                ok = fread(name, 1, 32, f) == 32 && fread(&frames, 4, 1, f) == 1 && fread(&fps, 4, 1, f) == 1 && fread(&loop, 4, 1, f) == 1 && frames && frames < 1000 && fps > 0;
+                FlameArmsAnim anim;
+                anim.name.assign(name, strnlen(name, 32)); anim.frames = frames; anim.fps = fps; anim.loop = loop != 0;
+                anim.m.resize(size_t(frames) * (t.bones * 12 + 3));
+                ok = ok && fread(anim.m.data(), 4, anim.m.size(), f) == anim.m.size();
+                t.anims.push_back(std::move(anim));
+            }
+        }
+        fclose(f);
+        if (!ok || t.camera < 0) { printf("flamethrower arms: %s is not as expected: the Thompson's moves\n", file.c_str()); fflush(stdout); return nullptr; }
+        g_flameArms = std::move(t);
+        printf("flamethrower arms: %u bones, %zu animations (", g_flameArms.bones, g_flameArms.anims.size());
+        for (const FlameArmsAnim& a : g_flameArms.anims) printf(" %s %u", a.name.c_str(), a.frames);
+        printf(" ), the gun's %u bones held\n", g_flameArms.gunBones);
+        fflush(stdout);
+        return &g_flameArms;
+    }
+
+    // the field of view the arms are drawn with (4:3 degrees): 80, measured from
+    // the M2's nozzle in 0.5.704's screenshot against the pose dump (about 94-96
+    // across 16:9); COD3_FLAME_VMFOV to try another
+    float FlameViewmodelFov()
+    {
+        // 0.5.717: the M2's own draw has it (its projection's x scale 0.75 on
+        // 16:9: 90 degrees for 4:3, the camera's +96): the camera's, not 80
+        static const float fov = [] { const char* t = getenv("COD3_FLAME_VMFOV"); const float v = t ? float(atof(t)) : 0.0f; return v > 20.0f && v < 130.0f ? v : 0.0f; }();
+        return fov > 0.0f ? fov : Flame::Fov();
+    }
+
+    const FlameArmsAnim* FlameAnim(const FlameArms& t, const char* name)
+    {
+        for (const FlameArmsAnim& a : t.anims) if (a.name == name) return &a;
+        return nullptr;
+    }
+
+    // one animation at t seconds (looped or held at its end), into out (bones x 12 + 3)
+    void FlameSample(const FlameArms& t, const FlameArmsAnim& a, double seconds, std::vector<float>& out)
+    {
+        const size_t stride = size_t(t.bones) * 12 + 3;
+        out.resize(stride);
+        double at = std::max(0.0, seconds) * a.fps;
+        if (a.loop && a.frames > 1) at = fmod(at, double(a.frames));
+        else at = std::min(at, double(a.frames - 1));
+        const uint32_t f0 = std::min<uint32_t>(uint32_t(at), a.frames - 1);
+        const uint32_t f1 = a.loop ? (f0 + 1) % a.frames : std::min<uint32_t>(f0 + 1, a.frames - 1);
+        const float u = float(at - f0);
+        const float* x = &a.m[f0 * stride];
+        const float* y = &a.m[f1 * stride];
+        for (size_t k = 0; k < stride; k++) out[k] = x[k] + (y[k] - x[k]) * u;
+    }
+
+    // 0.5.712: DIAGNOSTIC (the user, 711: the flame "should stick to the end of
+    // the barrel when moving side ways ... it still goes off screen a bit").
+    // CoD3 has Call of Duty 4's gun placement (cg_gun_rot_*, cg_gun_move_*,
+    // cg_bobWeapon*): the arms model is put in the view each frame by a matrix
+    // of its own (sway, lag, bob), not only by its pelvis. To find it: while
+    // the M2 is held, every 3 s (20 times), each rotation matrix (3 unit,
+    // square rows, 12 floats) in the local client's cgame block (0x82C7D490,
+    // 6368 bytes) and its view-weapon block (0x82C7A270, 0xC88) whose place is
+    // within 40 of the view's origin (+4960), logged with its place against
+    // the view (in the view's axes) and its forward against the view's.
+    void FlameFindGunPlacement(uint8_t* base)
+    {
+        static uint64_t lastAt = 0;
+        static int told = 0;
+        const uint64_t now = GetTickCount64();
+        if (told >= 20 || now - lastAt < 3000) return;
+        lastAt = now;
+        const uint32_t lc = Guest::Read32(base, 0x82BCBE9Cu);
+        if (lc > 3) return;
+        told++;
+        const uint32_t cg = 0x82C7D490u + 6368u * lc, wv = 0x82C7A270u + 0xC88u * lc;
+        float eye[3], ax[9];
+        for (int k = 0; k < 3; k++) eye[k] = ReadFloat(base, cg + 4960 + 4 * k);
+        for (int k = 0; k < 9; k++) ax[k] = ReadFloat(base, cg + 4976 + 4 * k);
+        std::string line;
+        char t[200];
+        // 0.5.713: both layouts (3 x 4 floats in a row; 4 rows of 16 bytes,
+        // the place at +48) over the whole cgame area 0x82C70000..0x82C90000
+        // (712 found none in the two blocks)
+        auto scan = [&](uint32_t from, uint32_t size, const char* label)
+        {
+            for (uint32_t o = 0; o + 64 <= size; o += 4)
+            for (int layout = 0; layout < 2; layout++)
+            {
+                float m[12];
+                for (int k = 0; k < 12; k++) m[k] = ReadFloat(base, from + o + 4 * (layout ? (k / 3) * 4 + k % 3 : k));
+                bool ok = true;
+                for (int k = 0; k < 12 && ok; k++) ok = std::isfinite(m[k]);
+                for (int r = 0; r < 3 && ok; r++) ok = fabsf(m[3 * r] * m[3 * r] + m[3 * r + 1] * m[3 * r + 1] + m[3 * r + 2] * m[3 * r + 2] - 1.0f) < 0.02f;
+                for (int r = 0; r < 3 && ok; r++) { const int s = (r + 1) % 3; ok = fabsf(m[3 * r] * m[3 * s] + m[3 * r + 1] * m[3 * s + 1] + m[3 * r + 2] * m[3 * s + 2]) < 0.02f; }
+                if (!ok) continue;
+                const float d[3] = { m[9] - eye[0], m[10] - eye[1], m[11] - eye[2] };
+                if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 80.0f * 80.0f) continue;
+                const float f = d[0] * ax[0] + d[1] * ax[1] + d[2] * ax[2], l = d[0] * ax[3] + d[1] * ax[4] + d[2] * ax[5], u = d[0] * ax[6] + d[1] * ax[7] + d[2] * ax[8];
+                const float fwd = m[0] * ax[0] + m[1] * ax[1] + m[2] * ax[2], side = m[0] * ax[3] + m[1] * ax[4] + m[2] * ax[5], up = m[0] * ax[6] + m[1] * ax[7] + m[2] * ax[8];
+                if (line.size() > 3000) continue;
+                snprintf(t, sizeof t, " | %s%s %08X at %.2f %.2f %.2f x %.3f %.3f %.3f", label, layout ? "/4x4" : "", from + o, f, l, u, fwd, side, up);
+                line += t;
+            }
+        };
+        (void)wv;
+        scan(0x82C70000u, 0x20000u, "cgame");
+        printf("flamethrower placement: eye %.1f %.1f %.1f%s\n", eye[0], eye[1], eye[2], line.empty() ? " | none" : line.c_str());
+        fflush(stdout);
+    }
+
+    void PlayFlameArms(uint8_t* base, uint32_t pose, uint32_t bones)
+    {
+        const FlameArms* table = FlameArmsTable();
+        if (!table || bones != table->bones) return;
+        const FlameArmsAnim* idle = FlameAnim(*table, "idle");
+        const FlameArmsAnim* fire = FlameAnim(*table, "fire");
+        const FlameArmsAnim* raise = FlameAnim(*table, "raise");
+        if (!idle) return;
+        const double now = ReloadClock();
+        static std::vector<float> a, b;
+        static double fireFrom = -10.0, idleFrom = -10.0;
+        static bool wasFiring = false;
+        const bool firing = Flame::Firing();
+        if (firing != wasFiring) { (firing ? fireFrom : idleFrom) = now; wasFiring = firing; }
+        const double sinceRaise = now - g_flameRaisedAt.load();
+        if (raise && sinceRaise >= 0.0 && sinceRaise < FlameRaiseTime)
+            FlameSample(*table, *raise, sinceRaise / FlameRaiseTime * ((raise->frames - 1) / double(raise->fps)), a);   // World at War's pullout in CoD3's raise time
+        else
+        {
+            FlameSample(*table, *idle, now, a);
+            // fire while it burns, blended in and out over 0.08 s
+            const float w = firing ? float(std::clamp((now - fireFrom) / 0.08, 0.0, 1.0)) : 1.0f - float(std::clamp((now - idleFrom) / 0.08, 0.0, 1.0));
+            if (fire && w > 0.0f)
+            {
+                FlameSample(*table, *fire, firing ? now - fireFrom : 1.0, b);
+                for (size_t k = 0; k < a.size(); k++) a[k] += (b[k] - a[k]) * w;
+            }
+        }
+        // the arms' model space is the view's (0.5.710: not under the game's
+        // tag_camera: in play it sits about 9 below the eye, 709's arms and
+        // nozzle were that much low; the pose dump's was the identity).
+        // 0.5.711: under the game's pelvis's move from its rest this frame: the
+        // game sways and bobs the arms by their pelvis (the user, 710: "when
+        // sway left to right the flame doesnt stick to the model of the tube")
+        float pnow[12];
+        for (int r = 0; r < 4; r++) for (int k = 0; k < 3; k++) pnow[3 * r + k] = ReadFloat(base, pose + 16 * r + 4 * k);   // bone 0, bip01 pelvis
+        const float* prest = table->pelvis;
+        const bool sway = table->hasPelvis && std::isfinite(pnow[0]) && std::isfinite(pnow[9]);
+        static bool toldCamera = false;
+        if (!toldCamera)
+        {
+            toldCamera = true;
+            const uint32_t cam = pose + 64 * uint32_t(table->camera);
+            printf("flamethrower arms: the game's tag_camera at %.2f %.2f %.2f (not used)\n", ReadFloat(base, cam + 48), ReadFloat(base, cam + 52), ReadFloat(base, cam + 56));
+            fflush(stdout);
+        }
+        // the arms are drawn with 80 degrees (4:3; measured, 0.5.709's notes),
+        // not the camera's +96 (90 in play): 709 squeezed by 0.637
+        const float fov = FlameViewmodelFov();
+        const float squeeze = tanf(32.5f * 3.14159265f / 180.0f) / tanf(std::clamp(fov, 20.0f, 130.0f) * 0.5f * 3.14159265f / 180.0f);
+        auto place = [&](const float* v, float* out, bool point)   // camera space (squeezed), moved as the pelvis is
+        {
+            float q[3] = { v[0] * squeeze, v[1], v[2] };
+            if (!sway) { for (int k = 0; k < 3; k++) out[k] = q[k]; return; }
+            if (point) for (int k = 0; k < 3; k++) q[k] -= prest[9 + k];
+            float l[3];
+            for (int a = 0; a < 3; a++) l[a] = q[0] * prest[3 * a] + q[1] * prest[3 * a + 1] + q[2] * prest[3 * a + 2];   // in the rest pelvis's frame
+            for (int k = 0; k < 3; k++) out[k] = l[0] * pnow[k] + l[1] * pnow[3 + k] + l[2] * pnow[6 + k] + (point ? pnow[9 + k] : 0.0f);
+        };
+        for (uint32_t bone = 0; bone < bones; bone++)
+        {
+            if (!table->played[bone]) continue;
+            float m[12], out[12];
+            for (int k = 0; k < 12; k++) m[k] = a[size_t(bone) * 12 + k];
+            Orthonormal(m);   // (the blend's; before the squeeze, which it would undo)
+            for (int r = 0; r < 4; r++) place(m + 3 * r, out + 3 * r, r == 3);
+            for (int r = 0; r < 4; r++) for (int k = 0; k < 3; k++) WriteFloat(base, pose + 64 * bone + 16 * r + 4 * k, out[3 * r + k]);
+        }
+        float nozzle[3];
+        place(&a[size_t(bones) * 12], nozzle, true);
+        Flame::Nozzle(nozzle, fov);
+        FlameFindGunPlacement(base);   // 0.5.712: DIAGNOSTIC
+        static int told = 0;
+        if (told < 3) { told++; printf("flamethrower arms: played (fov %.1f, squeeze %.3f), the nozzle at %.2f %.2f %.2f\n", fov, squeeze, nozzle[0], nozzle[1], nozzle[2]); fflush(stdout); }
+    }
+
+    // the Thompson gun's bones held at their rest (the M2's body is drawn in its)
+    void HoldFlameGun(uint8_t* base, uint32_t pose, uint32_t bones)
+    {
+        const FlameArms* table = FlameArmsTable();
+        if (!table || bones != table->gunBones) return;
+        for (uint32_t bone = 0; bone < bones; bone++)
+            for (int r = 0; r < 4; r++) for (int k = 0; k < 3; k++) WriteFloat(base, pose + 64 * bone + 16 * r + 4 * k, table->gun[size_t(bone) * 12 + 3 * r + k]);
+    }
+}
+
+// 0.5.674: THE WEBLEY'S OWN PARTS IN THE RELOAD. custom\webley\
+// webley_reload_gun.bin (retarget.py) holds, for every frame of CoD2's reload,
+// each of the gun model's bones' move from the idle pose the mesh was made
+// in (in j_gun's space) and whether its part is shown (CoD2 parks the
+// speed-loader and the spent rounds far off the gun). While the reload plays
+// the Webley's vertices are written again at each new frame (PoseWebley) and
+// the renderer told to take them again (Render::MemoryFreed); after, once
+// more at rest.
+namespace
+{
+    struct WebleyGunTable
+    {
+        uint32_t frames = 0, bones = 0;
+        float fps = 30.0f;
+        std::vector<int> meshBone;      // each table bone's index among the mesh's bones (-1: none)
+        std::vector<float> moves;       // frames x bones x 12
+        std::vector<uint8_t> shown;     // frames x bones
+        // 0.5.676 (version 2): the cylinder, in the mesh's space: its centre
+        // and forward axis (a shot turns it +60 degrees about it), the six
+        // rounds' mesh bones in firing order (the top one first), the frame
+        // the cases are thrown out and the frame the new rounds are in
+        float centre[3] = {}, axis[3] = { 1.0f, 0.0f, 0.0f };
+        int rounds[6] = { -1, -1, -1, -1, -1, -1 };
+        int chamber = -1;               // the cylinder's own mesh bone (j_chamber)
+        uint32_t eject = 0, insert = 0;
+    };
+    WebleyGunTable g_gunTable;
+    bool g_gunTableTried = false;
+
+    const WebleyGunTable* GunTable()
+    {
+        if (g_gunTableTried) return g_gunTable.frames ? &g_gunTable : nullptr;
+        if (g_webleyBoneNames.empty()) return nullptr;   // the mesh first (its bones' names)
+        g_gunTableTried = true;
+        const std::string file = WebleyDir() + "webley_reload_gun.bin";
+        FILE* f = fopen(file.c_str(), "rb");
+        if (!f) { printf("webley reload: %s not found: the Webley's parts stay still\n", file.c_str()); fflush(stdout); return nullptr; }
+        char magic[4] = {};
+        uint32_t version = 0, frames = 0, bones = 0;
+        float fps = 0;
+        bool ok = fread(magic, 1, 4, f) == 4 && memcmp(magic, "WGUN", 4) == 0 && fread(&version, 4, 1, f) == 1 && (version == 1 || version == 2) &&
+                  fread(&frames, 4, 1, f) == 1 && fread(&bones, 4, 1, f) == 1 && fread(&fps, 4, 1, f) == 1 &&
+                  frames >= 2 && frames < 2000 && bones >= 1 && bones <= 64 && fps > 1.0f && fps < 200.0f;
+        WebleyGunTable t;
+        if (ok)
+        {
+            t.frames = frames; t.bones = bones; t.fps = fps;
+            for (uint32_t i = 0; ok && i < bones; i++)
+            {
+                char name[33] = {};
+                ok = fread(name, 1, 32, f) == 32;
+                int at = -1;
+                for (size_t k = 0; k < g_webleyBoneNames.size(); k++) if (g_webleyBoneNames[k] == name) at = int(k);
+                t.meshBone.push_back(at);
+                if (strcmp(name, "j_chamber") == 0) t.chamber = at;
+            }
+            if (ok && version >= 2)
+            {
+                float cyl[6];
+                uint32_t order[6], frames2[2];
+                ok = fread(cyl, 4, 6, f) == 6 && fread(order, 4, 6, f) == 6 && fread(frames2, 4, 2, f) == 2;
+                for (int k = 0; ok && k < 3; k++) { t.centre[k] = cyl[k]; t.axis[k] = cyl[3 + k]; }
+                for (int k = 0; ok && k < 6; k++) t.rounds[k] = order[k] < bones ? t.meshBone[order[k]] : -1;
+                t.eject = frames2[0]; t.insert = frames2[1];
+            }
+            t.moves.resize(size_t(frames) * bones * 12);
+            t.shown.resize(size_t(frames) * bones);
+            for (size_t r = 0; ok && r < size_t(frames) * bones; r++)
+            {
+                uint8_t flag[4];
+                ok = fread(&t.moves[r * 12], 4, 12, f) == 12 && fread(flag, 1, 4, f) == 4;
+                t.shown[r] = flag[0];
+            }
+        }
+        fclose(f);
+        if (!ok) { printf("webley reload: %s is not a table of retarget.py's\n", file.c_str()); fflush(stdout); return nullptr; }
+        g_gunTable = std::move(t);
+        int found = 0;
+        for (int b : g_gunTable.meshBone) found += b >= 0;
+        printf("webley reload: %s: %u frames, %u gun bones (%d of them the mesh's); the cylinder's rounds %d %d %d %d %d %d, cases out at frame %u, new rounds in at %u\n",
+               file.c_str(), frames, bones, found, g_gunTable.rounds[0], g_gunTable.rounds[1], g_gunTable.rounds[2], g_gunTable.rounds[3], g_gunTable.rounds[4],
+               g_gunTable.rounds[5], g_gunTable.eject, g_gunTable.insert);
+        fflush(stdout);
+        return &g_gunTable;
+    }
+
+    // The Webley's parts: at this point of the reload (frame < 0: none), the
+    // cylinder turned by turn degrees about its axis (0.5.676: a sixth of a
+    // turn a shot), and the rounds shown (bit k: the k-th round in firing
+    // order is in its chamber; 0.5.676: as many as the gun has left). Written
+    // again only when one of them changes.
+    void PoseWebleyParts(uint8_t* base, int frame, float turn, uint32_t rounds)
+    {
+        static int last = -2;
+        static float lastTurn = -1.0f;
+        static uint32_t lastRounds = 0xFFFFFFFFu, lastBuffer = 0;
+        if (!g_webleyBuffers.vertices) return;
+        if (frame == last && fabsf(turn - lastTurn) < 0.05f && rounds == lastRounds && g_webleyBuffers.vertices == lastBuffer) return;
+        const WebleyGunTable* table = GunTable();
+        if (frame >= 0 && !table) return;
+        const uint32_t bones = uint32_t(g_webleyBoneNames.size());
+        std::vector<float> moves(size_t(bones) * 12, 0.0f);
+        std::vector<uint8_t> shown(bones, 1);
+        for (uint32_t b = 0; b < bones; b++) { moves[b * 12 + 0] = moves[b * 12 + 4] = moves[b * 12 + 8] = 1.0f; shown[b] = !WebleyPartAway(b); }
+        if (frame >= 0)
+        {
+            const uint32_t f = std::min<uint32_t>(uint32_t(frame), table->frames - 1);
+            for (uint32_t k = 0; k < table->bones; k++)
+            {
+                const int b = table->meshBone[k];
+                if (b < 0 || uint32_t(b) >= bones) continue;
+                memcpy(&moves[size_t(b) * 12], &table->moves[(size_t(f) * table->bones + k) * 12], 12 * sizeof(float));
+                shown[size_t(b)] = table->shown[size_t(f) * table->bones + k];
+            }
+        }
+        if (table && table->chamber >= 0)
+        {
+            // the cylinder and its rounds turned about its axis (through its
+            // centre), before the reload's move: D(R(p - c) + c)
+            const float a = turn * 3.14159265f / 180.0f, cs = cosf(a), sn = sinf(a);
+            const float* u = table->axis;
+            float r[3][3];   // the turn about u (rows; Rodrigues)
+            for (int i = 0; i < 3; i++)
+                for (int j = 0; j < 3; j++)
+                    r[i][j] = (i == j ? cs : 0.0f) + (1.0f - cs) * u[i] * u[j] + sn * (i == 0 ? (j == 1 ? -u[2] : j == 2 ? u[1] : 0.0f)
+                                                                                 : i == 1 ? (j == 0 ? u[2] : j == 2 ? -u[0] : 0.0f)
+                                                                                          : (j == 0 ? -u[1] : j == 1 ? u[0] : 0.0f));
+            float shift[3];   // c - R c
+            for (int i = 0; i < 3; i++) shift[i] = table->centre[i] - (r[i][0] * table->centre[0] + r[i][1] * table->centre[1] + r[i][2] * table->centre[2]);
+            auto turnBone = [&](int b)
+            {
+                if (b < 0 || uint32_t(b) >= bones) return;
+                float* d = &moves[size_t(b) * 12];   // columns d[0..2], d[3..5], d[6..8] and the shift d[9..11]
+                float out[12];
+                for (int j = 0; j < 3; j++)            // column j of D R: D applied to R's column j
+                    for (int i = 0; i < 3; i++) out[3 * j + i] = d[i] * r[0][j] + d[3 + i] * r[1][j] + d[6 + i] * r[2][j];
+                for (int i = 0; i < 3; i++) out[9 + i] = d[i] * shift[0] + d[3 + i] * shift[1] + d[6 + i] * shift[2] + d[9 + i];
+                memcpy(d, out, sizeof out);
+            };
+            turnBone(table->chamber);
+            for (int k = 0; k < 6; k++)
+            {
+                turnBone(table->rounds[k]);
+                const int b = table->rounds[k];
+                if (b >= 0 && uint32_t(b) < bones && !(rounds & (1u << k))) shown[size_t(b)] = 0;
+            }
+        }
+        PoseWebley(base, moves.data(), shown.data());
+        Render::MemoryFreed(g_webleyBuffers.vertices, g_webleyBuffers.vertexCount * 52);
+        last = frame;
+        lastTurn = turn;
+        lastRounds = rounds;
+        lastBuffer = g_webleyBuffers.vertices;
+    }
+}
+
+// 0.5.675: the Colt's gun skeleton's pose (11 bones, 64 bytes each) kept from
+// the frames before the Webley's reload (restore false) and put back on each
+// frame of it (restore true): the Colt's own reload animation, which the game
+// still plays on the gun, must not move the Webley drawn on its body bone.
+namespace
+{
+    void WebleyColtPose(uint8_t* base, uint32_t pose, bool restore)
+    {
+        constexpr uint32_t Bytes = 11 * 64;
+        static uint8_t kept[Bytes];
+        static bool have = false;
+        if (pose < 0x40000000u || pose >= 0xA0000000u) return;
+        if (!restore) { memcpy(kept, base + pose, Bytes); have = true; return; }
+        if (have) memcpy(base + pose, kept, Bytes);
+    }
+}
+
+// Our own player's Webley reload began (the reload sound, sub_82554BA0).
+void MpFixesWebleyReloadBegan()
+{
+    if (getenv("COD3_WEBLEY_NO_RELOAD")) return;
+    const double now = ReloadClock(), was = g_webleyReloadAt.load();
+    const WebleyReloadTable* table = ReloadTable();
+    if (!table) return;
+    if (was >= 0 && now - was < (table->frames - 1) / double(table->fps)) return;   // the same reload's
+    g_webleyReloadAt.store(now);
+    static int told = 0;
+    if (told++ < 20) { printf("webley reload: begun on the arms (%.2f s)\n", (table->frames - 1) / double(table->fps)); fflush(stdout); }
+}
+
+// 0.5.809: the dual Colts in hand: the right arm and its Colt (the Colt's view
+// meshes and the arms') drawn a second time mirrored left to right
+// (Render::SetMirrorBuffers): a left arm with its own Colt, moving as the
+// right does. COD3_DUAL_NO_MIRROR=1: off (one Colt drawn).
+// 0.5.811: the dual Colts' reload, one at a time (render_commands.cpp): begun
+// by the Colt's own reload sound for this machine's player (sub_82554BA0,
+// below), its length the gun's reload time (+1548, or +1552 when empty);
+// the right trigger held back for its second half (the left gun's).
+namespace
+{
+    std::atomic<bool> g_dualHeldNow{ false };
+    std::atomic<int32_t> g_dualWeapon{ -1 };
+    uint64_t g_dualReloadAt = 0;
+    uint32_t g_dualReloadMs = 0;
+}
+void MpFixesDualReloadBegan(uint8_t* base, bool empty)
+{
+    const int32_t weapon = g_dualWeapon.load();
+    if (g_dualReloadAt && GetTickCount64() - g_dualReloadAt < 2ull * g_dualReloadMs + 300) return;   // the same reload's
+    uint32_t ms = 2500;
+    const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+    const uint32_t def = weapon > 0 && list ? Guest::Read32(base, list + 4 * uint32_t(weapon)) : 0;
+    if (def >= 0x40000000u && def < 0xA0000000u)
+    {
+        const uint32_t t = Guest::Read32(base, def + (empty ? 1552 : 1548));
+        if (t >= 500 && t <= 6000) ms = t;
+    }
+    g_dualReloadAt = GetTickCount64();
+    g_dualReloadMs = ms;
+    Render::SetMirrorReload(ms);
+    printf("dual colts: reload%s: the right Colt (%u ms), then the left\n", empty ? " (empty)" : "", ms);
+    fflush(stdout);
+}
+
+void MpFixesDualView(uint8_t* base, uint32_t held)
+{
+    static int32_t dual = -1;
+    if (dual < 0)
+        for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
+            if (strcmp(Guns[i].name, "colt_dual") == 0) dual = int32_t(i);
+    static const bool off = getenv("COD3_DUAL_NO_MIRROR") != nullptr;
+    const bool holding = !off && dual >= 0 && g_campaignWeapon[dual] > 0 && held == uint32_t(g_campaignWeapon[dual]);
+    // 0.5.811: hip fire only; no fire during the left gun's half of a reload
+    {
+        if (dual >= 0) g_dualWeapon.store(g_campaignWeapon[dual]);
+        const bool heldDual = dual >= 0 && g_campaignWeapon[dual] > 0 && held == uint32_t(g_campaignWeapon[dual]);
+        g_dualHeldNow.store(heldDual);
+        const uint64_t t = GetTickCount64();
+        const bool secondHalf = heldDual && g_dualReloadAt && t >= g_dualReloadAt + g_dualReloadMs && t < g_dualReloadAt + 2ull * g_dualReloadMs;
+        Input::SetDualPistols(heldDual, secondHalf);
+        if (!heldDual && g_dualReloadAt) { g_dualReloadAt = 0; Render::SetMirrorReload(0); }
+        // 0.5.812: COD3_DUAL_TEST=1 (tests cannot press in a match: COD3_PAD's
+        // presses reached the menu and started the campaign, dual3): from 5 s
+        // after the dual Colts are first in hand, 16 shots 0.6 s apart (the
+        // clip emptied: its reload), 6 more at 25 s, a reload at 32 s
+        static const bool dualTest = getenv("COD3_DUAL_TEST") != nullptr;
+        static uint64_t testFrom = 0;
+        static int testStep = 0;
+        if (dualTest && heldDual)
+        {
+            if (!testFrom) testFrom = t;
+            const uint64_t since = t - testFrom;
+            static const std::vector<std::pair<uint64_t, bool>> plan = [] {
+                std::vector<std::pair<uint64_t, bool>> p;
+                for (int i = 0; i < 16; i++) p.push_back({ 5000 + uint64_t(i) * 600, false });
+                for (int i = 0; i < 6; i++) p.push_back({ 25000 + uint64_t(i) * 600, false });
+                p.push_back({ 32000, true });
+                return p; }();
+            if (testStep < int(plan.size()) && since >= plan[size_t(testStep)].first)
+            {
+                Input::TestHold(plan[size_t(testStep)].second, plan[size_t(testStep)].second ? 6 : 8);
+                printf("dual colts: test %s %d\n", plan[size_t(testStep)].second ? "reload" : "shot", testStep);
+                fflush(stdout);
+                testStep++;
+            }
+        }
+        static bool spreadSet = false;
+        if (!spreadSet)
+        {
+            spreadSet = true;
+            const char* sp = getenv("COD3_DUAL_SPREAD");
+            Render::SetMirrorSpread(sp ? float(atof(sp)) : 0.10f);
+        }
+    }
+    static bool was = false;
+    static uint64_t lastSet = 0;
+    const uint64_t now = GetTickCount64();
+    if (!holding)
+    {
+        if (was) { Render::SetMirrorBuffers(nullptr, 0); was = false; printf("dual colts: put away: one arm\n"); fflush(stdout); }
+        return;
+    }
+    if (was && now - lastSet < 500) return;   // the meshes' buffers again twice a second (a bank may load them anew)
+    lastSet = now;
+    std::vector<uint32_t> buffers;
+    {
+        std::lock_guard<std::mutex> guard(g_bodyLock);
+        for (const std::vector<uint32_t>* list : { &g_coltBodies, &g_coltParts, &g_armsMeshes })
+            for (uint32_t mesh : *list)
+            {
+                uint32_t buffer = 0, vertices = 0, stride = 0;
+                if (MeshBuffer(base, mesh, buffer, vertices, stride) && buffer) buffers.push_back(buffer);
+            }
+    }
+    Render::SetMirrorBuffers(buffers.data(), int(buffers.size()));
+    if (!was) { printf("dual colts: in hand: %zu meshes mirrored as the left arm and Colt (%zu Colt, %zu arms)\n", buffers.size(), g_coltBodies.size() + g_coltParts.size(), g_armsMeshes.size()); fflush(stdout); }
+    was = true;
+}
+
+void MpFixesWebleyView(uint8_t* base, uint32_t held, uint32_t ps)
+{
+    static int32_t webley = -1;
+    if (webley < 0)
+        for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
+            if (strcmp(Guns[i].name, "webley") == 0) webley = int32_t(i);
+    if (webley < 0 || getenv("COD3_WEBLEY_NO_VIEW")) return;
+    std::lock_guard<std::mutex> guard(g_bodyLock);
+    const bool holding = g_campaignWeapon[webley] > 0 && held == uint32_t(g_campaignWeapon[webley]);
+    // 0.5.673: the reload on the arms ends when the Webley is put away;
+    // COD3_WEBLEY_RELOADTEST plays it at those seconds after it is first held
+    g_webleyHeld.store(holding);
+    if (!holding) g_webleyReloadAt.store(-1.0);
+    if (const char* test = getenv("COD3_WEBLEY_RELOADTEST"))
+    {
+        static std::vector<double> at; static bool parsed = false; static double since = -1.0;
+        if (!parsed) { parsed = true; for (const char* t = test; *t;) { char* end; const double v = strtod(t, &end); if (end == t) break; at.push_back(v); t = end; } }
+        if (holding && since < 0) since = ReloadClock();
+        for (size_t i = 0; since >= 0 && i < at.size(); i++)
+            if (ReloadClock() - since >= at[i]) { printf("webley reload: test at %.1f s held\n", at[i]); MpFixesWebleyReloadBegan(); at.erase(at.begin() + long(i)); break; }
+    }
+    static const uint32_t Fields[] = { 28, 0x40 + 88, 0x40 + 104, 0x138 + 24, 0x138 + 28, 0x158 + 24, 0x158 + 28 };
+    constexpr size_t FieldCount = sizeof(Fields) / sizeof(Fields[0]);
+    static std::map<uint32_t, std::array<uint32_t, FieldCount>> saved;   // each Colt body's own
+    static std::map<uint32_t, std::array<uint32_t, 4>> partSaved;          // each hidden part's counts
+    static bool said = false;
+    if (holding && !g_coltBodies.empty() && !MakeWebley(base, g_coltBodies.front()))
+    {
+        if (!said) { said = true; printf("webley: held, but its view could not be made: the Colt's is drawn\n"); fflush(stdout); }
+        return;
+    }
+    for (size_t b = 0; b < g_coltBodies.size();)
+    {
+        const uint32_t body = g_coltBodies[b];
+        if (Guest::Read32(base, body + 0x40 + 80) != body + 0x138 || Guest::Read32(base, body + 0x40 + 96) != body + 0x158)
+        { saved.erase(body); g_coltBodies.erase(g_coltBodies.begin() + long(b)); continue; }
+        std::array<uint32_t, FieldCount> now{}, ours{};
+        for (size_t f = 0; f < FieldCount; f++) now[f] = Guest::Read32(base, body + Fields[f]);
+        const uint32_t vword = now[4];
+        ours = { g_webleyBuffers.indexCount / 3, g_webleyBuffers.vertexCount, g_webleyBuffers.indexCount,
+                 g_webleyBuffers.vertices | (now[3] & 3u),
+                 (vword & ~(0xFFFFFFu << 2)) | ((g_webleyBuffers.vertexCount * 13u & 0xFFFFFFu) << 2),
+                 g_webleyBuffers.indices, g_webleyBuffers.indexCount * 2 };
+        const bool isOurs = g_webleyBuffers.vertices && now == ours;
+        if (!saved.count(body) || (!isOurs && now != saved[body])) saved[body] = now;   // its own (or new ones loaded there)
+        const auto& want = holding && g_webleyBuffers.vertices ? ours : saved[body];
+        if (now != want) for (size_t f = 0; f < FieldCount; f++) Guest::Write32(base, body + Fields[f], want[f]);
+        b++;
+    }
+    // 0.5.669: hidden as the MG34's bipod is: the triangle count (+28), the
+    // vertex and index counts (+0x40+88, +0x40+104) and the index buffer's
+    // size (+0x158+28) all none. With only the first and third, the slide and
+    // hammer were still drawn, broken into shards in the hand ("part of the
+    // Colt on the Webley", user; the 0.5.668 test with the Webley moved up
+    // left them in place)
+    static const uint32_t HideFields[] = { 28, 0x40 + 88, 0x40 + 104, 0x158 + 28 };
+    for (size_t p = 0; p < g_coltParts.size();)
+    {
+        const uint32_t part = g_coltParts[p];
+        if (Guest::Read32(base, part + 0x40 + 96) != part + 0x158) { partSaved.erase(part); g_coltParts.erase(g_coltParts.begin() + long(p)); continue; }
+        std::array<uint32_t, 4> now{};
+        for (int f = 0; f < 4; f++) now[f] = Guest::Read32(base, part + HideFields[f]);
+        const std::array<uint32_t, 4> none{};
+        if (!partSaved.count(part) || (now != none && now != partSaved[part])) partSaved[part] = now;
+        const std::array<uint32_t, 4> want = holding && g_webleyBuffers.vertices ? none : partSaved[part];
+        if (now != want) for (int f = 0; f < 4; f++) Guest::Write32(base, part + HideFields[f], want[f]);
+        p++;
+    }
+    // 0.5.674: the Webley's own parts in the reload (or at rest).
+    // 0.5.676: and its cylinder as the gun's rounds are: each round fired
+    // turns it a sixth of a turn (clockwise seen from behind, eased over
+    // 0.12 s) and is gone from its chamber, so the rounds shown are the
+    // rounds left (the clip, ps + 4 * (172 + def+1468)). In a reload: as it
+    // was until the extractor throws the cases (all six fly), then, from
+    // when the new rounds are in, as many as the reload gives (the clip and
+    // the spare rounds, ps + 4 * (80 + def+1460), six at most), unturned.
+    // COD3_WEBLEY_CLIPTEST=N: N rounds left (for screenshots: firing cannot
+    // be scripted).
+    if (holding && g_webleyBuffers.vertices)
+    {
+        int clip = 6, spare = 0;
+        {
+            const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+            const uint32_t def = (held > 0 && held < 128 && list) ? Guest::Read32(base, list + 4 * held) : 0;
+            if (def >= 0x40000000u && def < 0xA0000000u && ps >= 0x40000000u && ps < 0xA0000000u)
+            {
+                const uint32_t clipAt = Guest::Read32(base, def + 1468), spareAt = Guest::Read32(base, def + 1460);
+                if (clipAt <= 128) clip = int(Guest::Read32(base, ps + 4 * (172 + clipAt)));
+                if (spareAt <= 128) spare = int(Guest::Read32(base, ps + 4 * (80 + spareAt)));
+            }
+            if (const char* test = getenv("COD3_WEBLEY_CLIPTEST")) clip = atoi(test);
+            clip = std::clamp(clip, 0, 6);
+            spare = std::max(spare, 0);
+        }
+        const int fired = 6 - clip;
+        static float turn = 0.0f;
+        static double lastAt = ReloadClock();
+        const double now = ReloadClock();
+        const float dt = float(std::clamp(now - lastAt, 0.0, 0.1));
+        lastAt = now;
+        int frame = -1;
+        const double began = g_webleyReloadAt.load();
+        const WebleyReloadTable* arms = ReloadTable();
+        if (began >= 0 && arms)
+        {
+            const double t = now - began;
+            if (t >= 0 && t <= (arms->frames - 1) / double(arms->fps)) frame = int(t * arms->fps);
+        }
+        // the reload's start: what the cylinder held then, and what it will
+        static double reloadSeen = -1.0;
+        static int firedThen = 0, givenThen = 6;
+        static float turnThen = 0.0f;
+        if (frame >= 0 && began != reloadSeen) { reloadSeen = began; firedThen = fired; givenThen = std::min(6, clip + spare); turnThen = turn; }
+        uint32_t rounds = 0;
+        const WebleyGunTable* gun = GunTable();
+        if (frame >= 0 && gun)
+        {
+            if (uint32_t(frame) < gun->insert)
+            {
+                turn = turnThen;
+                for (int k = 0; k < 6; k++) if (k >= firedThen || uint32_t(frame) >= gun->eject) rounds |= 1u << k;   // the cases fly, spent or not
+            }
+            else
+            {
+                turn = 0.0f;
+                for (int k = 0; k < givenThen; k++) rounds |= 1u << k;
+            }
+        }
+        else
+        {
+            const float target = 60.0f * float(fired);
+            if (target > turn) turn = std::min(target, turn + 60.0f * dt / 0.12f);
+            else turn = target;   // after a reload: a full cylinder, unturned
+            for (int k = fired; k < 6; k++) rounds |= 1u << k;
+        }
+        PoseWebleyParts(base, frame, turn, rounds);
+    }
+    static bool wasHolding = false;
+    if (holding != wasHolding)
+    {
+        wasHolding = holding;
+        printf("webley: %s (%zu Colt bodies, %zu parts hidden)\n", holding ? "in hand: CoD2's Webley drawn in the Colt's place" : "put away: the Colt's own view back", g_coltBodies.size(), g_coltParts.size());
+        fflush(stdout);
+    }
+    // COD3_WEBLEY_SHOTS="12 20": screenshots that many seconds after first held
+    if (const char* shots = getenv("COD3_WEBLEY_SHOTS"))
+    {
+        static std::vector<double> at; static bool parsed = false; static bool started = false; static std::chrono::steady_clock::time_point since;
+        if (!parsed) { parsed = true; for (const char* t = shots; *t;) { char* end; const double v = strtod(t, &end); if (end == t) break; at.push_back(v); t = end; } }
+        if (holding && !started) { started = true; since = std::chrono::steady_clock::now(); }
+        if (started)
+        {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+            for (size_t i = 0; i < at.size(); i++)
+                if (now >= at[i]) { Overlay::RequestScreenshot(); printf("webley: screenshot at %.1f s held\n", now); fflush(stdout); at.erase(at.begin() + long(i)); break; }
+        }
+    }
+}
+
+// 0.5.681: THE FLAMETHROWER'S VIEW. World at War's viewmodel_usa_flamethrower
+// (custom\flamethrower\viewmodel_flamethrower.mesh, tools/waw) drawn in the
+// Thompson body's place while the flamethrower is held, as the Webley is in
+// the Colt's (the body's triangle, vertex and index counts and buffers are
+// ours while held, its own after); the Thompson's magazine, round and charging
+// handle are not drawn. Its fit, worked out offline on both meshes (the
+// Thompson's from weapusge.cod block 10, tools/kapf/xemesh.py): World at
+// War's +x (the barrel) is the Thompson's -y, its +y the Thompson's +x, +z up
+// in both; the M2's rear grip (x -10.26, z -3.18) on the Thompson's pistol
+// grip (y -4.60, z -2.03), scaled by the hands' spacing (the Thompson's 6.32
+// from grip to handguard over the M2's 16.17 from grip to grip: 0.391), so
+// its tube lies under the left hand and its nozzle where the Thompson's
+// muzzle was (y -15.5 to -14.7). COD3_FLAME_FIT="scale x y z": scale (0: as
+// fitted) and a shift, for fitting by screenshot without a rebuild. Its
+// texture (custom\flamethrower\flamethrower_c.png, the hose on a grey band
+// below the body's) by the renderer (Render::SetMeshTexture), its other
+// slots custom\flamethrower\slots.txt's.
+namespace
+{
+    std::vector<WebleyVertex> g_flameVerts;
+    std::vector<uint16_t> g_flameIndices;
+    struct FlameBuffers { uint32_t vertices = 0, indices = 0, vertexCount = 0, indexCount = 0; std::string madeFor; } g_flameBuffers;
+
+    // The body's packed normals' order (x low or z low) and its triangles'
+    // facing to them, as MakeWebley reads the Colt's
+    bool BodyPacking(uint8_t* base, uint32_t body, bool& reversed, bool& clockwise)
+    {
+        uint32_t buffer = 0, count = 0, stride = 0;
+        const uint32_t indices = Guest::Read32(base, body + 0x158 + 24), bytes = Guest::Read32(base, body + 0x158 + 28);
+        if (!MeshBuffer(base, body, buffer, count, stride) || stride != 52) return false;
+        double agree[2] = {}, facing[2] = {};
+        for (uint32_t t = 0; t + 6 <= bytes && t < 6 * 400; t += 6)
+        {
+            uint32_t vi[3]; float p[3][3]; bool ok = true;
+            for (int k = 0; k < 3 && ok; k++) { vi[k] = Guest::Read16(base, indices + t + 2 * k); ok = vi[k] < count; if (ok) for (int c = 0; c < 3; c++) p[k][c] = ReadFloat(base, buffer + 52 * vi[k] + 4 * c); }
+            if (!ok) continue;
+            const float a[3] = { p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2] }, b[3] = { p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2] };
+            const float n[3] = { a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0] };
+            const float len = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+            if (len < 1e-6f) continue;
+            const uint32_t w = Guest::Read32(base, buffer + 52 * vi[0] + 12);
+            for (int r = 0; r < 2; r++)
+            {
+                const float m[3] = { float(Field10(w, r ? 20 : 0)), float(Field10(w, 10)), float(Field10(w, r ? 0 : 20)) };
+                const float ml = sqrtf(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]);
+                if (ml > 0) { const double d = (n[0] * m[0] + n[1] * m[1] + n[2] * m[2]) / (len * ml); agree[r] += fabs(d); facing[r] += d; }
+            }
+        }
+        reversed = agree[1] > agree[0];
+        clockwise = facing[reversed ? 1 : 0] < 0;
+        return true;
+    }
+
+    bool MakeFlameView(uint8_t* base, uint32_t body)
+    {
+        static bool tried = false, loaded = false, ourClockwise = false;
+        if (!tried)
+        {
+            tried = true;
+            loaded = LoadMeshFile(Flame::Dir() + "viewmodel_flamethrower.mesh", g_flameVerts, g_flameIndices);
+            // the mesh's own triangles against its own normals
+            double facing = 0;
+            for (size_t t = 0; loaded && t + 2 < g_flameIndices.size(); t += 3)
+            {
+                const WebleyVertex& a = g_flameVerts[g_flameIndices[t]];
+                const WebleyVertex& b = g_flameVerts[g_flameIndices[t + 1]];
+                const WebleyVertex& c = g_flameVerts[g_flameIndices[t + 2]];
+                const float u[3] = { b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2] }, v[3] = { c.p[0] - a.p[0], c.p[1] - a.p[1], c.p[2] - a.p[2] };
+                const float n[3] = { u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0] };
+                facing += n[0] * a.n[0] + n[1] * a.n[1] + n[2] * a.n[2];
+            }
+            ourClockwise = facing < 0;
+            printf("flamethrower: %sviewmodel_flamethrower.mesh %s (%zu vertices, %zu triangles, %s to its normals)\n", Flame::Dir().c_str(),
+                   loaded ? "read" : "NOT read", g_flameVerts.size(), g_flameIndices.size() / 3, ourClockwise ? "clockwise" : "counter-clockwise");
+            fflush(stdout);
+        }
+        if (!loaded) return false;
+        // 0.5.682: two points, not one: the rear grip (World at War x -10.26,
+        // z -3.18) on the Thompson's pistol grip (y -4.60, z -2.03) and the
+        // tube just behind the front grip (x 2.0, z 0) in the left palm, where
+        // the Thompson's handguard was (y -10.92, z 0.30): turned 5.7 degrees
+        // nose up about the rear grip, scale 0.532 (0.5.681's one point and
+        // the hands' spacing left the tube under an open left hand).
+        // COD3_FLAME_FIT="scale pitch x y z": scale (0: as fitted), degrees
+        // more nose up, a shift.
+        float user[5] = { 0, 0, 0, 0, 0 };
+        if (const char* t = getenv("COD3_FLAME_FIT")) sscanf(t, "%f %f %f %f %f", &user[0], &user[1], &user[2], &user[3], &user[4]);
+        const float scale = user[0] > 0.0f ? user[0] : 0.532f;
+        const float pitch = (5.70f + user[1]) * 3.14159265f / 180.0f, pc = cosf(pitch), ps = sinf(pitch);
+        constexpr float GripX = -10.26f, GripY = 0.06f, GripZ = -3.18f;
+        const float ox = 0.02f + user[2], oy = -4.60f + user[3], oz = -2.03f + user[4];
+        char key[160];
+        snprintf(key, sizeof key, "%.4f %.4f %.4f %.4f %.4f", scale, pitch, ox, oy, oz);
+        if (g_flameBuffers.vertices && g_flameBuffers.madeFor == key) return true;
+        bool reversed = false, clockwise = false;
+        if (!BodyPacking(base, body, reversed, clockwise)) { printf("flamethrower: the Thompson body's vertices are not as expected (52 bytes)\n"); fflush(stdout); return false; }
+        const bool flip = clockwise != ourClockwise;
+        const uint32_t vcount = uint32_t(g_flameVerts.size()), icount = uint32_t(g_flameIndices.size());
+        static uint32_t vroom = 0, iroom = 0;
+        if (vcount * 52 > vroom) { vroom = (vcount * 52 + 0xFFFFu) & ~0xFFFFu; g_flameBuffers.vertices = Guest::AllocateExtended(vroom); }
+        if (icount * 2 > iroom) { iroom = (icount * 2 + 0xFFFFu) & ~0xFFFFu; g_flameBuffers.indices = Guest::AllocateExtended(iroom); }
+        if (!g_flameBuffers.vertices || !g_flameBuffers.indices) { printf("flamethrower: no memory for its buffers\n"); return false; }
+        for (uint32_t i = 0; i < vcount; i++)
+        {
+            const WebleyVertex& v = g_flameVerts[i];
+            const uint32_t at = g_flameBuffers.vertices + 52 * i;
+            // turned nose up about the rear grip, then World at War's +x to the
+            // Thompson's -y, +y to +x, +z up, the rear grip on its pistol grip
+            const float dx = v.p[0] - GripX, dz = v.p[2] - GripZ;
+            const float rx = dx * pc - dz * ps, rz = dx * ps + dz * pc;
+            const float nx = v.n[0] * pc - v.n[2] * ps, nz = v.n[0] * ps + v.n[2] * pc;
+            const float n[3] = { v.n[1], -nx, nz };
+            float t[3] = { n[1], -n[0], 0.0f };
+            float tl = sqrtf(t[0] * t[0] + t[1] * t[1]);
+            if (tl < 0.1f) { t[0] = 1.0f; t[1] = 0.0f; t[2] = 0.0f; tl = 1.0f; }
+            for (float& c : t) c /= tl;
+            const float b[3] = { n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0] };
+            WriteFloat(base, at + 0, (v.p[1] - GripY) * scale + ox);
+            WriteFloat(base, at + 4, -rx * scale + oy);
+            WriteFloat(base, at + 8, rz * scale + oz);
+            Guest::Write32(base, at + 12, PackDirection(n, reversed));
+            for (uint32_t uv = 16; uv <= 32; uv += 8) { WriteFloat(base, at + uv, v.uv[0]); WriteFloat(base, at + uv + 4, v.uv[1]); }
+            Guest::Write32(base, at + 40, 0xFFFFFFFFu);
+            Guest::Write32(base, at + 44, PackDirection(t, reversed));
+            Guest::Write32(base, at + 48, PackDirection(b, reversed));
+        }
+        for (uint32_t i = 0; i < icount; i++) Guest::Write16(base, g_flameBuffers.indices + 2 * i, g_flameIndices[flip && i % 3 ? (i % 3 == 1 ? i + 1 : i - 1) : i]);
+        {
+            // 0.5.718: the mesh as written (its own space) for the gun's mask over its flame (overlay.cpp)
+            std::vector<float> xyz(size_t(vcount) * 3);
+            for (uint32_t i = 0; i < vcount; i++) for (int k = 0; k < 3; k++) xyz[size_t(i) * 3 + k] = ReadFloat(base, g_flameBuffers.vertices + 52 * i + 4 * uint32_t(k));
+            Overlay::SetWeaponMaskMesh(xyz.data(), vcount, g_flameIndices.data(), g_flameIndices.size());
+        }
+        g_flameBuffers.vertexCount = vcount; g_flameBuffers.indexCount = icount; g_flameBuffers.madeFor = key;
+        // 0.5.684: the colour map in slot 4: the Thompson's draws read it there
+        // (the Colt's in 5): with ours in 5 and grey.png in 4, 0.5.682's M2 was
+        // all grey (its draw: slot 3 a DXT5 normal map, 4 and 5 DXT1, 2 a cube)
+        Render::SetMeshTexture(g_flameBuffers.vertices, (Flame::Dir() + "flamethrower_c.png").c_str(), 4);
+        if (getenv("COD3_FLAME_VSDUMP")) Render::ProbeVertexBuffer(g_flameBuffers.vertices, Flame::Dir().c_str());   // 0.5.714: DIAGNOSTIC
+        {
+            // 0.5.717: the nozzle (World at War's tag_flash, 17.711 -0.003 -0.288
+            // in j_gun's space) put in the mesh as its vertices are, followed
+            // onto the screen by the M2's own draw (Render::TrackMeshPoint): the
+            // flame starts where the tube's mouth is drawn, whatever moves it
+            const float dx = 17.711f - GripX, dz = -0.288f - GripZ;
+            const float rx = dx * pc - dz * ps, rz = dx * ps + dz * pc;
+            const float tip[3] = { (-0.003f - GripY) * scale + ox, -rx * scale + oy, rz * scale + oz };
+            Render::TrackMeshPoint(g_flameBuffers.vertices, tip[0], tip[1], tip[2]);
+            printf("flamethrower: its nozzle in the mesh at %.3f %.3f %.3f, followed on the screen\n", tip[0], tip[1], tip[2]);
+            fflush(stdout);
+        }
+        if (FILE* f = fopen((Flame::Dir() + "slots.txt").c_str(), "rb"))
+        {
+            char line[512] = {};
+            const bool got = fgets(line, sizeof line, f) != nullptr;
+            fclose(f);
+            std::istringstream words(got ? line : "");
+            for (std::string word; words >> word;)
+            {
+                const size_t eq = word.find('=');
+                if (eq == std::string::npos) continue;
+                Render::SetMeshSlotTexture(g_flameBuffers.vertices, atoi(word.substr(0, eq).c_str()), (Flame::Dir() + word.substr(eq + 1)).c_str());
+            }
+        }
+        printf("flamethrower: made at %08X (%u vertices) and %08X (%u indices): scale %.3f, pitch %.1f, grip at %.2f %.2f %.2f; the Thompson's normals %s, its triangles %s%s\n",
+               g_flameBuffers.vertices, vcount, g_flameBuffers.indices, icount, scale, pitch * 180.0f / 3.14159265f, ox, oy, oz, reversed ? "z-low" : "x-low",
+               clockwise ? "clockwise" : "counter-clockwise", flip ? " (ours turned round)" : "");
+        fflush(stdout);
+        return true;
+    }
+}
+
+// 0.5.726: CoD2'S SCOPED MOSIN-NAGANT IN THE SCOPED KAR98'S VIEW. CoD2's
+// viewmodel_mosinnagant_cloth (posed by viewmodel_mosincloth_idle; its x ahead,
+// y left, z up, the bore at z 0.948, tag_flash at x 28.445, the butt at x
+// -21.55) put in the Kar98's body mesh (k98.w_ge_RFL_VM: its -y ahead, the
+// muzzle at y -22.81 and bore z 0.65, the butt at y 11.03, centred at x -0.3):
+// muzzle on muzzle, butt on butt (scale 0.672, the butt lands at 10.8), the
+// bore on the bore. While the Mosin is held the body's buffers are ours and the
+// Kar98's bolt, clips and scope (CoD2's model has its own) draw nothing.
+// COD3_MOSIN_FIT="scale x y z": another scale (0: as fitted) and a shift;
+// COD3_MOSIN_SLOT: the colour map's pixel slot (default 4).
+namespace
+{
+    std::string MosinDir()
+    {
+        static std::string dir;
+        if (dir.empty())
+        {
+            char path[MAX_PATH] = {};
+            GetModuleFileNameA(nullptr, path, MAX_PATH);
+            std::string d(path);
+            const size_t slash = d.find_last_of("\\/");
+            dir = (slash == std::string::npos ? std::string(".") : d.substr(0, slash)) + "\\custom\\mosin\\";
+        }
+        return dir;
+    }
+    std::vector<WebleyVertex> g_mosinVerts;
+    std::vector<uint16_t> g_mosinIndices;
+    struct MosinBuffers { uint32_t vertices = 0, indices = 0, vertexCount = 0, indexCount = 0; std::string madeFor; } g_mosinBuffers;
+
+    bool MakeMosinView(uint8_t* base, uint32_t body)
+    {
+        static bool tried = false, loaded = false, ourClockwise = false;
+        if (!tried)
+        {
+            tried = true;
+            loaded = LoadMeshFile(MosinDir() + "viewmodel_mosin.mesh", g_mosinVerts, g_mosinIndices);
+            double facing = 0;
+            for (size_t t = 0; loaded && t + 2 < g_mosinIndices.size(); t += 3)
+            {
+                const WebleyVertex& a = g_mosinVerts[g_mosinIndices[t]];
+                const WebleyVertex& b = g_mosinVerts[g_mosinIndices[t + 1]];
+                const WebleyVertex& c = g_mosinVerts[g_mosinIndices[t + 2]];
+                const float u[3] = { b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2] }, v[3] = { c.p[0] - a.p[0], c.p[1] - a.p[1], c.p[2] - a.p[2] };
+                const float n[3] = { u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0] };
+                facing += n[0] * a.n[0] + n[1] * a.n[1] + n[2] * a.n[2];
+            }
+            ourClockwise = facing < 0;
+            printf("mosin: %sviewmodel_mosin.mesh %s (%zu vertices, %zu triangles, %s to its normals)\n", MosinDir().c_str(),
+                   loaded ? "read" : "NOT read", g_mosinVerts.size(), g_mosinIndices.size() / 3, ourClockwise ? "clockwise" : "counter-clockwise");
+            fflush(stdout);
+        }
+        if (!loaded) return false;
+        float user[4] = { 0, 0, 0, 0 };
+        if (const char* t = getenv("COD3_MOSIN_FIT")) sscanf(t, "%f %f %f %f", &user[0], &user[1], &user[2], &user[3]);
+        const float scale = user[0] > 0.0f ? user[0] : 0.672f;
+        constexpr float TipX = 28.445f, BoreZ = 0.948f;   // CoD2's: the muzzle, the bore
+        const float ox = -0.30f + user[1], oy = -22.81f + user[2], oz = 0.65f + user[3];   // the Kar98's
+        char key[128];
+        snprintf(key, sizeof key, "%.4f %.4f %.4f %.4f", scale, ox, oy, oz);
+        if (g_mosinBuffers.vertices && g_mosinBuffers.madeFor == key) return true;
+        bool reversed = false, clockwise = false;
+        if (!BodyPacking(base, body, reversed, clockwise)) { printf("mosin: the Kar98 body's vertices are not as expected (52 bytes)\n"); fflush(stdout); return false; }
+        const bool flip = clockwise != ourClockwise;
+        const uint32_t vcount = uint32_t(g_mosinVerts.size()), icount = uint32_t(g_mosinIndices.size());
+        static uint32_t vroom = 0, iroom = 0;
+        if (vcount * 52 > vroom) { vroom = (vcount * 52 + 0xFFFFu) & ~0xFFFFu; g_mosinBuffers.vertices = Guest::AllocateExtended(vroom); }
+        if (icount * 2 > iroom) { iroom = (icount * 2 + 0xFFFFu) & ~0xFFFFu; g_mosinBuffers.indices = Guest::AllocateExtended(iroom); }
+        if (!g_mosinBuffers.vertices || !g_mosinBuffers.indices) { printf("mosin: no memory for its buffers\n"); return false; }
+        for (uint32_t i = 0; i < vcount; i++)
+        {
+            const WebleyVertex& v = g_mosinVerts[i];
+            const uint32_t at = g_mosinBuffers.vertices + 52 * i;
+            // CoD2's +x to the Kar98's -y, +y to +x, +z up
+            const float n[3] = { v.n[1], -v.n[0], v.n[2] };
+            float t[3] = { n[1], -n[0], 0.0f };
+            float tl = sqrtf(t[0] * t[0] + t[1] * t[1]);
+            if (tl < 0.1f) { t[0] = 1.0f; t[1] = 0.0f; t[2] = 0.0f; tl = 1.0f; }
+            for (float& c : t) c /= tl;
+            const float b[3] = { n[1] * t[2] - n[2] * t[1], n[2] * t[0] - n[0] * t[2], n[0] * t[1] - n[1] * t[0] };
+            WriteFloat(base, at + 0, v.p[1] * scale + ox);
+            WriteFloat(base, at + 4, -(v.p[0] - TipX) * scale + oy);
+            WriteFloat(base, at + 8, (v.p[2] - BoreZ) * scale + oz);
+            Guest::Write32(base, at + 12, PackDirection(n, reversed));
+            for (uint32_t uv = 16; uv <= 32; uv += 8) { WriteFloat(base, at + uv, v.uv[0]); WriteFloat(base, at + uv + 4, v.uv[1]); }
+            Guest::Write32(base, at + 40, 0xFFFFFFFFu);
+            Guest::Write32(base, at + 44, PackDirection(t, reversed));
+            Guest::Write32(base, at + 48, PackDirection(b, reversed));
+        }
+        for (uint32_t i = 0; i < icount; i++) Guest::Write16(base, g_mosinBuffers.indices + 2 * i, g_mosinIndices[flip && i % 3 ? (i % 3 == 1 ? i + 1 : i - 1) : i]);
+        g_mosinBuffers.vertexCount = vcount; g_mosinBuffers.indexCount = icount; g_mosinBuffers.madeFor = key;
+        static const int slot = [] { const char* t = getenv("COD3_MOSIN_SLOT"); return t ? atoi(t) : 4; }();
+        Render::SetMeshTexture(g_mosinBuffers.vertices, (MosinDir() + "mosin_c.png").c_str(), slot);
+        if (FILE* f = fopen((MosinDir() + "slots.txt").c_str(), "rb"))
+        {
+            char line[512] = {};
+            const bool got = fgets(line, sizeof line, f) != nullptr;
+            fclose(f);
+            std::istringstream words(got ? line : "");
+            for (std::string word; words >> word;)
+            {
+                const size_t eq = word.find('=');
+                if (eq == std::string::npos || atoi(word.substr(0, eq).c_str()) == slot) continue;
+                Render::SetMeshSlotTexture(g_mosinBuffers.vertices, atoi(word.substr(0, eq).c_str()), (MosinDir() + word.substr(eq + 1)).c_str());
+            }
+        }
+        printf("mosin: made at %08X (%u vertices) and %08X (%u indices): scale %.3f, at %.2f %.2f %.2f, colour map in slot %d\n",
+               g_mosinBuffers.vertices, vcount, g_mosinBuffers.indices, icount, scale, ox, oy, oz, slot);
+        fflush(stdout);
+        return true;
+    }
+}
+
+std::string MosinShotFile() { return MosinDir() + "nagant_sniper.wav"; }
+
+void MpFixesMosinView(uint8_t* base, uint32_t held)
+{
+    static int32_t mosin = -1;
+    if (mosin < 0)
+        for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
+            if (strcmp(Guns[i].name, "mosin_scoped") == 0) mosin = int32_t(i);
+    if (mosin < 0) return;
+    const bool holding = g_campaignWeapon[mosin] > 0 && held == uint32_t(g_campaignWeapon[mosin]);
+    if (getenv("COD3_MOSIN_NO_VIEW")) return;
+    std::lock_guard<std::mutex> guard(g_bodyLock);
+    static const uint32_t Fields[] = { 28, 0x40 + 88, 0x40 + 104, 0x138 + 24, 0x138 + 28, 0x158 + 24, 0x158 + 28 };
+    constexpr size_t FieldCount = sizeof(Fields) / sizeof(Fields[0]);
+    static std::map<uint32_t, std::array<uint32_t, FieldCount>> saved;
+    static std::map<uint32_t, std::array<uint32_t, 4>> partSaved;
+    static bool said = false;
+    if (holding && !g_k98Bodies.empty() && !MakeMosinView(base, g_k98Bodies.front()))
+    {
+        if (!said) { said = true; printf("mosin: held, but its view could not be made: the Kar98's is drawn\n"); fflush(stdout); }
+        return;
+    }
+    for (size_t b = 0; b < g_k98Bodies.size();)
+    {
+        const uint32_t body = g_k98Bodies[b];
+        if (Guest::Read32(base, body + 0x40 + 80) != body + 0x138 || Guest::Read32(base, body + 0x40 + 96) != body + 0x158)
+        { saved.erase(body); g_k98Bodies.erase(g_k98Bodies.begin() + long(b)); continue; }
+        std::array<uint32_t, FieldCount> now{}, ours{};
+        for (size_t f = 0; f < FieldCount; f++) now[f] = Guest::Read32(base, body + Fields[f]);
+        const uint32_t vword = now[4];
+        ours = { g_mosinBuffers.indexCount / 3, g_mosinBuffers.vertexCount, g_mosinBuffers.indexCount,
+                 g_mosinBuffers.vertices | (now[3] & 3u),
+                 (vword & ~(0xFFFFFFu << 2)) | ((g_mosinBuffers.vertexCount * 13u & 0xFFFFFFu) << 2),
+                 g_mosinBuffers.indices, g_mosinBuffers.indexCount * 2 };
+        const bool isOurs = g_mosinBuffers.vertices && now == ours;
+        if (!saved.count(body) || (!isOurs && now != saved[body])) saved[body] = now;
+        const auto& want = holding && g_mosinBuffers.vertices ? ours : saved[body];
+        if (now != want) for (size_t f = 0; f < FieldCount; f++) Guest::Write32(base, body + Fields[f], want[f]);
+        b++;
+    }
+    static const uint32_t HideFields[] = { 28, 0x40 + 88, 0x40 + 104, 0x158 + 28 };
+    for (size_t p = 0; p < g_k98Parts.size();)
+    {
+        const uint32_t part = g_k98Parts[p];
+        if (Guest::Read32(base, part + 0x40 + 96) != part + 0x158) { partSaved.erase(part); g_k98Parts.erase(g_k98Parts.begin() + long(p)); continue; }
+        std::array<uint32_t, 4> now{};
+        for (int f = 0; f < 4; f++) now[f] = Guest::Read32(base, part + HideFields[f]);
+        const std::array<uint32_t, 4> none{};
+        if (!partSaved.count(part) || (now != none && now != partSaved[part])) partSaved[part] = now;
+        const std::array<uint32_t, 4> want = holding && g_mosinBuffers.vertices ? none : partSaved[part];
+        if (now != want) for (int f = 0; f < 4; f++) Guest::Write32(base, part + HideFields[f], want[f]);
+        p++;
+    }
+    static bool wasHolding = false;
+    if (holding != wasHolding)
+    {
+        wasHolding = holding;
+        printf("mosin: %s (%zu Kar98 bodies, %zu parts hidden)\n", holding ? "in hand: CoD2's scoped Mosin drawn in the Kar98's place" : "put away: the Kar98's own view back",
+               g_k98Bodies.size(), g_k98Parts.size());
+        fflush(stdout);
+    }
+}
+
+// 0.5.720: WORLD AT WAR'S OVERHEATING, NOT A RELOAD (the user: "i think it
+// used a cool down instead of an actual reload animation"). WaW's weapon file:
+// unlimitedAmmo 1, overheatWeapon 1, overheatRate 38, cooldownRate 13,
+// overheatEndVal 50. For every player holding the M2 (on the host; the
+// clients' are the host's): its clip is filled again each frame (never a
+// reload); each shot since adds heat (a shot a tenth of a second: 3.8), heat
+// cools 13 a second; at 100 it has overheated and fires no more (its command's
+// fire bit cleared before ClientThink, bots.cpp) until the heat is under 50.
+// Our own heat goes to the flame's picture (its bar). COD3_FLAME_RELOAD=1:
+// the old 100-round tank.
+namespace
+{
+    struct FlameHeat { float heat = 0.0f; bool over = false; uint32_t entity = 0; };
+    FlameHeat g_flameHeat[64];
+    int32_t FlameWeaponNumber()
+    {
+        static int32_t flame = -1;
+        if (flame < 0)
+            for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
+                if (strcmp(Guns[i].name, "flamethrower") == 0) flame = int32_t(i);
+        return flame >= 0 ? g_campaignWeapon[flame] : 0;
+    }
+
+    void FlameHeatTick(uint8_t* base, uint32_t own)
+    {
+        static const bool off = getenv("COD3_FLAME_RELOAD") != nullptr;
+        const int32_t weapon = FlameWeaponNumber();
+        if (off || weapon <= 0) return;
+        const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+        const uint32_t def = list ? Guest::Read32(base, list + 4 * uint32_t(weapon)) : 0;
+        if (def < 0x40000000u || def >= 0xA0000000u) return;
+        const uint32_t clipPool = Guest::Read32(base, def + 1468), clipSize = Guest::Read32(base, def + 1476);
+        if (clipPool > 128 || clipSize == 0 || clipSize > 1000) return;
+        static uint64_t last = 0;
+        const uint64_t now = GetTickCount64();
+        const float dt = last ? std::min(0.25f, float(now - last) / 1000.0f) : 0.0f;
+        last = now;
+        const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
+        for (uint32_t c = 0; entities && c < MpCapClients && c < 64; c++)
+        {
+            FlameHeat& h = g_flameHeat[c];
+            const uint32_t e = Guest::Read32(base, entities + 4 * (c + 1));
+            const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+            if (e != h.entity) { h = FlameHeat{}; h.entity = e; }
+            if (r < 0x40000000u || r >= 0xA0000000u) continue;
+            const bool holding = Guest::Read32(base, r + 164) == uint32_t(weapon);
+            const uint32_t clipAt = r + 4 * (172 + clipPool);
+            const uint32_t inClip = Guest::Read32(base, clipAt);
+            const uint32_t shots = holding && inClip < clipSize ? clipSize - inClip : 0;
+            if (shots) h.heat += 3.8f * float(std::min<uint32_t>(shots, 10));
+            else h.heat -= 13.0f * dt;
+            h.heat = std::clamp(h.heat, 0.0f, 100.0f);
+            if (h.heat >= 100.0f && !h.over)
+            {
+                h.over = true;
+                if (e == own) { printf("flamethrower: overheated\n"); fflush(stdout); }
+            }
+            else if (h.over && h.heat < 50.0f) h.over = false;   // overheatEndVal
+            if (holding && inClip != clipSize) Guest::Write32(base, clipAt, clipSize);   // unlimited: never a reload
+            if (e == own) Flame::Heat(h.heat, h.over);
+        }
+    }
+}
+
+// 0.5.722: NO AMMUNITION COUNTER WITH THE M2 (the user: "remove the ammo
+// counter and just keep the cooldown bar"; World at War shows only its heat).
+// The HUD's ammunition widget (IGOAmmoWidget, its virtual table 0x82070F64)
+// finds its parts by name in its load (slot 1, sub_824F2A70: FindElement
+// "clipammo" into +16, "totalammo" into +20, "hudammo" at +12) and updates
+// them each frame (slot 2, sub_824FAD20). While our M2 is held, after that
+// update and each frame, the three parts' visibility byte (+4, as
+// menu_mouse.cpp reads it) is 0; their own is put back when it is put away.
+namespace
+{
+    std::atomic<uint32_t> g_ammoWidget{ 0 };
+
+    bool g_ammoHidden = false;
+
+    void AmmoWidgetHide(uint8_t* base)
+    {
+        // 0.5.725: off: none of these hid the counter (722 its +4, 724 its colours
+        // and place); the heat bar's panel is drawn over the box instead
+        // (flamethrower.cpp HeatBar). Kept for COD3_AMMO_WIDGET_TRY=1.
+        if (!getenv("COD3_AMMO_WIDGET_TRY")) return;
+        const uint32_t widget = g_ammoWidget.load();
+        if (widget < 0x40000000u || widget >= 0xA0000000u) return;
+        static const uint32_t Parts[3] = { 12, 16, 20 };
+        const bool hide = g_flameArmsHeld.load() && !getenv("COD3_FLAME_RELOAD");
+        // 0.5.723: DIAGNOSTIC (722: the byte +4 did not hide them): the widget
+        // and its three parts' first 160 bytes, as words, three times with the
+        // M2 held and three times without (8 s apart), to find what shows them
+        {
+            static int toldHeld = 0, toldNot = 0;
+            static uint64_t lastAt = 0;
+            const uint64_t now = GetTickCount64();
+            int& told = hide ? toldHeld : toldNot;
+            if (told < 3 && now - lastAt > 8000)
+            {
+                lastAt = now; told++;
+                auto dump = [&](const char* label, uint32_t at)
+                {
+                    std::string line;
+                    char t[16];
+                    for (uint32_t o = 0; o < 160; o += 4) { snprintf(t, sizeof t, " %08X", Guest::Read32(base, at + o)); line += t; }
+                    printf("ammo widget (%s) %s %08X:%s\n", hide ? "M2 held" : "not held", label, at, line.c_str());
+                };
+                dump("widget", widget);
+                for (uint32_t o : { 12u, 16u, 20u })
+                {
+                    const uint32_t part = Guest::Read32(base, widget + o);
+                    if (part >= 0x40000000u && part < 0xA0000000u) dump(o == 12 ? "hudammo" : o == 16 ? "clipammo" : "totalammo", part);
+                }
+                fflush(stdout);
+            }
+        }
+        if (!hide && !g_ammoHidden) return;
+        // 0.5.724: 723's dump: +4 is a float (1.0), not what shows them. The box
+        // (hudammo, an image) has its place at +20/+24 and two colours at +64/+68;
+        // the numbers (clipammo, totalammo, texts) their place at +44/+48 and two
+        // colours at +92/+96 (RGBA: 8FB1C9FF). Hidden: the colours' alpha 0 and
+        // the place 2000 lower (off the 640 x 480 layout); both put back after.
+        static uint32_t saved[3][3] = {};   // the two colours and the height of each
+        for (int k = 0; k < 3; k++)
+        {
+            const uint32_t part = Guest::Read32(base, widget + Parts[k]);
+            if (part < 0x40000000u || part >= 0xA0000000u) continue;
+            const bool box = k == 0;
+            const uint32_t colourA = part + (box ? 64 : 92), colourB = part + (box ? 68 : 96), height = part + (box ? 24 : 48);
+            if (hide)
+            {
+                if (!g_ammoHidden) { saved[k][0] = Guest::Read32(base, colourA); saved[k][1] = Guest::Read32(base, colourB); saved[k][2] = Guest::Read32(base, height); }
+                Guest::Write32(base, colourA, Guest::Read32(base, colourA) & 0xFFFFFF00u);
+                Guest::Write32(base, colourB, Guest::Read32(base, colourB) & 0xFFFFFF00u);
+                float y; const uint32_t was = saved[k][2]; memcpy(&y, &was, 4);
+                WriteFloat(base, height, y + 2000.0f);
+            }
+            else if (g_ammoHidden)
+            {
+                Guest::Write32(base, colourA, saved[k][0]);
+                Guest::Write32(base, colourB, saved[k][1]);
+                Guest::Write32(base, height, saved[k][2]);
+            }
+        }
+        if (hide != g_ammoHidden) { printf("flamethrower: the ammunition counter %s\n", hide ? "hidden" : "back"); fflush(stdout); }
+        g_ammoHidden = hide;
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_824F2A70);
+PPC_FUNC(sub_824F2A70)
+{
+    const uint32_t widget = ctx.r3.u32;
+    __imp__sub_824F2A70(ctx, base);
+    g_ammoWidget.store(widget);
+    g_ammoHidden = false;   // (its parts are new)
+}
+extern "C" PPC_FUNC(__imp__sub_824FAD20);
+PPC_FUNC(sub_824FAD20)
+{
+    __imp__sub_824FAD20(ctx, base);
+    AmmoWidgetHide(base);
+}
+
+// bots.cpp's ClientThink hook: a player with an overheated M2 fires no more
+bool MpFixesFlameOverheated(uint8_t* base, uint32_t entity)
+{
+    const uint32_t entities = Guest::Read32(base, 0x82BCC7FC);
+    for (uint32_t c = 0; entities && c < MpCapClients && c < 64; c++)
+        if (Guest::Read32(base, entities + 4 * (c + 1)) == entity) return g_flameHeat[c].over && g_flameHeat[c].entity == entity;
+    return false;
+}
+
+void MpFixesFlameView(uint8_t* base, uint32_t held, uint32_t ps)
+{
+    (void)ps;
+    {
+        const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+        FlameHeatTick(base, list ? Guest::Read32(base, list + 4) : 0);   // 0.5.720
+        AmmoWidgetHide(base);   // 0.5.722
+    }
+    static int32_t flame = -1;
+    if (flame < 0)
+        for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
+            if (strcmp(Guns[i].name, "flamethrower") == 0) flame = int32_t(i);
+    if (flame < 0) return;
+    const bool holding = g_campaignWeapon[flame] > 0 && held == uint32_t(g_campaignWeapon[flame]);
+    // 0.5.709: World at War's arms while it is held (PlayFlameArms), its pullout as it comes out
+    if (holding && !g_flameArmsHeld.load()) g_flameRaisedAt.store(ReloadClock());
+    g_flameArmsHeld.store(holding);
+    Flame::Held(holding);
+    Flame::Tick();
+    if (getenv("COD3_FLAME_NO_VIEW")) return;
+    std::lock_guard<std::mutex> guard(g_bodyLock);
+    static const uint32_t Fields[] = { 28, 0x40 + 88, 0x40 + 104, 0x138 + 24, 0x138 + 28, 0x158 + 24, 0x158 + 28 };
+    constexpr size_t FieldCount = sizeof(Fields) / sizeof(Fields[0]);
+    static std::map<uint32_t, std::array<uint32_t, FieldCount>> saved;   // each Thompson body's own
+    static std::map<uint32_t, std::array<uint32_t, 4>> partSaved;          // each hidden part's counts
+    static bool said = false;
+    if (holding && !g_tommyBodies.empty() && !MakeFlameView(base, g_tommyBodies.front()))
+    {
+        if (!said) { said = true; printf("flamethrower: held, but its view could not be made: the Thompson's is drawn\n"); fflush(stdout); }
+        return;
+    }
+    for (size_t b = 0; b < g_tommyBodies.size();)
+    {
+        const uint32_t body = g_tommyBodies[b];
+        if (Guest::Read32(base, body + 0x40 + 80) != body + 0x138 || Guest::Read32(base, body + 0x40 + 96) != body + 0x158)
+        { saved.erase(body); g_tommyBodies.erase(g_tommyBodies.begin() + long(b)); continue; }
+        std::array<uint32_t, FieldCount> now{}, ours{};
+        for (size_t f = 0; f < FieldCount; f++) now[f] = Guest::Read32(base, body + Fields[f]);
+        const uint32_t vword = now[4];
+        ours = { g_flameBuffers.indexCount / 3, g_flameBuffers.vertexCount, g_flameBuffers.indexCount,
+                 g_flameBuffers.vertices | (now[3] & 3u),
+                 (vword & ~(0xFFFFFFu << 2)) | ((g_flameBuffers.vertexCount * 13u & 0xFFFFFFu) << 2),
+                 g_flameBuffers.indices, g_flameBuffers.indexCount * 2 };
+        const bool isOurs = g_flameBuffers.vertices && now == ours;
+        if (!saved.count(body) || (!isOurs && now != saved[body])) saved[body] = now;
+        const auto& want = holding && g_flameBuffers.vertices ? ours : saved[body];
+        if (now != want) for (size_t f = 0; f < FieldCount; f++) Guest::Write32(base, body + Fields[f], want[f]);
+        b++;
+    }
+    static const uint32_t HideFields[] = { 28, 0x40 + 88, 0x40 + 104, 0x158 + 28 };
+    for (size_t p = 0; p < g_tommyParts.size();)
+    {
+        const uint32_t part = g_tommyParts[p];
+        if (Guest::Read32(base, part + 0x40 + 96) != part + 0x158) { partSaved.erase(part); g_tommyParts.erase(g_tommyParts.begin() + long(p)); continue; }
+        std::array<uint32_t, 4> now{};
+        for (int f = 0; f < 4; f++) now[f] = Guest::Read32(base, part + HideFields[f]);
+        const std::array<uint32_t, 4> none{};
+        if (!partSaved.count(part) || (now != none && now != partSaved[part])) partSaved[part] = now;
+        const std::array<uint32_t, 4> want = holding && g_flameBuffers.vertices ? none : partSaved[part];
+        if (now != want) for (int f = 0; f < 4; f++) Guest::Write32(base, part + HideFields[f], want[f]);
+        p++;
+    }
+    static bool wasHolding = false;
+    if (holding != wasHolding)
+    {
+        wasHolding = holding;
+        printf("flamethrower: %s (%zu Thompson bodies, %zu parts hidden)\n", holding ? "in hand: World at War's M2 drawn in the Thompson's place" : "put away: the Thompson's own view back",
+               g_tommyBodies.size(), g_tommyParts.size());
+        fflush(stdout);
+    }
+    // COD3_FLAME_SHOTS="12 20": screenshots that many seconds after first held
+    if (const char* shots = getenv("COD3_FLAME_SHOTS"))
+    {
+        static std::vector<double> at; static bool parsed = false; static bool started = false; static std::chrono::steady_clock::time_point since;
+        if (!parsed) { parsed = true; for (const char* t = shots; *t;) { char* end; const double v = strtod(t, &end); if (end == t) break; at.push_back(v); t = end; } }
+        if (holding && !started) { started = true; since = std::chrono::steady_clock::now(); }
+        if (started)
+        {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+            for (size_t i = 0; i < at.size(); i++)
+                if (now >= at[i]) { Overlay::RequestScreenshot(); printf("flamethrower: screenshot at %.1f s held\n", now); fflush(stdout); at.erase(at.begin() + long(i)); break; }
+        }
     }
 }
 
@@ -9724,6 +15432,21 @@ PPC_FUNC(sub_82486BF8)
             Guest::Write32(base, def + 1452, uint32_t(want));
             printf("weapons: %d %s (class %u): clip %u, start %u -> %u, max %u -> %u (clip ammo #%u, reserve #%u)\n", k, name.c_str(), Guest::Read32(base, def + 176), clip,
                    start, Guest::Read32(base, def + 1452), most, Guest::Read32(base, def + 1472), Guest::Read32(base, def + 1468), Guest::Read32(base, def + 1460));
+        }
+        fflush(stdout);
+    }
+    {   // 0.5.499: every weapon's clip size (+1476) and clip and ammunition pools
+        // (+1468, +1460), one line each (user: the MG42 and the FG42 fire 4-5
+        // rounds and must reload; the mines and rifle grenades above are held
+        // to 4 by pool, so a gun sharing their pool would do just that)
+        const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+        const uint32_t list = Guest::Read32(base, 0x82BCBF9C);
+        for (int32_t k = 1; list && k <= count && k < 128; k++)
+        {
+            const uint32_t def = Guest::Read32(base, list + 4 * uint32_t(k));
+            if (!def) continue;
+            printf("weapons: pool %d %s: clip size %u, clip pool #%u, ammo pool #%u, max %u\n", k, ReadText(base, Guest::Read32(base, def + 8), 32).c_str(),
+                   Guest::Read32(base, def + 1476), Guest::Read32(base, def + 1468), Guest::Read32(base, def + 1460), Guest::Read32(base, def + 1472));
         }
         fflush(stdout);
     }
@@ -9845,6 +15568,29 @@ PPC_FUNC(sub_82556868)
                 }
             }
         }
+        if (MpFixesHellfireQuiet(text)) { ctx.r3.u64 = 0; return; }   // 0.5.448
+        {
+            // 0.5.468: the sounds asked for most, every 10 s (0.5.467's Rouen
+            // game sank to 8 fps under 100 to 500 sounds going at once)
+            static std::mutex countLock;
+            static std::map<std::string, int> counts;
+            static uint64_t lastTold = 0;
+            std::lock_guard<std::mutex> guard(countLock);
+            counts[text]++;
+            const uint64_t now = GetTickCount64();
+            if (now - lastTold >= 10000)
+            {
+                lastTold = now;
+                std::vector<std::pair<int, std::string>> top;
+                for (const auto& c : counts) top.push_back({ c.second, c.first });
+                std::sort(top.begin(), top.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                printf("sounds: the last 10 s, most asked for:");
+                for (size_t k = 0; k < top.size() && k < 6; k++) printf(" %s x%d", top[k].second.c_str(), top[k].first);
+                printf("\n");
+                fflush(stdout);
+                counts.clear();
+            }
+        }
         static std::set<std::string> seen;
         static std::mutex lock;
         {
@@ -9885,9 +15631,453 @@ PPC_FUNC(sub_820B00C0)
         static std::mutex lock;
         const std::string name = ReadText(base, ctx.r4.u32, 64);
         std::lock_guard<std::mutex> guard(lock);
-        if (seen.size() < 4000 && seen.insert(name).second) printf("assets: %s (from %08X)\n", name.c_str(), uint32_t(ctx.lr));
+        // 0.5.774: the vehicles' effects past the 4000 (the shells' explosions:
+        // the log was full long before the first shot, test seelowfx4)
+        std::string l = name;
+        for (char& c : l) c = char(tolower(static_cast<unsigned char>(c)));
+        const bool vehicleFx = l.rfind("tank_", 0) == 0 || l.rfind("projexplode", 0) == 0 || l.rfind("weapon/", 0) == 0 ||
+                               l.rfind("mf_sherman", 0) == 0 || l.rfind("mf_panzer", 0) == 0 || l.rfind("vexplode", 0) == 0;
+        if ((seen.size() < 4000 || vehicleFx) && seen.insert(name).second) printf("assets: %s (from %08X)\n", name.c_str(), uint32_t(ctx.lr));
     }
     __imp__sub_820B00C0(ctx, base);
+}
+
+// 0.5.812: an effect looked up by name (sub_824402C8: sub_82474FD8(category 9,
+// the scope archive *(*0x82BCC828+40), its key); 0 = not found, no effect):
+// the vehicles' and the mortar's effects logged with what came back and the
+// scope they were looked for in (the user: "i wanna see the explosion when i
+// shoot a round with my tank").
+extern "C" PPC_FUNC(__imp__sub_824402C8);
+PPC_FUNC(sub_824402C8)
+{
+    const uint32_t nameAt = ctx.r3.u32;
+    const uint32_t holder = Guest::Read32(base, 0x82BCC828);
+    const uint32_t scope = holder >= 0x40000000u && holder < 0xA0000000u ? Guest::Read32(base, holder + 40) : 0xFFFFFFFFu;
+    const PPCContext asked = ctx;
+    __imp__sub_824402C8(ctx, base);
+    // 0.5.813: not found while the scope is the vehicles' database pack (a tank
+    // gun's events are made there, sub_82554BA0): looked for again in the
+    // vehicles' effects pack, where the tanks' effects are (mf_panzerIV_dirt_w,
+    // tank_dirt/mud/metal/...: dual4's "mf_panzeriv_dirt_w ... archive 6: NOT
+    // FOUND", so the muzzle blast and the shell's explosion were never drawn)
+    bool again = false;
+    // 0.5.814: tankboom3: still NOT FOUND in the effects pack (archive
+    // g_vehicleFxArchive). Each archive in turn, once per name, the one that
+    // has it remembered and used (logged), else nothing.
+    static std::map<std::string, int32_t> where;
+    if (ctx.r3.u32 == 0 && nameAt && holder >= 0x40000000u && holder < 0xA0000000u && g_vehicleArchive >= 0)
+    {
+        std::string n = ReadText(base, nameAt, 64);
+        for (char& c : n) c = char(tolower(static_cast<unsigned char>(c)));
+        if (n.rfind("tank_", 0) == 0 || n.rfind("mf_", 0) == 0)
+        {
+            auto it = where.find(n);
+            std::vector<int32_t> tries;
+            if (it != where.end()) { if (it->second >= 0) tries.push_back(it->second); }
+            else
+            {
+                if (g_vehicleFxArchive >= 0) tries.push_back(g_vehicleFxArchive);
+                for (int32_t k = 0; k < 64; k++) if (k != g_vehicleFxArchive && uint32_t(k) != scope) tries.push_back(k);
+            }
+            int32_t got = -1;
+            for (int32_t k : tries)
+            {
+                PPCContext retry = asked;
+                Guest::Write32(base, holder + 40, uint32_t(k));
+                __imp__sub_824402C8(retry, base);
+                Guest::Write32(base, holder + 40, scope);
+                if (retry.r3.u32) { ctx.r3.u64 = retry.r3.u64; again = true; got = k; break; }
+            }
+            // 0.5.815: once: each archive's lookup table, its categories' counts
+            // (sub_820CFF58: object +8 categories, +12 their 32-byte records,
+            // a record's +24 its entries), to see where the effects pack's are
+            static bool dumped = false;
+            if (!dumped && got < 0)
+            {
+                dumped = true;
+                const uint32_t manager = Guest::Read32(base, 0x82BCC824);
+                {
+                    std::string raw;
+                    char t[24];
+                    for (uint32_t k = 0; manager && k < 24; k++) { snprintf(t, sizeof t, " %u:%08X", k, Guest::Read32(base, manager + 4 * (k + 13))); raw += t; }
+                    printf("effects: the asset manager %08X, its archives' slots:%s (the vehicles' effects %d, database %d)\n", manager, raw.c_str(), g_vehicleFxArchive, g_vehicleArchive);
+                }
+                for (uint32_t k = 0; manager && k < 32; k++)
+                {
+                    const uint32_t obj = Guest::Read32(base, manager + 4 * (k + 13));
+                    if (obj < 0x40000000u || obj >= 0xA0000000u) continue;
+                    const uint32_t cats = Guest::Read32(base, obj + 8), recs = Guest::Read32(base, obj + 12);
+                    std::string line;
+                    for (uint32_t c = 0; recs >= 0x40000000u && recs < 0xA0000000u && c < cats && c < 40; c++)
+                    {
+                        const uint32_t n2 = Guest::Read32(base, recs + 32 * c + 24);
+                        if (n2) line += " c" + std::to_string(c) + "=" + std::to_string(n2);
+                    }
+                    printf("effects: archive %u (object %08X): %u categories:%s\n", k, obj, cats, line.c_str());
+                }
+                fflush(stdout);
+            }
+            // 0.5.820: Merville's tank effects cannot be had on another map: effects
+            // are made and registered only from the level's own archive (fxlist1,
+            // tankboom5-19: never from an archive loaded beside it). The shell's
+            // hit is made with the game's own heavy explosion that this level has,
+            // the artillery's (artillery_<surface>, as the mortar's on Seelow), and
+            // the gun's blast with the bazooka's; looked for in the map's archive.
+            if (got < 0 && g_mapArchive >= 0)
+            {
+                std::vector<std::string> stand;
+                if (n.rfind("tank_", 0) == 0 && n != "tank_shell_trail")
+                    stand = { "artillery_" + n.substr(5), "artillery_dirt", "artillery_generic" };
+                else if (n.rfind("mf_", 0) == 0)
+                    stand = { "mf_bazooka_w", "mf_panzerschreck_w", "mf_bazooka_v" };
+                static std::map<std::string, uint32_t> texts;
+                for (const std::string& name : stand)
+                {
+                    uint32_t& text = texts[name];
+                    if (!text) { text = Guest::AllocatePhysical(0x40); memset(base + text, 0, 0x40); memcpy(base + text, name.c_str(), std::min<size_t>(name.size(), 0x3F)); }
+                    PPCContext retry = asked;
+                    retry.r3.u64 = text;
+                    Guest::Write32(base, holder + 40, uint32_t(g_mapArchive));
+                    __imp__sub_824402C8(retry, base);
+                    Guest::Write32(base, holder + 40, scope);
+                    if (retry.r3.u32)
+                    {
+                        ctx.r3.u64 = retry.r3.u64; again = true;
+                        static std::set<std::string> told;
+                        if (told.insert(n).second) { printf("effects: %s made with this level's %s\n", n.c_str(), name.c_str()); fflush(stdout); }
+                        break;
+                    }
+                }
+                if (again) { where.emplace(n, -1); return; }
+            }
+            if (it == where.end())
+            {
+                where[n] = got;
+                printf("effects: %s not in archive %d: %s (the vehicles' effects pack is %d)\n", n.c_str(), int32_t(scope),
+                       got >= 0 ? ("found in archive " + std::to_string(got)).c_str() : "in NO archive", g_vehicleFxArchive);
+                fflush(stdout);
+            }
+        }
+    }
+    if (!nameAt) return;
+    std::string l = ReadText(base, nameAt, 64);
+    for (char& c : l) c = char(tolower(static_cast<unsigned char>(c)));
+    // 0.5.819: COD3_ALL_EFFECTS=1: every effect looked up, once each
+    static const bool allEffects = getenv("COD3_ALL_EFFECTS") != nullptr;
+    if (!allEffects && l.rfind("tank_", 0) != 0 && l.find("mortar") == std::string::npos && l.find("81mm") == std::string::npos && l.rfind("mf_", 0) != 0) return;
+    static std::set<std::string> said;
+    const std::string key = l + (ctx.r3.u32 ? "+" : "-") + std::to_string(scope);
+    if (said.size() < 300 && said.insert(key).second)
+    {
+        printf("effects: %s looked up in archive %d: %s (%08X)\n", l.c_str(), int32_t(scope),
+               again ? "found in the vehicles' effects pack" : ctx.r3.u32 ? "found" : "NOT FOUND", ctx.r3.u32);
+        // 0.5.818: what a found effect's handle is: its first words, and the name
+        // its first word points at (a resource's own name record: hash, name)
+        if (ctx.r3.u32 >= 0x40000000u && ctx.r3.u32 < 0xC0000000u)
+        {
+            const uint32_t h = ctx.r3.u32, w0 = Guest::Read32(base, h);
+            printf("effects:   handle %08X: %08X %08X %08X %08X; first word's name '%s'\n", h, w0, Guest::Read32(base, h + 4), Guest::Read32(base, h + 8),
+                   Guest::Read32(base, h + 12), w0 >= 0x40000000u && w0 < 0xC0000000u ? ReadText(base, w0 + 4, 28).c_str() : "-");
+        }
+        fflush(stdout);
+    }
+}
+
+// 0.5.688: DIAGNOSTIC for the Carentan level work (COD3_TEXLOOKUP=1): the
+// texture lookup by name that a material's TEX import goes through
+// (sub_824784B8's TEX branch -> sub_82477E70(scope, name object: u32 hash,
+// then the text) -> sub_82474FD8 category 0 in the scope's indexes; nothing
+// found gives the default texture). Logs our converted textures' names (c2*)
+// and the first 30 others: the scope, the hash and what came back.
+// a gun's own icon image by its name (made from its source's when not yet; 0: not one)
+static uint32_t OwnIconFor(uint8_t* base, const PPCContext& at, uint32_t scope, const std::string& name);
+extern "C" PPC_FUNC(__imp__sub_82477E70);
+PPC_FUNC(sub_82477E70)
+{
+    static const bool on = [] { const char* t = getenv("COD3_TEXLOOKUP"); return t && t[0] == '1'; }();
+    const uint32_t scope = ctx.r3.u32, nameObj = ctx.r4.u32, caller = uint32_t(ctx.lr);
+    __imp__sub_82477E70(ctx, base);
+    // 0.5.693: the Webley's own icon. 0.5.692's test (logs-backup/20261101-130413-webley-
+    // iconname692b): the kill feed and HUD look hud_webley up here, ~100 times a match, from
+    // 824409C0 (scope 0) and 82440A18 (scope 0xC); nothing had that name, so 0 came back:
+    // the white box. For the Colt this returns the image object (hud_colt45 -> 5E5B41E4)
+    // that MakeWebleyIcon copies, so the copy, which draws CoD2's picture, is the answer.
+    // 0.5.696: any gun's own icon (OwnIcon: the flamethrower's too). 0.5.697: made
+    // here if no image look-up made it yet (the flamethrower's never came that way)
+    if (ctx.r3.u32 == 0 && nameObj)
+        if (const uint32_t own = OwnIconFor(base, ctx, scope, ReadText(base, nameObj + 4, 32))) ctx.r3.u64 = own;
+    if (!on)
+        return;
+    const uint32_t hash = nameObj ? Guest::Read32(base, nameObj) : 0;
+    const std::string name = nameObj ? ReadText(base, nameObj + 4, 64) : std::string();
+    // 0.5.692: COD3_TEXLOOKUP_PREFIX (default c2) picks the names logged in full
+    // (e.g. hud: does the kill feed's icon name come this way), with the caller
+    static const std::string prefix = [] { const char* t = getenv("COD3_TEXLOOKUP_PREFIX"); return std::string(t && t[0] ? t : "c2"); }();
+    static int others = 0, ours = 0;
+    const bool mine = name.rfind(prefix, 0) == 0;
+    if ((mine && ours++ < 200) || (!mine && others++ < 30))
+    {
+        printf("texlookup: %s hash %08X scope %08X -> %08X (from %08X)\n", name.c_str(), hash, scope, ctx.r3.u32, caller);
+        fflush(stdout);
+    }
+}
+
+// 0.5.689: the same diagnostic, the binding side: the TEX resource handler
+// (sub_82476F38, r3 the texture's description, r4 its pack: makes the GPU
+// texture, then binds the name in the current scope's indexes) and the
+// category-0 bind it calls (sub_824750C0, r4 0, r5 scope, r6 name object,
+// r7 the texture).
+extern "C" PPC_FUNC(__imp__sub_82476F38);
+PPC_FUNC(sub_82476F38)
+{
+    static const bool on = [] { const char* t = getenv("COD3_TEXLOOKUP"); return t && t[0] == '1'; }();
+    const uint32_t desc = ctx.r3.u32, entry = ctx.r4.u32;
+    const uint32_t nameRec = on && entry ? Guest::Read32(base, entry) : 0;
+    const std::string name = nameRec ? ReadText(base, nameRec + 4, 28) : std::string();
+    __imp__sub_82476F38(ctx, base);
+    if (on)
+    {
+        static int ours = 0, others = 0;
+        const bool mine = name.rfind("c2", 0) == 0;
+        if ((mine && ours++ < 80) || (!mine && others++ < 20))
+        {
+            // The handler's r3 is the block descriptor, r4 its type entry.
+            // Resolve the same image part as the original, without modifying it.
+            uint32_t image = 0;
+            const uint32_t regions = Guest::Read32(base, desc + 8);
+            const uint32_t regionList = Guest::Read32(base, desc + 12);
+            for (uint32_t i = 0; i < regions && i < 8; ++i)
+            {
+                const uint32_t rec = regionList + 24 * i;
+                const uint32_t nm = Guest::Read32(base, rec);
+                if (ReadText(base, nm + 4, 28) == "image")
+                {
+                    // Each type maps region to a part at +20 in the type record.
+                    for (uint32_t ty = Guest::Read32(base, desc + 16), n = 0;
+                         ty && Guest::Read32(base, ty) && n < 16;
+                         ty += 4 * (regions + 5), ++n)
+                    {
+                        const uint32_t count = Guest::Read32(base, ty + 16);
+                        const uint32_t start = Guest::Read32(base, ty + 12);
+                        const uint32_t stride = 4 * (Guest::Read32(base, ty + 8) + 1);
+                        if (entry >= start && entry < start + count * stride)
+                        {
+                            const uint32_t which = Guest::Read8(base, ty + 20 + 4 * i);
+                            if (which != 255) image = Guest::Read32(base, entry + 4 * (which + 1));
+                            break;
+                        }
+                    }
+                }
+            }
+            printf("texhandler: %s desc %08X entry %08X image %08X\n", name.c_str(), desc, entry, image);
+            fflush(stdout);
+        }
+    }
+}
+
+extern "C" PPC_FUNC(__imp__sub_824750C0);
+PPC_FUNC(sub_824750C0)
+{
+    static const bool on = [] { const char* t = getenv("COD3_TEXLOOKUP"); return t && t[0] == '1'; }();
+    if (!on || ctx.r4.u32 != 0)
+    {
+        __imp__sub_824750C0(ctx, base);
+        return;
+    }
+    const uint32_t scope = ctx.r5.u32, nameObj = ctx.r6.u32, value = ctx.r7.u32;
+    const std::string name = nameObj ? ReadText(base, nameObj + 4, 64) : std::string();
+    __imp__sub_824750C0(ctx, base);
+    static int ours = 0, others = 0;
+    const bool mine = name.rfind("c2", 0) == 0;
+    if ((mine && ours++ < 60) || (!mine && others++ < 20))
+    {
+        printf("texbind: %s scope %08X texture %08X -> %08X\n", name.c_str(), scope, value, ctx.r3.u32);
+        fflush(stdout);
+    }
+}
+
+// 0.5.672: DIAGNOSTIC for the Webley's reload, the arms' pose. The frame's
+// pose jobs (sub_8250EFF0: count at 0x82BCBEFC, 820-byte jobs from
+// 0x82B4F828) each have sub_82186740 (r3 the animated model, r4 its part,
+// r5 the pose to fill, r6 the part's index) fill one pose: a 64-byte local
+// transform a bone (the bone count at *(r3+100) + 20 * r6), each started
+// from the default at 0x82A84660 and then blended from the animations.
+// COD3_POSE_DUMP=1: from 20 s into the run, each model part's first pose is
+// written once to custom\webley\dump\pose_<n>.bin (u32 r3, r4, r5, r6, the
+// bone count; 0x200 bytes of r3, 0x40 of r4, the 20-byte table entry, the
+// 64-byte default, the pose; then each of r3's first 128 words that is a
+// guest address, with 0x100 bytes from it), with the names found logged,
+// to find the view arms and learn the pose's layout. At most 60.
+extern "C" PPC_FUNC(__imp__sub_82186740);
+PPC_FUNC(sub_82186740)
+{
+    static const bool want = getenv("COD3_POSE_DUMP") != nullptr;
+    const uint32_t model = ctx.r3.u32, part = ctx.r4.u32, pose = ctx.r5.u32, index = ctx.r6.u32;
+    __imp__sub_82186740(ctx, base);
+    // 0.5.673: the Webley's reload on the first-person arms (the skeleton
+    // named viewmodel_hands, its name at +0x0C; PlayWebleyReload)
+    if (const double began = g_webleyReloadAt.load(); began >= 0 && g_webleyHeld.load() && model >= 0x40000000u && model < 0xA0000000u && index == 0)
+    {
+        const double t = ReloadClock() - began;
+        const WebleyReloadTable* table = ReloadTable();
+        if (table && t > (table->frames - 1) / double(table->fps)) g_webleyReloadAt.store(-1.0);
+        else if (table && ReadText(base, model + 0x0C, 32) == "colt")
+        {
+            // 0.5.675: the Colt's own reload (its gun animation, playing under
+            // the Webley) does not move the gun's bones: they keep the pose
+            // they had before the reload (WebleyColtPose)
+            WebleyColtPose(base, pose, true);
+        }
+        else if (table && ReadText(base, model + 0x0C, 32) == "viewmodel_hands")
+        {
+            const uint32_t list = Guest::Read32(base, model + 100);
+            const uint32_t bones = (list >= 0x40000000u && list < 0xA0000000u) ? Guest::Read32(base, list) : 0;
+            PlayWebleyReload(base, pose, bones, t);
+            static int told = 0;
+            if (told < 3) { told++; printf("webley reload: arms pose %08X (%u bones) played at %.2f s\n", pose, bones, t); fflush(stdout); }
+        }
+    }
+    // 0.5.675: the Colt's gun pose kept while no reload of the Webley plays
+    else if (g_webleyHeld.load() && model >= 0x40000000u && model < 0xA0000000u && index == 0 && ReadText(base, model + 0x0C, 32) == "colt")
+        WebleyColtPose(base, pose, false);
+    // 0.5.709: World at War's flamethrower animations on the arms, the
+    // Thompson gun (the M2's body) held at rest
+    if (g_flameArmsHeld.load() && model >= 0x40000000u && model < 0xA0000000u && index == 0)
+    {
+        const std::string name = ReadText(base, model + 0x0C, 32);
+        const uint32_t list = Guest::Read32(base, model + 100);
+        const uint32_t bones = (list >= 0x40000000u && list < 0xA0000000u) ? Guest::Read32(base, list) : 0;
+        if (name == "viewmodel_hands") PlayFlameArms(base, pose, bones);
+        else if (name.find("thom") != std::string::npos || name.find("tommy") != std::string::npos) HoldFlameGun(base, pose, bones);
+        static std::set<std::string> seen;
+        if (seen.size() < 12 && seen.insert(name).second) { printf("flamethrower arms: a pose while held: \"%s\", %u bones\n", name.c_str(), bones); fflush(stdout); }
+    }
+    if (!want) return;
+    static const auto start = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - start < std::chrono::seconds(20)) return;
+    static std::set<uint64_t> seen;
+    static std::mutex lock;
+    std::lock_guard<std::mutex> guard(lock);
+    if (seen.size() >= 60 || !seen.insert((uint64_t(model) << 32) | index).second) return;
+    auto guest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+    if (!guest(model) || !guest(pose)) return;
+    const uint32_t table = Guest::Read32(base, model + 100);
+    const uint32_t bones = guest(table) ? std::min<uint32_t>(Guest::Read32(base, table + 20 * index), 256) : 0;
+    char path[MAX_PATH];
+    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    std::string dir(path);
+    dir = dir.substr(0, dir.find_last_of("\\/")) + "\\custom\\webley\\dump\\";
+    CreateDirectoryA(dir.c_str(), nullptr);
+    const size_t n = seen.size();
+    FILE* f = fopen((dir + "pose_" + std::to_string(n) + ".bin").c_str(), "wb");
+    if (!f) return;
+    auto word = [&](uint32_t v) { const uint8_t be[4] = { uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v) }; fwrite(be, 1, 4, f); };
+    auto put = [&](uint32_t from, uint32_t count) { for (uint32_t i = 0; i < count; i++) { const uint8_t b = Guest::Read8(base, from + i); fwrite(&b, 1, 1, f); } };
+    word(model); word(part); word(pose); word(index); word(bones);
+    put(model, 0x200); put(part, 0x40);
+    if (guest(table)) put(table + 20 * index, 20); else for (int i = 0; i < 5; i++) word(0);
+    put(0x82A84660, 64);
+    put(pose, bones * 64);
+    std::string names;
+    for (uint32_t i = 0; i < 128; i++)
+    {
+        const uint32_t a = Guest::Read32(base, model + 4 * i);
+        if (!guest(a)) continue;
+        word(i); word(a); put(a, 0x100);
+        std::string run;
+        for (uint32_t k = 0; k < 0x100; k++)
+        {
+            const char c = char(Guest::Read8(base, a + k));
+            if (c >= 32 && c < 127) run += c;
+            else { if (run.size() >= 6 && names.size() < 300) names += " +" + std::to_string(4 * i) + ":" + run; run.clear(); }
+        }
+    }
+    fclose(f);
+    printf("pose dump %zu: model %08X part %08X index %u, %u bones, pose %08X;%s\n", n, model, part, index, bones, pose, names.c_str());
+    fflush(stdout);
+}
+
+// 0.5.670: DIAGNOSTIC for the Webley's reload. COD3_ASSET_DUMP="usCOLT colt":
+// each asset whose name holds one of the words is logged and dumped to
+// custom\webley\dump\<name>.<how>.bin: 0x100 bytes of the object, then for
+// each of its words that is a guest address, the address and 0x3000 bytes
+// from it (u32 address, bytes; to the end), to learn .xeanim and .xeskel.
+// Two ways in (both in the asset handlers' table at 0x820A30F8..3108):
+// sub_82475550 (r3 name, r4 a new resource object) has the resource
+// manager (sub_8218DCC0: by the name's key, sub_82473110) find it or load
+// it into that object; sub_82475610 (r3 name, r4 value, r5 kind) puts a
+// value in its kind's table (*(0x82BCC824 + 4 * (kind + 13))).
+namespace
+{
+    bool AssetDumpWanted(const std::string& name)
+    {
+        static const std::vector<std::string> words = [] {
+            std::vector<std::string> w;
+            std::istringstream in(getenv("COD3_ASSET_DUMP") ? getenv("COD3_ASSET_DUMP") : "");
+            for (std::string t; in >> t;) { for (char& c : t) c = char(tolower((unsigned char)c)); w.push_back(t); }
+            return w;
+        }();
+        std::string lower = name;
+        for (char& c : lower) c = char(tolower((unsigned char)c));
+        for (const std::string& w : words) if (lower.find(w) != std::string::npos) return true;
+        return false;
+    }
+    void AssetDump(uint8_t* base, const std::string& name, const char* how, uint32_t object)
+    {
+        static std::set<std::string> done;
+        static std::mutex lock;
+        std::lock_guard<std::mutex> guard(lock);
+        if (!done.insert(name + "#" + how).second) return;
+        auto guest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+        printf("asset dump: %s (%s) object %08X:", name.c_str(), how, object);
+        for (uint32_t i = 0; guest(object) && i < 32; i++) printf(" %08X", Guest::Read32(base, object + 4 * i));
+        printf("\n");
+        fflush(stdout);
+        if (!guest(object)) return;
+        char path[MAX_PATH];
+        GetModuleFileNameA(nullptr, path, MAX_PATH);
+        std::string dir(path);
+        dir = dir.substr(0, dir.find_last_of("\\/")) + "\\custom\\webley\\dump\\";
+        CreateDirectoryA(dir.c_str(), nullptr);
+        std::string file = name;
+        for (char& c : file) if (c == '\\' || c == '/' || c == ':') c = '_';
+        FILE* f = fopen((dir + file + "." + how + ".bin").c_str(), "wb");
+        if (!f) return;
+        auto put = [&](uint32_t from, uint32_t n) { for (uint32_t i = 0; i < n; i++) { const uint8_t b = Guest::Read8(base, from + i); fwrite(&b, 1, 1, f); } };
+        put(object, 0x100);
+        for (uint32_t i = 0; i < 64; i++)
+        {
+            const uint32_t a = Guest::Read32(base, object + 4 * i);
+            if (!guest(a) || a == object) continue;
+            const uint8_t be[4] = { uint8_t(a >> 24), uint8_t(a >> 16), uint8_t(a >> 8), uint8_t(a) };
+            fwrite(be, 1, 4, f);
+            put(a, 0x3000);
+        }
+        fclose(f);
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_82475550);
+PPC_FUNC(sub_82475550)
+{
+    const uint32_t nameAt = ctx.r3.u32, object = ctx.r4.u32;
+    __imp__sub_82475550(ctx, base);
+    if (nameAt)
+    {
+        const std::string name = ReadText(base, nameAt, 96);
+        if (AssetDumpWanted(name)) AssetDump(base, name, "made", object);
+        MervilleLoadLog("made", name, object, 0);   // 0.5.763
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_82475610);
+PPC_FUNC(sub_82475610)
+{
+    if (ctx.r3.u32)
+    {
+        const std::string name = ReadText(base, ctx.r3.u32, 96);
+        if (AssetDumpWanted(name)) AssetDump(base, name, ("kind" + std::to_string(ctx.r5.u32)).c_str(), ctx.r4.u32);
+        MervilleLoadLog("put", name, ctx.r4.u32, ctx.r5.u32);   // 0.5.763
+    }
+    __imp__sub_82475610(ctx, base);
 }
 
 extern "C" PPC_FUNC(__imp__sub_824EE308);
@@ -9926,6 +16116,129 @@ PPC_FUNC(sub_824EE308)
     fflush(stdout);
 }
 
+// 0.5.677: THE WEBLEY'S OWN ICON (the kill feed's, +1860, and the HUD's,
+// +1440: hud_webley, CoD2's picture, custom\webley\hud_webley.png). No
+// archive has an image by that name, so the image look-up (below) is given
+// one made here: a copy of the Colt's (hud_colt45) whose texture (its fetch
+// constant, found in the image object: a texture's type 2 in its first word,
+// a known format and a size in the next two) points at a place of its own,
+// which the renderer draws CoD2's picture for (Render::SetTextureImage).
+// 0.5.696: the same for every gun with an icon of its own (OwnIcon): the
+// Webley's from the Colt's, the flamethrower's (World at War's
+// hud_m2_flamethrower) from the Thompson's, its name read from the gun.
+namespace
+{
+    struct OwnIcon { const char* name; std::string from; const char* dir; uint32_t image; int tries; };
+    // 0.5.697: the flamethrower's source named here too (hud_thompson, as 0.5.696 logged it)
+    OwnIcon g_ownIcons[] = { { "hud_webley", "hud_colt45", "webley", 0, 0 }, { "hud_m2_flamethrower", "hud_thompson", "flamethrower", 0, 0 },
+                             { "hud_scoped_nagant", "hud_scoped_kar98", "mosin", 0, 0 } };   // 0.5.726: CoD2's scoped Mosin
+    uint32_t& g_webleyIcon = g_ownIcons[0].image;
+}
+static void SetOwnIconSource(const char* name, const std::string& from)
+{
+    for (OwnIcon& icon : g_ownIcons) if (strcmp(icon.name, name) == 0 && icon.from.empty()) icon.from = from;
+}
+namespace
+{
+    std::string OwnIconPicture(const OwnIcon& icon)
+    {
+        std::string custom = WebleyDir();   // the custom folder: custom\webley less its last part
+        custom.resize(custom.size() - strlen("webley\\"));
+        return custom + icon.dir + "\\" + icon.name + ".png";
+    }
+
+    uint32_t MakeWebleyIcon(uint8_t* base, uint32_t colt, const OwnIcon& icon = g_ownIcons[0])
+    {
+        auto guest = [](uint32_t a) { return a >= 0x40000000u && a < 0xA0000000u; };
+        if (!guest(colt)) return 0;
+        // the fetch constant: in the image object, or in an object it points at
+        uint32_t holder = 0, at = 0;
+        auto look = [&](uint32_t object) -> bool
+        {
+            for (uint32_t o = 0; o + 24 <= 0x100; o += 4)
+            {
+                const uint32_t w0 = Guest::Read32(base, object + o), w1 = Guest::Read32(base, object + o + 4), w2 = Guest::Read32(base, object + o + 8);
+                const uint32_t format = w1 & 0x3F, width = (w2 & 0x1FFF) + 1, height = ((w2 >> 13) & 0x1FFF) + 1;
+                const bool known = format == 2 || format == 3 || format == 4 || format == 6 || format == 10 || format == 15 || format == 18 || format == 19 || format == 20;
+                if ((w0 & 3) == 2 && known && (w1 & 0xFFFFF000u) && width >= 8 && width <= 2048 && height >= 8 && height <= 2048) { holder = object; at = o; return true; }
+            }
+            return false;
+        };
+        bool inside = look(colt);
+        if (!inside)
+            for (uint32_t o = 0; o < 0x40 && !holder; o += 4)
+            {
+                const uint32_t p = Guest::Read32(base, colt + o);
+                if (guest(p) && p != colt) look(p);
+            }
+        if (!holder) { printf("webley icon: no texture found in the Colt's image %08X\n", colt); fflush(stdout); return 0; }
+        // 0.5.696: the texels in the title's physical memory: the game cuts a
+        // texture's address to 29 bits (0.5.695's log: 46050000 fetched as
+        // 06050000), so one in the extended window was fetched from elsewhere
+        const uint32_t image = Guest::AllocateExtended(0x1000), texels = Guest::AllocatePhysical(0x10000);
+        if (!image || !texels) return 0;
+        // 0.5.694: a word pointing into the Colt's image (+0x14: its own D3D
+        // header at +0x2C, which the draw binds: xetex.py tex_desc) points
+        // into the copy instead; left alone, the kill feed drew the Colt's.
+        uint32_t moved = 0;
+        for (uint32_t k = 0; k < 0x100; k += 4)
+        {
+            const uint32_t word = Guest::Read32(base, colt + k);
+            const bool self = word >= colt && word < colt + 0x100;
+            Guest::Write32(base, image + k, self ? image + (word - colt) : word);
+            if (self) moved |= 1u << (k / 4 & 31);
+        }
+        printf("own icon %s: words of %s's image pointing into it, moved to the copy: mask %08X\n", icon.name, icon.from.c_str(), moved);
+        uint32_t texture = image;
+        if (holder != colt)
+        {
+            // the texture object copied too, the copy's pointer to it moved
+            texture = image + 0x800;
+            for (uint32_t k = 0; k < 0x100; k += 4) Guest::Write32(base, texture + k, Guest::Read32(base, holder + k));
+            for (uint32_t o = 0; o < 0x40; o += 4) if (Guest::Read32(base, colt + o) == holder) Guest::Write32(base, image + o, texture);
+        }
+        const uint32_t gpu = Guest::GpuOffset(texels);
+        const uint32_t w1 = Guest::Read32(base, texture + at + 4), w5 = Guest::Read32(base, texture + at + 20);
+        Guest::Write32(base, texture + at + 4, (w1 & 0xFFFu) | gpu);
+        if (w5 & 0xFFFFF000u) Guest::Write32(base, texture + at + 20, (w5 & 0xFFFu) | gpu);
+        const std::string png = OwnIconPicture(icon);
+        Render::SetTextureImage(gpu, png.c_str());
+        printf("own icon %s: %s's image %08X copied to %08X (its texture's constant at +%X of %s), texels at %08X (GPU %08X): %s\n",
+               icon.name, icon.from.c_str(), colt, image, at, holder == colt ? "the image" : "the object it points at", texels, gpu, png.c_str());
+        fflush(stdout);
+        return image;
+    }
+}
+
+// 0.5.697: a gun's own icon for the name look-up (sub_82477E70, the kill
+// feed's), made from its source's image found the same way, in the same
+// scope, when no image look-up made it yet: 0.5.696's flamethrower icon was
+// never asked for through sub_824784B8 (a white box in the kill feed).
+static uint32_t OwnIconFor(uint8_t* base, const PPCContext& at, uint32_t scope, const std::string& name)
+{
+    for (OwnIcon& icon : g_ownIcons)
+    {
+        if (name != icon.name) continue;
+        if (!icon.image && !icon.from.empty() && icon.tries < 20)
+        {
+            icon.tries++;
+            PPCContext call = at;
+            call.r1.u32 = (at.r1.u32 - 0x800) & ~0xFu;
+            const uint32_t text = call.r1.u32 + 0x200, key = call.r1.u32 + 0x300;
+            for (uint32_t i = 0; i < 0x80; i += 4) Guest::Write32(base, text + i, 0);
+            for (uint32_t i = 0; i < icon.from.size() && i < 0x7F; i++) Guest::Write8(base, text + i, uint8_t(icon.from[i]));
+            call.r3.u64 = key; call.r4.u64 = text; call.lr = 0;
+            Guest::Lookup(0x820B00C0)(call, base);
+            call.r3.u64 = scope; call.r4.u64 = key; call.lr = 0;
+            __imp__sub_82477E70(call, base);
+            if (call.r3.u32) icon.image = MakeWebleyIcon(base, call.r3.u32, icon);
+            else { printf("own icon %s: %s not found in scope %08X\n", icon.name, icon.from.c_str(), scope); fflush(stdout); }
+        }
+        return icon.image;
+    }
+    return 0;
+}
+
 // The HUD's images (sub_824784B8: an archive key r3, the asset's type r4,
 // "TEX" 0x00584554 for an image): looked for in one archive only (the
 // current one, sub_8246F1A0), else the default image. The pick-up prompt's
@@ -9938,6 +16251,32 @@ PPC_FUNC(sub_824784B8)
 {
     PPCContext saved = ctx;
     __imp__sub_824784B8(ctx, base);
+    // 0.5.677: the Webley's icon (hud_webley): made from the Colt's (MakeWebleyIcon)
+    if (saved.r4.u32 == 0x00584554u && saved.r3.u32)
+    {
+        std::string key;
+        for (uint32_t i = 4; i < 32; i++) { const char c = char(Guest::Read8(base, saved.r3.u32 + i)); if (!c) break; key += char(tolower(static_cast<unsigned char>(c))); }
+        for (OwnIcon& icon : g_ownIcons)
+        {
+            if (key != icon.name) continue;
+            if (!icon.image && !icon.from.empty() && icon.tries < 20)
+            {
+                icon.tries++;
+                PPCContext call = saved;
+                call.r1.u32 = (saved.r1.u32 - 0x800) & ~0xFu;
+                const uint32_t text = call.r1.u32 + 0x200, fromKey = call.r1.u32 + 0x300;
+                for (uint32_t i = 0; i < 0x80; i += 4) Guest::Write32(base, text + i, 0);
+                for (uint32_t i = 0; i < icon.from.size() && i < 0x7F; i++) Guest::Write8(base, text + i, uint8_t(icon.from[i]));
+                call.r3.u64 = fromKey; call.r4.u64 = text; call.lr = 0;
+                Guest::Lookup(0x820B00C0)(call, base);
+                call.r3.u64 = fromKey; call.r4.u64 = 0x00584554u; call.lr = 0;
+                __imp__sub_824784B8(call, base);
+                if (call.r3.u32 && call.r3.u32 != Guest::Read32(base, 0x82A8C390)) icon.image = MakeWebleyIcon(base, call.r3.u32, icon);
+                else { printf("own icon %s: %s's image not found yet\n", icon.name, icon.from.c_str()); fflush(stdout); }
+            }
+            if (icon.image) { ctx.r3.u64 = icon.image; return; }
+        }
+    }
     if (saved.r4.u32 != 0x00584554u || !Settings::Get().campaignIcons) return;
     const uint32_t fallback = Guest::Read32(base, 0x82A8C390);
     if (ctx.r3.u32 != fallback && ctx.r3.u32 != 0) return;
@@ -9981,7 +16320,7 @@ namespace
     {
         std::string bare = Lower(name);
         if (bare.size() > 4 && bare.compare(bare.size() - 4, 4, ".tga") == 0) bare.resize(bare.size() - 4);
-        for (const CampaignGun& gun : Guns) if (bare == Lower(gun.hud)) return true;
+        for (const CampaignGun& gun : Guns) if (gun.hud && bare == Lower(gun.hud)) return true;   // 0.5.653: the Webley has none
         return false;
     }
     void ResolveCampaignIcons(PPCContext& ctx, uint8_t* base)
@@ -10102,10 +16441,51 @@ PPC_FUNC(sub_824EF868)
         const uint32_t object = weapon > 0 ? Guest::Read32(base, table + 52 + 4 * uint32_t(weapon)) : 0;
         if (object && object != hand && Guest::Read32(base, object + 40) > 0) { pattern = object; break; }
     }
+    // 0.5.678: the Webley's slot (the kill feed's and the HUD's icon for it):
+    // a copy of the Colt's icon object, its parts given the Webley's image
+    // (MakeWebleyIcon, from the Colt part's own image: CoD2's hud_webley)
+    // 0.5.691: COD3_WEBLEY_ICON_SLOT=1 does this slot copy alone, the names
+    // (+1860, +1440) left the Colt's: 0.5.680's white box came with both
+    // done at once, and a name look-up of hud_webley finds nothing
+    for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]) && !getenv("COD3_WEBLEY_COLT_ICON"); i++)
+    {
+        const int32_t weapon = g_campaignWeapon[i];
+        if (weapon <= 0 || strcmp(Guns[i].name, "webley") != 0) continue;
+        const int32_t count = int32_t(Guest::Read32(base, 0x82BCBF94));
+        const uint32_t defs = Guest::Read32(base, 0x82BCBF9C);
+        int32_t coltWeapon = 0;
+        for (int32_t k = 1; defs && k <= count && k < 128 && !coltWeapon; k++)
+        {
+            const uint32_t def = Guest::Read32(base, defs + 4 * uint32_t(k));
+            if (def && k != weapon && ReadText(base, Guest::Read32(base, def + 8), 32) == "colt") coltWeapon = k;
+        }
+        const uint32_t colt = coltWeapon ? Guest::Read32(base, table + 52 + 4 * uint32_t(coltWeapon)) : 0;
+        if (!colt || colt == hand || Guest::Read32(base, colt + 40) == 0) { printf("hud images: the Webley's icon: no Colt icon object (weapon %d, %08X)\n", coltWeapon, colt); continue; }
+        const uint32_t count2 = std::min<uint32_t>(Guest::Read32(base, colt + 40), 8);
+        const uint32_t copy = allocate(0x100), list = allocate(4 * count2 + 4);
+        if (!copy || !list) continue;
+        for (uint32_t k = 0; k < 0x100; k += 4) Guest::Write32(base, copy + k, Guest::Read32(base, colt + k));
+        const uint32_t from = Guest::Read32(base, colt + 32);
+        uint32_t picture = 0;
+        for (uint32_t k = 0; k < count2; k++)
+        {
+            const uint32_t part = allocate(104), was = Guest::Read32(base, from + 4 * k);
+            if (part && was)
+            {
+                for (uint32_t b = 0; b < 104; b += 4) Guest::Write32(base, part + b, Guest::Read32(base, was + b));
+                if (!g_webleyIcon) g_webleyIcon = MakeWebleyIcon(base, Guest::Read32(base, was + 100));
+                if (g_webleyIcon) { Guest::Write32(base, part + 100, g_webleyIcon); picture = g_webleyIcon; }
+            }
+            Guest::Write32(base, list + 4 * k, part);
+        }
+        Guest::Write32(base, copy + 32, list);
+        Guest::Write32(base, table + 52 + 4 * uint32_t(weapon), copy);
+        printf("hud images: weapon %d webley: icon object %08X (a copy of the Colt's %08X, weapon %d), image %08X on %u part(s)\n", weapon, copy, colt, coltWeapon, picture, count2);
+    }
     for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
     {
         const int32_t weapon = g_campaignWeapon[i];
-        if (weapon <= 0) continue;
+        if (weapon <= 0 || !Guns[i].hud) continue;   // 0.5.653: no icon of its own (the Webley): the copy's
         const uint32_t slot = table + 52 + 4 * uint32_t(weapon);
         uint32_t object = Guest::Read32(base, slot);
         const uint32_t picture = image(Guns[i].hud);
@@ -10228,7 +16608,9 @@ PPC_FUNC(sub_8212B268)
         std::string upper = cue;
         for (char& c : upper) c = char(toupper(static_cast<unsigned char>(c)));
         const std::string prefix = copy + "_FIRE_";
-        if (upper.rfind(prefix, 0) == 0)
+        // (a gun with no shot cue of its own, the Webley: its shots are CoD2's
+        // WAVs; 0.5.657 crashed here on its last shot)
+        if (gun.shot && upper.rfind(prefix, 0) == 0)
         {
             static std::map<std::string, uint32_t> swapped;
             static std::mutex lock;
@@ -10331,12 +16713,361 @@ PPC_FUNC(sub_8212AF78)
 // (sten as thompson), and while that event is made the copy's gunshot
 // cues become the campaign gun's own (THOMPSON_FIRE_1ST: STEN_FIRE_1ST, in
 // the campaign banks).
+// 0.5.792: a weapon's numbered event (sub_82555160: r3 the entity, r4 the
+// event's record, its weapon key at +500, r5 the event number) looks the
+// weapon's event set up in the MAP's event table (scope *(*0x82BCC828 + 40),
+// the map's archive; sub_8254D628) and makes each of its events
+// (sub_82554BA0). Seelow's table (Rouen's) has no tank guns, so a tank's shot
+// and its shell's hit made nothing (the user: shots silent, hits unseen;
+// 776-780's hand-made stand-ins never looked right). For a tank gun the scope
+// is Merville's game database (the vehicles' pack) for the whole call: its own
+// event sets play, the fire sounds, the flashes and projexplode_<turret>_<surface>
+// (tank_dirt, tank_metal ... in the effects pack), exactly as on Merville.
+// COD3_TANK_EVENTS=0: off.
+// 0.5.797: the set's lookup itself (sub_8254D628: sub_820D71E8 finds the
+// name in the SCOPE archive, *(*0x82BCC828 + 40), then checks its kind and
+// adds it to the list at r8, its count at r8 + 64). 795's tankfire1 test (a
+// bot firing a Panzer IV 41 times): the name was right (mp_merville.fx) but
+// it was looked for in the map's archive (Rouen's copy), which does not have
+// it: nothing found, -1 (r22's start value: no event of the set was made).
+// While a tank gun's set is looked up (g_tankSetLookup, from sub_82555160
+// below) the scope is the vehicles' pack, where Merville's database is.
+// 0.5.799: the same for the mortar (mortar_shell's explosion, event 56, and the
+// tube's mortar_81mm_turret): their sets are in Laison's database (archive
+// g_laisonArchive, laisonriver.dbb), looked up there by the names below in
+// turn (the first found is kept). 0.5.308 saw the round's own explosion
+// "made no explosion": the same cause, the map's table has no mortar.
+static int32_t g_setLookupArchive = -1;           // the archive the set is looked for in (-1: the game's)
+static std::vector<std::string> g_setLookupNames; // names tried in turn (empty: the game's)
+static const char* g_setLookupWhat = "";
+extern "C" PPC_FUNC(__imp__sub_8254D628);
+PPC_FUNC(sub_8254D628)
+{
+    const uint32_t holder = Guest::Read32(base, 0x82BCC828);
+    if (g_setLookupArchive < 0 || holder < 0x40000000u || holder >= 0xA0000000u) { __imp__sub_8254D628(ctx, base); return; }
+    const PPCContext saved = ctx;
+    const uint32_t list = ctx.r8.u32;
+    const std::string asked = ReadText(base, ctx.r5.u32, 64);
+    const uint32_t before = list ? Guest::Read32(base, list + 64) : 0;
+    const uint32_t was = Guest::Read32(base, holder + 40);
+    static std::map<std::string, uint32_t> texts;
+    std::vector<std::string> names = g_setLookupNames;
+    if (names.empty()) names.push_back(asked);
+    std::string found;
+    for (const std::string& name : names)
+    {
+        ctx = saved;
+        if (name != asked) { uint32_t& t = texts[name]; if (!t) t = GuestText(base, name); ctx.r5.u64 = t; }
+        Guest::Write32(base, holder + 40, uint32_t(g_setLookupArchive));
+        __imp__sub_8254D628(ctx, base);
+        Guest::Write32(base, holder + 40, was);
+        if (list && Guest::Read32(base, list + 64) > before) { found = name; break; }
+    }
+    static std::set<std::string> said;
+    const std::string key = std::string(g_setLookupWhat) + "|" + found;
+    if (said.size() < 24 && said.insert(key).second)
+    {
+        std::string tried; for (const std::string& n : names) tried += (tried.empty() ? "" : ", ") + n;
+        printf("vehicles: the %s's event set looked up in archive %d (the map's %u), tried %s: %s\n", g_setLookupWhat, g_setLookupArchive, was, tried.c_str(),
+               found.empty() ? "NOT found" : ("found " + found).c_str());
+        fflush(stdout);
+    }
+    // the names that work first next time
+    if (!found.empty() && !g_setLookupNames.empty() && g_setLookupNames.front() != found)
+    {
+        auto it = std::find(g_setLookupNames.begin(), g_setLookupNames.end(), found);
+        if (it != g_setLookupNames.end()) std::rotate(g_setLookupNames.begin(), it, it + 1);
+    }
+}
+// 0.5.799: while a mortar weapon's event set is made, every event of it is
+// made with Laison's archive as the scope (sub_82554BA0, below)
+static int32_t g_eventScopeArchive = -1;
+static std::vector<std::string> g_mortarSetNames = { "laisonriver.fx", "laison.fx", "laison_mortar.fx", "laisonriver_mortar.fx" };
+extern "C" PPC_FUNC(__imp__sub_82555160);
+PPC_FUNC(sub_82555160)
+{
+    // (0.5.793: the record as sub_82556180 fills it: the weapon's name at +16,
+    // up to 128 bytes, the event number at +292; 792 read +500, always 0.)
+    const uint32_t record = ctx.r4.u32;
+    static const bool off = [] { const char* t = getenv("COD3_TANK_EVENTS"); return t && t[0] == '0'; }();
+    // 0.5.802: a weapon event made INSIDE another one's (mervtank1: players'
+    // footsteps while a mortar event was being made) starts with the game's
+    // own scope, not the outer call's; the outer's is put back after
+    struct ScopeGuard
+    {
+        int32_t lookup, events; std::vector<std::string> names; const char* what;
+        ScopeGuard() : lookup(g_setLookupArchive), events(g_eventScopeArchive), names(g_setLookupNames), what(g_setLookupWhat)
+        { g_setLookupArchive = -1; g_eventScopeArchive = -1; g_setLookupNames.clear(); }
+        ~ScopeGuard() { g_setLookupArchive = lookup; g_eventScopeArchive = events; g_setLookupNames = names; g_setLookupWhat = what; }
+    } scopeGuard;
+    // 0.5.799: the mortar's (round and tube) from Laison's database
+    static const bool mortarOff = [] { const char* t = getenv("COD3_MORTAR_EVENTS"); return t && t[0] == '0'; }();
+    if (!mortarOff && record >= 0x40000000u && record < 0xA0000000u && g_laisonArchive >= 0)
+    {
+        std::string gun = ReadText(base, record + 16, 64);
+        for (char& c : gun) c = char(tolower(static_cast<unsigned char>(c)));
+        if (gun == "mortar_81mm_turret")   // 0.5.802: not mortar_shell (the set has no rules for it: its generic events)
+        {
+            const uint32_t number = Guest::Read32(base, record + 292);
+            g_setLookupArchive = g_laisonArchive; g_setLookupNames = g_mortarSetNames; g_setLookupWhat = "mortar";
+            g_eventScopeArchive = g_laisonArchive;
+            __imp__sub_82555160(ctx, base);
+            g_eventScopeArchive = -1;
+            g_mortarSetNames = g_setLookupNames;   // the order found
+            g_setLookupArchive = -1; g_setLookupNames.clear();
+            static std::set<std::string> said;
+            const std::string what = gun + " " + std::to_string(number);
+            if (said.size() < 40 && said.insert(what).second)
+            {
+                printf("vehicles: %s's event %u made by the game from Laison's table (archive %d) -> %d\n", gun.c_str(), number, g_laisonArchive, int32_t(ctx.r3.u32));
+                fflush(stdout);
+            }
+            return;
+        }
+    }
+    if (!off && record >= 0x40000000u && record < 0xA0000000u && g_vehicleArchive >= 0 && !g_vehicleArchiveWhole)
+    {
+        const uint32_t number = Guest::Read32(base, record + 292);
+        std::string gun = ReadText(base, record + 16, 64);
+        for (char& c : gun) c = char(tolower(static_cast<unsigned char>(c)));
+        static int seen = 0;
+        if (seen < 16)
+        {
+            seen++;
+            printf("vehicles: weapon event %u of record %08X: '%s'\n", number, record, gun.c_str());
+            fflush(stdout);
+        }
+        const bool tankGun = gun.find("panzeriv_turret") != std::string::npos || gun.find("sherman_turret") != std::string::npos ||
+                             gun.find("_sherman_tank") != std::string::npos || gun.find("_gunner") != std::string::npos;
+        const uint32_t holder = Guest::Read32(base, 0x82BCC828);
+        if (tankGun && holder >= 0x40000000u && holder < 0xA0000000u)
+        {
+            const uint32_t was = Guest::Read32(base, holder + 40);
+            // 0.5.794: the set is looked up by NAME, the archive's (its object's
+            // +4, sub_82472BD8) and ".fx" (category EVENT.FX): Merville's database
+            // has it as mp_merville.fx; the pack's own name found nothing (793:
+            // every tank event -1).
+            // 0.5.795: sub_82472BD8 has no object for the pack (794: 00000000,
+            // the name read from nothing): the scope stays the map's, and the MAP
+            // archive's object is named mp_merville for this call; each event of
+            // the set is then made from Merville's table by sub_82554BA0's switch
+            // (779, its names have the tank guns').
+            PPCContext find = ctx;
+            find.r1.u32 = (ctx.r1.u32 - 0x1000) & ~0xFu;
+            find.r3.u64 = holder; find.r4.u64 = was; find.lr = 0;
+            Guest::Lookup(0x82472BD8)(find, base);
+            const uint32_t object = find.r3.u32;
+            static uint32_t mervName = 0;
+            if (!mervName) mervName = GuestText(base, "mp_merville");
+            const bool rename = (object >= 0x40000000u && object < 0xA0000000u) || (object >= 0x82000000u && object < 0x83000000u);
+            const uint32_t nameWas = rename ? Guest::Read32(base, object + 4) : 0;
+            static bool toldName = false;
+            if (!toldName)
+            {
+                toldName = true;
+                printf("vehicles: the map's archive %u (object %08X) is named '%s': a tank gun's events looked up as mp_merville.fx\n", was, object,
+                       rename && nameWas ? ReadText(base, nameWas, 64).c_str() : "?");
+                fflush(stdout);
+            }
+            if (rename) Guest::Write32(base, object + 4, mervName);
+            g_setLookupArchive = g_vehicleArchive; g_setLookupWhat = "tank gun";   // 0.5.797: the set looked for in the pack (sub_8254D628, above)
+            __imp__sub_82555160(ctx, base);
+            g_setLookupArchive = -1;
+            if (rename) Guest::Write32(base, object + 4, nameWas);
+            Guest::Write32(base, holder + 40, was);
+            // 0.5.804: a tank machine gun's shot that no rule matched: its own named
+            // events are made instead (CampaignEventName, from the next shot on)
+            const bool mg = gun.find("_gunner") != std::string::npos || gun.find("_sherman_tank") != std::string::npos;
+            if (mg && number == 2)
+            {
+                const bool none = int32_t(ctx.r3.u32) < 0;
+                if (none != g_tankMgNoRule) { printf("vehicles: %s's shot (event 2) %s: its named events %s\n", gun.c_str(), none ? "matched no rule" : "matched", none ? "made by name" : "left to the set"); fflush(stdout); }
+                g_tankMgNoRule = none;
+            }
+            static std::set<std::string> said;
+            const std::string what = gun + " " + std::to_string(number);
+            if (said.size() < 40 && said.insert(what).second)
+            {
+                printf("vehicles: %s's event %u made by the game from Merville's table (the map's %u) -> %d\n", gun.c_str(), number, was, int32_t(ctx.r3.u32));
+                fflush(stdout);
+            }
+            return;
+        }
+    }
+    __imp__sub_82555160(ctx, base);
+}
 extern "C" PPC_FUNC(__imp__sub_82554BA0);
 PPC_FUNC(sub_82554BA0)
 {
     // The event's name r4 (the copy's: shots keep it, for the table and
     // the muzzle flash), the message r5 (+496 the shooter's sound handle).
     if (SoundTimes() && ctx.r4.u32) { printf("sound times: %lld event %s (r5 %08X)\n", SoundMs(), ReadText(base, ctx.r4.u32, 64).c_str(), ctx.r5.u32); fflush(stdout); }
+    // 0.5.811: COD3_EVENT_SHOTS: a burst of screenshots from such an event
+    if (static const char* eventShots = getenv("COD3_EVENT_SHOTS"); eventShots && eventShots[0] && ctx.r4.u32)
+    {
+        const long long now = SoundMs(), was = g_eventShotsFrom.load();
+        static const long long gap = [] { const char* t = getenv("COD3_EVENT_SHOTS_STEP"); const char* c = getenv("COD3_EVENT_SHOTS_COUNT");
+                                          return std::max(2500LL, (long long)(t ? atoi(t) : 100) * (c ? atoi(c) : 15) + 500); }();
+        if ((was < 0 || now - was > gap) && ReadText(base, ctx.r4.u32, 80).find(eventShots) != std::string::npos)
+        {
+            g_eventShotsFrom.store(now);
+            printf("sound times: %lld event %s: screenshots\n", now, ReadText(base, ctx.r4.u32, 80).c_str()); fflush(stdout);
+        }
+    }
+    // 0.5.811: this machine's player's dual Colts reloaded (MpFixesDualReloadBegan)
+    if (g_dualHeldNow.load() && ctx.r4.u32 && ctx.r5.u32 >= 0x40000000u && ctx.r5.u32 < 0xA0000000u)
+    {
+        std::string low = ReadText(base, ctx.r4.u32, 64);
+        for (char& c : low) c = char(tolower(static_cast<unsigned char>(c)));
+        if (low.find("reload") != std::string::npos && low.find("rechamber") == std::string::npos)
+        {
+            const uint32_t handle = Guest::Read32(base, ctx.r5.u32 + 496), slotIndex = handle & 0x3FFF;
+            uint32_t ent = 0;
+            if (slotIndex < 4096 && Guest::Read32(base, 0x82BD1FC0 + 8 * slotIndex + 4) == (handle >> 14)) ent = Guest::Read32(base, 0x82BD1FC0 + 8 * slotIndex);
+            const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+            const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+            if (ent && ent == own) MpFixesDualReloadBegan(base, low.find("empty") != std::string::npos);
+        }
+    }
+    // 0.5.799: an event of the mortar's set (sub_82555160 above): made from
+    // Laison's table (scope Laison's archive), as in the campaign
+    if (g_eventScopeArchive >= 0 && ctx.r4.u32)
+    {
+        const uint32_t holder = Guest::Read32(base, 0x82BCC828);
+        if (holder >= 0x40000000u && holder < 0xA0000000u)
+        {
+            const std::string event = ReadText(base, ctx.r4.u32, 80);
+            const uint32_t was = Guest::Read32(base, holder + 40);
+            Guest::Write32(base, holder + 40, uint32_t(g_eventScopeArchive));
+            __imp__sub_82554BA0(ctx, base);
+            Guest::Write32(base, holder + 40, was);
+            static std::set<std::string> said;
+            if (said.size() < 40 && said.insert(event).second)
+            {
+                printf("vehicles: mortar event %s made from Laison's table (scope %d, the map's %u) -> %08X\n", event.c_str(), g_eventScopeArchive, was, ctx.r3.u32);
+                fflush(stdout);
+            }
+            // 0.5.802: the round's own hit made: the stand-ins are no longer played
+            if (!g_mortarOwnEvents && event.rfind("projexplode_81mm", 0) == 0 && int32_t(ctx.r3.u32) > 0)
+            {
+                g_mortarOwnEvents = true;
+                printf("vehicles: the mortar round's own explosion works (%s): the panzerschreck's and frag's stand-ins off\n", event.c_str()); fflush(stdout);
+            }
+            return;
+        }
+    }
+    // 0.5.779: the tank guns' own events, from Merville's event table. On a map
+    // with the vehicles' pack (Seelow), a weapon event is looked up in the map
+    // archive's event table (sub_82490220 -> sub_820D71E8, scope *(*0x82BCC828
+    // + 40): the map's archive): Rouen's for Seelow, with no tank guns (the
+    // shots silent, the shells' explosions unseen; 776-778's stand-ins: a
+    // grenade's or panzerschreck's blast, cues played by hand). While a tank
+    // gun's event is made the scope is the vehicles' pack (Merville's game
+    // database: its event table first, then every list archive), so its own
+    // entries play: PANZERIV/SHERMAN shots, the MGs, projexplode_<turret>_<surface>
+    // (tank_dirt, tank_metal ... from the effects pack), exactly as on Merville.
+    // COD3_TANK_EVENTS=0: off.
+    if (ctx.r4.u32 && g_vehicleArchive >= 0 && !g_vehicleArchiveWhole)
+    {
+        static const bool off = [] { const char* t = getenv("COD3_TANK_EVENTS"); return t && t[0] == '0'; }();
+        std::string event = ReadText(base, ctx.r4.u32, 80);
+        for (char& c : event) c = char(tolower(static_cast<unsigned char>(c)));
+        const bool tankGun = event.find("panzeriv_turret") != std::string::npos || event.find("sherman_turret") != std::string::npos ||
+                             event.find("_sherman_tank") != std::string::npos || event.find("_gunner") != std::string::npos;
+        const uint32_t holder = Guest::Read32(base, 0x82BCC828);
+        if (tankGun && !off && holder >= 0x40000000u && holder < 0xA0000000u)
+        {
+            const uint32_t was = Guest::Read32(base, holder + 40);
+            Guest::Write32(base, holder + 40, uint32_t(g_vehicleArchive));
+            __imp__sub_82554BA0(ctx, base);
+            Guest::Write32(base, holder + 40, was);
+            static std::set<std::string> said;
+            if (said.size() < 40 && said.insert(event).second)
+            {
+                printf("vehicles: tank event %s made from Merville's table (scope %d, the map's %u) -> %08X\n", event.c_str(), g_vehicleArchive, was, ctx.r3.u32);
+                fflush(stdout);
+            }
+            return;
+        }
+    }
+    // 0.5.656: the Webley's sounds are CoD2's. Whoever this sound is of (the
+    // message's +496, his sound handle) holding the Webley (his state's +164):
+    // the Colt's fire, reload and rechamber sounds (the copy's events) are not
+    // played (the event looked up under a name no table has, as a campaign
+    // gun's own name was, silent), and for a reload CoD2's own is played
+    // (custom\webley\wpnrld_webley_rev.wav; his shots' are played from
+    // CampaignEventName). Fainter with distance, none past 4000 units.
+    if (ctx.r4.u32 && ctx.r5.u32)
+    {
+        static int32_t webleyGun = -1;
+        if (webleyGun < 0) for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++) if (strcmp(Guns[i].name, "webley") == 0) webleyGun = int32_t(i);
+        const int32_t weapon = webleyGun >= 0 ? g_campaignWeapon[webleyGun] : 0;
+        const uint32_t handle = Guest::Read32(base, ctx.r5.u32 + 496), slotIndex = handle & 0x3FFF;
+        uint32_t ent = 0;
+        if (weapon > 0 && slotIndex < 4096 && Guest::Read32(base, 0x82BD1FC0 + 8 * slotIndex + 4) == (handle >> 14)) ent = Guest::Read32(base, 0x82BD1FC0 + 8 * slotIndex);
+        const uint32_t ps = ent ? Guest::Read32(base, ent + 512) : 0;
+        if (ps >= 0x40000000u && ps < 0x90000000u && Guest::Read32(base, ps + 164) == uint32_t(weapon))
+        {
+            std::string low = ReadText(base, ctx.r4.u32, 64);
+            for (char& c : low) c = char(tolower(static_cast<unsigned char>(c)));
+            const bool reload = low.find("reload") != std::string::npos || low.find("rechamber") != std::string::npos;
+            // (the last shot's own event, weapon_colt_weapon_last_shot_1st, too)
+            const bool fire = low.find("fire") != std::string::npos || low.find("shot") != std::string::npos;
+            if (reload || fire)
+            {
+                static uint32_t silent = 0;
+                if (!silent) silent = GuestText(base, "webley_cod2_sound_instead");
+                if (reload && low.find("rechamber") == std::string::npos)
+                {
+                    static std::map<uint32_t, uint64_t> lastAt;
+                    const uint64_t now = GetTickCount64();
+                    if (now - lastAt[ent] > 2000)
+                    {
+                        lastAt[ent] = now;
+                        const uint32_t list = Guest::Read32(base, 0x82BCC7FC);
+                        const uint32_t own = list ? Guest::Read32(base, list + 4) : 0;
+                        float gain = 0.9f;
+                        if (own && ent != own)
+                        {
+                            const float dx = PlaneReadF(base, ent + 336) - PlaneReadF(base, own + 336), dy = PlaneReadF(base, ent + 340) - PlaneReadF(base, own + 340);
+                            gain = 0.6f * std::max(0.0f, 1.0f - sqrtf(dx * dx + dy * dy) / 4000.0f);
+                        }
+                        Audio::PlayClip(WebleyDir() + "wpnrld_webley_rev.wav", gain);
+                        if (ent == own) MpFixesWebleyReloadBegan();   // 0.5.673: CoD2's reload on our arms
+                    }
+                }
+                static int told = 0;
+                if (told < 20) { told++; printf("webley: the Colt's sound %s for entity %08X not played%s\n", low.c_str(), ent, reload ? " (CoD2's reload in its place)" : ""); fflush(stdout); }
+                ctx.r4.u64 = silent;
+            }
+        }
+    }
+    // 0.5.726: the scoped Mosin's shot is CoD2's (nagant_sniper.wav, played from
+    // CampaignEventName): the Kar98's fire sounds are not played for whoever
+    // holds it (its bolt and reload stay: the moves are the Kar98's)
+    if (ctx.r4.u32 && ctx.r5.u32)
+    {
+        static int32_t mosinGun = -1;
+        if (mosinGun < 0) for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++) if (strcmp(Guns[i].name, "mosin_scoped") == 0) mosinGun = int32_t(i);
+        const int32_t weapon = mosinGun >= 0 ? g_campaignWeapon[mosinGun] : 0;
+        const uint32_t handle = Guest::Read32(base, ctx.r5.u32 + 496), slotIndex = handle & 0x3FFF;
+        uint32_t ent = 0;
+        if (weapon > 0 && slotIndex < 4096 && Guest::Read32(base, 0x82BD1FC0 + 8 * slotIndex + 4) == (handle >> 14)) ent = Guest::Read32(base, 0x82BD1FC0 + 8 * slotIndex);
+        const uint32_t ps = ent ? Guest::Read32(base, ent + 512) : 0;
+        if (ps >= 0x40000000u && ps < 0x90000000u && Guest::Read32(base, ps + 164) == uint32_t(weapon))
+        {
+            std::string low = ReadText(base, ctx.r4.u32, 64);
+            for (char& c : low) c = char(tolower(static_cast<unsigned char>(c)));
+            if (low.find("fire") != std::string::npos || low.find("shot") != std::string::npos || low.find("ringoff") != std::string::npos)
+            {
+                static uint32_t silent = 0;
+                if (!silent) silent = GuestText(base, "mosin_cod2_sound_instead");
+                static int told = 0;
+                if (told < 20) { told++; printf("mosin: the Kar98's sound %s for entity %08X not played (CoD2's in its place)\n", low.c_str(), ent); fflush(stdout); }
+                ctx.r4.u64 = silent;
+            }
+        }
+    }
     // 0.5.278: the reloads Justin hears as his own: each reload-like event
     // here (the sound code: the event's name r4, its message r5, +496 the
     // sound handle of whose it is) with the player it belongs to and how
@@ -10428,13 +17159,17 @@ PPC_FUNC(sub_82554BA0)
         {
             static std::set<std::string> kept;
             static std::mutex keptLock;
-            static uint32_t eventText = 0;
+            static uint32_t eventText = 0, planeText = 0;
             {
                 std::lock_guard<std::mutex> guard(keptLock);
                 cueOverride = kept.insert(sent.rfind("UAV:", 0) == 0 ? sent.substr(4) : sent).first->c_str();
                 if (!eventText) eventText = GuestText(base, "weapon_kar98_weapon_fire_3rd");
+                if (!planeText) planeText = GuestText(base, "weapon_m1garand_weapon_fire_3rd");
             }
-            ctx.r4.u64 = eventText;
+            // 0.5.446: the planes' own (ARPL_) as the Garand's shot: its voices
+            // are not the Kar98's, which the Hellfire's explosions and whistles
+            // ("UAV:") take (Justin: the planes' sound not heard under it)
+            ctx.r4.u64 = sent.rfind("ARPL_", 0) == 0 ? planeText : eventText;
             static int said = 0;
             if ((said < 30 && said++ < 30)) { printf("uav plane: sound %s made as the Kar98's shot event, its cue swapped\n", cueOverride); fflush(stdout); }
             const CampaignGun* outer = t_eventGun;
@@ -10515,7 +17250,9 @@ PPC_FUNC(sub_8254D180)
 {
     if (ctx.r4.u32)
     {
-        static const std::pair<const char*, const char*> Texts[] = { { "WEAPON_GEWEHR43", "Gewehr 43" }, { "WEAPON_MG42", "MG42" }, { "WEAPON_LEE_ENFIELD_SNIPER", "Lee-Enfield Scoped" }, { "WEAPON_FG42_SCOPED", "FG42 Scoped" }, { "WEAPON_MILLS_BOMB", "Mills Bomb" } };
+        static const std::pair<const char*, const char*> Texts[] = { { "WEAPON_GEWEHR43", "Gewehr 43" }, { "WEAPON_MG42", "MG42" }, { "WEAPON_LEE_ENFIELD_SNIPER", "Lee-Enfield Scoped" }, { "WEAPON_FG42_SCOPED", "FG42 Scoped" }, { "WEAPON_MILLS_BOMB", "Mills Bomb" }, { "WEAPON_WEBLEY", "Webley" },
+                                                                     { "WEAPON_FLAMETHROWER", "M2 Flamethrower" },   // 0.5.681
+                                                                     { "WEAPON_MOSIN_SCOPED", "Mosin-Nagant (Scoped)" } };   // 0.5.726
         const std::string key = ReadText(base, ctx.r4.u32, 40);
         static uint32_t made[sizeof(Texts) / sizeof(Texts[0])] = {};
         for (size_t i = 0; i < sizeof(Texts) / sizeof(Texts[0]); i++)
@@ -10811,6 +17548,8 @@ static void TacticalInsertionFrame(PPCContext& ctx,uint8_t* base) {
     const uint32_t levelTime=Guest::Read32(base,0x82C2826C);
     if(host!=hostBefore || levelTime<levelBefore) {saved=false;hold={};returnHold={};}
     hostBefore=host;levelBefore=levelTime;
+    // 0.5.454: only with the cheat on (F11, off by default)
+    if(!Settings::Get().returnPoint) {Input::SetTacticalPointInput(false,false);saved=false;hold={};returnHold={};return;}
     bool eligible=host>=0x40000000u && host<0xA0000000u && ps>=0x40000000u && ps<0xA0000000u &&
         Guest::Read32(base,0x82BCBE9C)==0 && !Guest::Read8(base,0x82C73024) && !Overlay::IsOpen() &&
         Guest::Read32(base,0x82C7A270+0xB8)==2;
@@ -11123,12 +17862,18 @@ PPC_FUNC(sub_824C0AE0)
 // about 5 MB more, taken from the same memory the game takes them from. The
 // "pool:" line every 30 s says how many effects and nodes are in use and the
 // most at once, to see whether they still fill (a leak) or not.
+// 0.5.446: four times the effect nodes, effects and the third kind (was
+// twice): Justin's 0.5.445 game over the internet (30 bots, killcams) logged
+// "apsMemory : pool(size=224, count=4096) is empty" ~2700 times in 10 s, the
+// 128-byte effects' (8192) too, then froze as a killcam began: the main
+// thread for ever in the game's malloc (sub_820DF428, its heap's lists
+// broken), from killcam set-up code. About 2 MB more.
 namespace
 {
     int32_t Doubled(int32_t asked, int32_t most)
     {
-        const int32_t twice = asked > 0 ? asked * 2 : asked;
-        return twice > most ? most : twice;
+        const int32_t more = asked > 0 ? asked * 4 : asked;
+        return more > most ? most : more;
     }
 }
 extern "C" PPC_FUNC(__imp__sub_82109F38);
@@ -11229,6 +17974,14 @@ PPC_FUNC(sub_8210ACA0)
     // 24-player Rimling run crashed loading the map, in the session's
     // message reading, an unrelated-looking place; kept minimal to be safe).
     if (asked > 0 && asked <= 8192 && (MpCapClients > 24 || ctx.r4.u32 == 1024)) ctx.r3.s64 = asked * 2;
+    // 0.5.446: the blocks of 1 KB and less four times (0.5.445's game ran the
+    // 32, 512 and 1024-byte ones dry, at twice): about 2 MB more
+    if (asked > 0 && asked <= 8192 && MpCapClients > 24 && ctx.r4.u32 <= 1024) ctx.r3.s64 = asked * 4;
+    // 0.5.476: the 1 KB blocks eight times (Justin's 0.5.475 CTF, 31 bots: the
+    // 1 KB pool, 2048 at four times, logged empty 40 times mid-game, then the
+    // game froze in a killcam, in the game's malloc, as in 0.5.445): 4 MB more
+    // (Justin: "increase the size of the pool so it doesnt happen again")
+    if (asked > 0 && asked <= 8192 && MpCapClients > 24 && ctx.r4.u32 == 1024) ctx.r3.s64 = asked * 8;
     static int told = 0;
     if ((told < 40 && told++ < 40)) { printf("effects: memory pool of %u-byte blocks, %d of them (the game asked for %d)\n", ctx.r4.u32, int32_t(ctx.r3.u32), asked); fflush(stdout); }
     __imp__sub_8210ACA0(ctx, base);
@@ -11668,6 +18421,74 @@ namespace HeapWait
         }
         fflush(stdout);
     }
+}
+// 0.5.479: the game heap's fill over a match, every 30 s (Justin: "the game
+// keeps crashing when i play longer games": 0.5.478's CTF on Rouen hung at
+// 9.5 min with heap 0 at 611 of 637 MB, a cache asking 50 KB for ever).
+// "heap: ..." lines: how much is used, and how much more than 30 s before,
+// so a log shows whether it climbs all match (a leak) or jumps.
+void MpFixesHeapReport(uint8_t* base)
+{
+    static uint64_t last = 0;
+    static uint32_t before = 0;
+    const uint64_t now = GetTickCount64();
+    if (now - last < 30000) return;
+    last = now;
+    uint32_t capacity = 0, used = 0, peak = 0;
+    constexpr uint32_t heap0 = 0x82A84120u;   // as HeapWait's
+    if (!HeapWait::Peek(base, heap0 + 1156, capacity) || !HeapWait::Peek(base, heap0 + 1160, used) || !HeapWait::Peek(base, heap0 + 1164, peak) || capacity == 0) return;
+    printf("heap: game heap %.1f of %.1f MB used (%.0f%%), peak %.1f, %+.2f MB in 30 s\n", used / 1048576.0, capacity / 1048576.0, 100.0 * used / capacity,
+           peak / 1048576.0, before ? (double(used) - double(before)) / 1048576.0 : 0.0);
+    fflush(stdout);
+    before = used;
+}
+// 0.5.557: the damage direction (the HUD's arrow toward where a hit came
+// from) for a victim that is no local player. sub_82452580 puts a 36-byte
+// entry (9 words) into the local player's client game state, cg 0x82C7D490 +
+// 6040 + r7 * 6368, r7 the victim's local client number; the title has four.
+// From the player-death code (sub_82587268 -> sub_825862F4) a bot's death
+// passes his slot, 4 to 31, so the entry went past the four into whatever lies
+// beyond: 556's hardware watch caught it five times of five writing the float
+// vector over the renderer list 82C89A60 (r7 7: 0x82C7EC28 + 7 * 6368 + 32 is
+// its count), the corruption the 0.5.185 guard had been repairing since, and
+// every other slot's death wrote 36 bytes somewhere else unguarded (555's
+// freeze: the heap broken, the last death before it bot 7's). A bot has no
+// HUD: skipped, as the function's own early exit does.
+extern "C" PPC_FUNC(__imp__sub_82452580);
+PPC_FUNC(sub_82452580)
+{
+    if (ctx.r7.u32 >= 4)
+    {
+        static std::atomic<int> told{ 0 };
+        if (told.fetch_add(1) < 12) { printf("guard: damage direction for client %u (no local player: only 4) skipped; it would have written at %08X\n", ctx.r7.u32, 0x82C7EC28u + ctx.r7.u32 * 6368u); fflush(stdout); }
+        return;
+    }
+    __imp__sub_82452580(ctx, base);
+}
+
+// 0.5.556: the game heaps at a stall (watchdog.cpp, "no swap for five
+// seconds"): 555's freeze was the main thread for ever in the game's malloc
+// (sub_820DF428), its free lists broken; this says which heap and how full,
+// and heap 0's descriptor's first 32 words, for the next one.
+void MpFixesHeapDump(uint8_t* base)
+{
+    constexpr uint32_t heaps = 0x82A84120u;
+    uint32_t active = 0;
+    HeapWait::Peek(base, heaps + 9392, active);
+    printf("heapdump: active game heap %08X\n", active);
+    for (uint32_t i = 0; i < 8; i++)
+    {
+        const uint32_t heap = heaps + i * 1172;
+        uint32_t capacity = 0, used = 0, peak = 0, fallback = 0;
+        if (!HeapWait::Peek(base, heap + 1156, capacity) || !HeapWait::Peek(base, heap + 1160, used) ||
+            !HeapWait::Peek(base, heap + 1164, peak) || !HeapWait::Peek(base, heap + 1168, fallback)) { printf("heapdump: heap %u unreadable\n", i); continue; }
+        if (capacity == 0 && used == 0) continue;
+        printf("heapdump: heap %u at %08X capacity %u used %u peak %u fallback %08X\n", i, heap, capacity, used, peak, fallback);
+    }
+    printf("heapdump: heap 0 descriptor:");
+    for (uint32_t o = 0; o < 128; o += 4) { uint32_t w = 0; HeapWait::Peek(base, heaps + o, w); printf("%s%08X", o % 32 == 0 ? "\n  " : " ", w); }
+    printf("\n");
+    fflush(stdout);
 }
 extern "C" PPC_FUNC(__imp__sub_82185D18);
 PPC_FUNC(sub_82185D18)
@@ -12759,4 +19580,16 @@ PPC_FUNC(sub_820B5CD8)
 
 
 void RosterTrapReport() { RosterTrap::Report(); }
+
+// 0.5.801: "mortar_test [rounds]" (console or COD3_CMD): the host's own mortar
+// set up now (a fresh one, as from the killstreak box) and its rounds fired
+// one every 2.5 s (MortarUseFrame), for tests, which cannot press d-pad or RT.
+void MpFixesMortarTest(int rounds)
+{
+    g_mortarTestRounds.store(std::clamp(rounds, 1, kMortarRounds));
+    g_mortarTestNext = 0;
+    if (!g_mortarActive.load()) g_mortarAskStart.store(2);
+    printf("mortar: mortar_test %d rounds asked\n", g_mortarTestRounds.load());
+    fflush(stdout);
+}
 #endif

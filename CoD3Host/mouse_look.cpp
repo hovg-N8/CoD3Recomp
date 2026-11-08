@@ -21,6 +21,9 @@
 #include "input.h"
 #include "kernel.h"
 #include "settings.h"
+#ifdef COD3_MP
+#include "spectator.h"   // 0.5.614: the free camera's own aim
+#endif
 
 #include <cmath>
 #include <cstring>
@@ -115,6 +118,12 @@ PPC_FUNC(sub_8250FF48)
         return;
     }
     if (!Input::TakeLook(dx, dy) || (dx == 0 && dy == 0)) return;
+#ifdef COD3_MP
+    // 0.5.614: the free camera turns by its own aim (spectator.cpp): in the
+    // spectator's seat the game's spectator script holds the view still
+    if (Spectator::TakeMouseLook(float(dx) * DegreesPerCount * Settings::Get().mouseSensitivity,
+                                 float(dy) * DegreesPerCount * Settings::Get().mouseSensitivity)) return;
+#endif
 
     // Nobody turns: the title's own reasons, as its pad look has them.
     if ((Guest::Read32(base, client + FlagsOffset) & 0x4000u) != 0) return;

@@ -51,6 +51,8 @@ namespace Overlay
     // options page follows the main menu, which is the OPTIONS entry.
     enum class FrontEndText { MainMenu = 1, OptionsMenu = 2 };
     void NoteFrontEndText(FrontEndText text);
+    // The main menu was drawn within the last second (co-op's lobby: back from a mission).
+    bool MainMenuShown();
 
     // A game's own heads-up display drawn over the picture (Domination's
     // flags, dom.cpp): while active() says so, draw(width, height) each frame
@@ -60,4 +62,29 @@ namespace Overlay
     void SetMenuHud(bool (*active)(), void (*draw)(int width, int height));
     // A third, the killstreaks' box (mp_fixes.cpp, 0.5.82).
     void SetStreakHud(bool (*active)(), void (*draw)(int width, int height));
+    // A fourth, the spectator's seat on the team choice (spectator.cpp, 0.5.608).
+    void SetSeatHud(bool (*active)(), void (*draw)(int width, int height));
+    // A fifth, the pre-match countdown (bots.cpp, 0.5.641).
+    void SetMatchHud(bool (*active)(), void (*draw)(int width, int height));
+    // A sixth, drawn first (under the others): the weapon's own picture over
+    // the view (the flamethrower's flame, flamethrower.cpp, 0.5.681).
+    void SetWeaponHud(bool (*active)(), void (*draw)(int width, int height));
+    // 0.5.739: a seventh, drawn just after it: World at War's signal flare's
+    // glow where it burns and its blinding over the view (flare.cpp)
+    void SetFlareHud(bool (*active)(), void (*draw)(int width, int height));
+    // 0.5.718: the weapon's view mesh (its vertices as drawn: xyz, the mesh's
+    // own space; triangles): the weapon picture above is drawn only where this
+    // mesh is not, put on the screen by its own draw's transforms
+    // (Render::TrackedTransform): the gun over its flame
+    void SetWeaponMaskMesh(const float* xyz, size_t vertices, const uint16_t* indices, size_t count);
+    // 0.5.681: a PNG file as a texture for ImGui's draws (an
+    // ID3D11ShaderResourceView*, kept for good; null if it cannot be read).
+    void* ImageTexture(const std::string& pngPath, int* width = nullptr, int* height = nullptr);
+    // Co-op v40's lobby (coop_lobby.cpp, the campaign; merged 0.5.622): while
+    // available() says so, F2 opens and closes it, and while it is open it has
+    // the keys and the mouse as the settings do; draw(width, height, open) each
+    // frame (closed, it may draw a hint).
+    void SetLobby(bool (*available)(), void (*draw)(int width, int height, bool open));
+    bool LobbyOpen();
+    void SetLobbyOpen(bool open);
 }

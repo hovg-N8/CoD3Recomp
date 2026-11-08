@@ -16,8 +16,12 @@ Route Detour(Point from, Point goal, int hand, bool escaping,
              const FailedRoutes* failed=nullptr, uint32_t now=0) {
     Route result;
     if (!Finite(from)||!Finite(goal)||Distance(from,goal)<20) return result;
+    // 0.5.700: 96 traces (was 64): Climb may now try a piece twice (a
+    // stair's lift, then the whole rise), and on stairs (16-unit pieces,
+    // three traces each) a few ways used the 64 up before the way out was
+    // tried (Carentan's cellar stairs)
     auto bounded=[&](Point a,Point b,bool body) {
-        if (result.queries>=64) return Hit{};
+        if (result.queries>=96) return Hit{};
         ++result.queries; return query(a,b,body);
     };
     struct Node { Point at,first; float cost,rank; unsigned depth; bool expanded; };
@@ -25,14 +29,14 @@ Route Detour(Point from, Point goal, int hand, bool escaping,
     nodes[0]={from,from,0,Distance(from,goal),0,false};
     float best=-std::numeric_limits<float>::infinity();
     const float initial=Distance(from,goal);
-    for(unsigned expansion=0;expansion<12 && result.queries<64;++expansion) {
+    for(unsigned expansion=0;expansion<12 && result.queries<96;++expansion) {
         unsigned pick=32; float rank=std::numeric_limits<float>::infinity();
         for(unsigned i=0;i<count;++i) if(!nodes[i].expanded && nodes[i].depth<4 && nodes[i].rank<rank) {pick=i;rank=nodes[i].rank;}
         if(pick==32)break;
         nodes[pick].expanded=true; const Node parent=nodes[pick];
         const float yaw=std::atan2(goal.y-parent.at.y,goal.x-parent.at.x);
         for(float degrees : {0.0f,45.0f,-45.0f,90.0f,-90.0f,135.0f,-135.0f,180.0f}) {
-            if(result.queries>=64 || count==nodes.size())break;
+            if(result.queries>=96 || count==nodes.size())break;
             const float angle=yaw+degrees*hand*0.01745329252f;
             const float length=std::fmin(Distance(parent.at,goal),96.0f);
             Point candidate{parent.at.x+std::cos(angle)*length,parent.at.y+std::sin(angle)*length,parent.at.z},landing;
@@ -70,7 +74,7 @@ bool ShortEscape(Point from,Point goal,int hand,Query&& query,Point& out) {
     const float yaw=std::atan2(goal.y-from.y,goal.x-from.x);
     unsigned calls=0;
     auto bounded=[&](Point a,Point b,bool body){
-        if(calls>=24)return Hit{};
+        if(calls>=40)return Hit{};   // 0.5.700: 40 (was 24), as Detour's
         ++calls;return query(a,b,body);
     };
     for(float degrees:{0.f,45.f,-45.f,90.f,-90.f,135.f,-135.f,180.f}) {

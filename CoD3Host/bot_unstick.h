@@ -18,14 +18,43 @@ namespace BotNavigation {
 struct NetProgress {
     static constexpr uint32_t Window = 3500, Forgive = 15000;
     static constexpr float MinNet = 56;
+    // 0.5.597: going back and forth: still within 200 of where he was 8 s ago
+    // while he wants to move and his goal is far (over 300). 596's self-test:
+    // of 318 samples with a bot under 30 from where he was 3 s before, 177 had
+    // no stall or strike counted, over half moving at 100-250: swinging more
+    // than 56 each way set the 56-unit test's start again every time.
+    static constexpr uint32_t RegionWindow = 8000;
+    static constexpr float RegionRadius = 200;
     Point from{}; uint32_t since = 0, lastStuck = 0; unsigned strikes = 0; bool primed = false;
+    Point region{}; uint32_t regionSince = 0; unsigned regionStrikes = 0;
+    // 0.5.701: a room he cannot leave: still within 450 of where he was 30 s
+    // ago while he wants to move and his goal is far. 0.5.700's Carentan test:
+    // a bot walked down the cellar stairs (walkable since 700) and paced the
+    // cellar (512 x 408, a dead end) for 3 minutes; the 200/8 s test reset at
+    // every lap and its strikes were forgiven between them. Counted as the
+    // fourth strike at once, so the unstuck (along his learnt route) follows.
+    static constexpr uint32_t RoomWindow = 30000;
+    static constexpr float RoomRadius = 450;
+    Point room{}; uint32_t roomSince = 0; unsigned roomStrikes = 0;
 
-    void Reset() { primed = false; strikes = 0; since = lastStuck = 0; }
+    void Reset() { primed = false; strikes = 0; since = lastStuck = 0; regionSince = 0; roomSince = 0; }
     // Returns true once per stuck window (and counts a strike).
-    bool Track(Point feet, uint32_t now, bool wantsMove) {
+    bool Track(Point feet, uint32_t now, bool wantsMove, bool farGoal = false) {
         if (!Finite(feet)) return false;
         if (strikes && now - lastStuck >= Forgive) strikes = 0;   // a quiet 15 s: forgiven
-        if (!wantsMove || !primed) { from = feet; since = now; primed = true; return false; }
+        if (!wantsMove || !primed) { from = feet; since = now; region = feet; regionSince = now; room = feet; roomSince = now; primed = true; return false; }
+        if (!farGoal || !roomSince || Distance(feet, room) >= RoomRadius) { room = feet; roomSince = now; }
+        else if (now - roomSince >= RoomWindow) {
+            room = region = from = feet; roomSince = regionSince = since = lastStuck = now;
+            strikes = strikes < 3 ? 4 : strikes + 1; ++roomStrikes;
+            return true;
+        }
+        if (!farGoal || Distance(feet, region) >= RegionRadius) { region = feet; regionSince = now; }
+        else if (now - regionSince >= RegionWindow) {
+            region = from = feet; regionSince = since = lastStuck = now;
+            ++strikes; ++regionStrikes;
+            return true;
+        }
         if (Distance(feet, from) >= MinNet) { from = feet; since = now; return false; }
         if (now - since < Window) return false;
         from = feet; since = now; lastStuck = now;

@@ -492,9 +492,20 @@ PPC_FUNC(__imp__XMAEnableContext)
     {
         found->second.enabled = true;
         found->second.blocksThisEnable = 0;
-        Work(base, ctx.r3.u32);
+        // 0.5.468: at most 128 decoded a frame (Justin, 0.5.467 on Rouen: "the
+        // game got very slow and sounded like an alien running at 8fps"; its
+        // log: 100 to 260 contexts going in each audio frame for the last 45 s,
+        // peaks of 440 to 516, where 40 to 60 is usual): past that a context is
+        // enabled but not decoded this frame (it is decoded again on its next)
+        const uint32_t going = g_enablesThisFrame.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (going <= 128) Work(base, ctx.r3.u32);
+        else
+        {
+            static std::atomic<uint64_t> skipped{ 0 };
+            const uint64_t n = skipped.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (n == 1 || n % 5000 == 0) { printf("xma: more than 128 sounds going in one audio frame: %llu decodes put off so far\n", (unsigned long long)n); fflush(stdout); }
+        }
         g_enables.fetch_add(1, std::memory_order_relaxed);
-        g_enablesThisFrame.fetch_add(1, std::memory_order_relaxed);
         if (XmaTrace())
         {
             static auto first = std::chrono::steady_clock::now();

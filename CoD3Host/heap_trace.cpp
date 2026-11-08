@@ -34,6 +34,10 @@ namespace
     std::mutex g_mutex;
     std::unordered_set<uint32_t> g_live;
     std::atomic<int> g_reported{ 0 };
+    // (co-op v45k, merged in 0.5.671) the blocks followed always (in the campaign), so the
+    // joining copy's guard can tell a double free; COD3_NOHEAPFOLLOW turns the following off
+    std::atomic<bool> g_guard{ false };
+    bool Following() { static const bool off = getenv("COD3_NOHEAPFOLLOW") != nullptr; return !off; }
 
     // The guest call chain from the context: the link register, then the
     // return addresses the prologues saved eight bytes below each back
@@ -61,22 +65,32 @@ namespace
         g_live.insert(pointer);
     }
 
-    void Freed(const PPCContext& ctx, uint8_t* base, uint32_t pointer, const char* what)
+    // false: not a block the heap holds (and, guarded, the free is not to be done)
+    bool Freed(const PPCContext& ctx, uint8_t* base, uint32_t pointer, const char* what)
     {
-        if (pointer == 0) return;
+        if (pointer == 0) return true;
         bool known;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
             known = g_live.erase(pointer) != 0;
         }
-        if (known || (g_reported.load(std::memory_order_relaxed) >= 12 || g_reported.fetch_add(1) >= 12)) return;
+        if (known) return true;
+        if (g_guard.load(std::memory_order_relaxed))
+        {
+            static std::atomic<int> told{ 0 };
+            if ((told.load(std::memory_order_relaxed) < 20 && told.fetch_add(1) < 20)) { printf("heap: co-op guard: a %s of 0x%08X, not a live block: not done", what, pointer); PrintChain(ctx, base); printf("\n"); fflush(stdout); }
+            return false;
+        }
+        if (!Wanted() || (g_reported.load(std::memory_order_relaxed) >= 12 || g_reported.fetch_add(1) >= 12)) return true;
         const uint32_t header = Guest::Read32(base, pointer - 4);
         printf("heap: %s of 0x%08X, which is not a live block (chunk header %08X, size %u)", what, pointer, header, header & ~7u);
         PrintChain(ctx, base);
         printf("\n");
         fflush(stdout);
+        return true;
     }
 }
+void HeapTrace::SetGuard(bool on) { if (g_guard.exchange(on) != on) { printf("heap: co-op guard %s\n", on ? "on" : "off"); fflush(stdout); } }
 
 // The heap's free lists, checked around a call that walks them. A bin's
 // list is circular through fd; a chunk that appears twice makes a cycle,
@@ -225,7 +239,7 @@ PPC_FUNC(sub_820CC1D0)
 {
     CheckUnsorted(ctx, base, "entering an allocation");
     __imp__sub_820CC1D0(ctx, base);
-    if (Wanted()) Allocated(ctx.r3.u32);
+    if (Wanted() || Following()) Allocated(ctx.r3.u32);
     CheckUnsorted(ctx, base, "leaving an allocation");
 }
 
@@ -234,7 +248,7 @@ PPC_FUNC(sub_820CC238)
 {
     CheckUnsorted(ctx, base, "entering an allocation");
     __imp__sub_820CC238(ctx, base);
-    if (Wanted()) Allocated(ctx.r3.u32);
+    if (Wanted() || Following()) Allocated(ctx.r3.u32);
     CheckUnsorted(ctx, base, "leaving an allocation");
 }
 
@@ -244,7 +258,7 @@ PPC_FUNC(sub_820CC2A0)
     // From a heap of the title's choosing (the level's), the same block shape.
     CheckUnsorted(ctx, base, "entering an allocation");
     __imp__sub_820CC2A0(ctx, base);
-    if (Wanted()) Allocated(ctx.r3.u32);
+    if (Wanted() || Following()) Allocated(ctx.r3.u32);
     CheckUnsorted(ctx, base, "leaving an allocation");
 }
 
@@ -253,7 +267,7 @@ PPC_FUNC(sub_820CC330)
 {
     CheckUnsorted(ctx, base, "entering an allocation");
     __imp__sub_820CC330(ctx, base);
-    if (Wanted()) Allocated(ctx.r3.u32);
+    if (Wanted() || Following()) Allocated(ctx.r3.u32);
     CheckUnsorted(ctx, base, "leaving an allocation");
 }
 
@@ -262,7 +276,7 @@ PPC_FUNC(sub_820CC398)
 {
     CheckUnsorted(ctx, base, "entering an allocation");
     __imp__sub_820CC398(ctx, base);
-    if (Wanted()) Allocated(ctx.r3.u32);
+    if (Wanted() || Following()) Allocated(ctx.r3.u32);
     CheckUnsorted(ctx, base, "leaving an allocation");
 }
 
@@ -271,7 +285,7 @@ PPC_FUNC(sub_820CC468)
 {
     const uint32_t pointer = ctx.r3.u32;
     CheckUnsorted(ctx, base, "entering a free");
-    if (Wanted()) Freed(ctx, base, pointer, "free");
+    if ((Wanted() || Following()) && !Freed(ctx, base, pointer, "free")) return;
     __imp__sub_820CC468(ctx, base);
     // After the free: a list it has just joined may have closed on itself.
     if (Wanted()) CheckBins(ctx, base, "after freeing", pointer);
@@ -284,7 +298,7 @@ PPC_FUNC(sub_820CC4C0)
     // free(heap, block): the block is the second argument.
     const uint32_t pointer = ctx.r4.u32;
     CheckUnsorted(ctx, base, "entering a free from a heap");
-    if (Wanted()) Freed(ctx, base, pointer, "free from a heap");
+    if ((Wanted() || Following()) && !Freed(ctx, base, pointer, "free from a heap")) return;
     __imp__sub_820CC4C0(ctx, base);
     if (Wanted()) CheckBins(ctx, base, "after freeing", pointer);
     CheckUnsorted(ctx, base, "leaving a free from a heap");

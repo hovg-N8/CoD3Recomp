@@ -14,6 +14,7 @@
 // title mixes them.
 
 #include <cstdint>
+#include <string>
 
 namespace Audio
 {
@@ -31,4 +32,9 @@ namespace Audio
     // How many frames were played and how many had to be dropped because the
     // device had not finished with the ones before.
     void Report();
+
+    // 0.5.653: a WAV file (16-bit PCM, any rate, mono or stereo) played once,
+    // mixed into the title's own frames at this gain (CoD2's Webley's
+    // gunshot, mp_fixes.cpp). Read once and kept.
+    void PlayClip(const std::string& path, float gain);
 }

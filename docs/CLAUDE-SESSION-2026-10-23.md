@@ -106,3 +106,23 @@ native one must keep the vector ops' denormal flushing), sub_8248BB48
 - Still open: 0.5.418's killcam fix wants a two-player game
   ("killcam guard: ... killcam not playing" in both logs); the friend's
   GPU slowdown (0.5.416) has no cause in the log.
+
+## 0.5.425 (2026-10-24 17:10): co-op v38 merged
+
+- coop.cpp = Team Friend's v38 diff applied on our v36 + 0.5.316 mortar
+  probe (kept); their SHARED-LOG entry inserted at the top of ours; notes
+  in docs/COOP-V38-NOTES.txt, diff in docs/build-logs/. Campaign only:
+  CoD3MP.exe is the same as 0.5.424 but for the version.
+- First city benchmark CRASHED (work/claude-410/bench-city-425.log): a
+  72 s stall at startup (frames 61 -> 62, "watchdog: no swap ... after
+  16"), "freed memory read at 0xA0D90004" in the vertical blank's
+  handler chain (sub_825A1430 -> sub_825A15F4 -> sub_825A17E4), guest
+  writes running on into unallocated memory (942 MB committed on demand),
+  then C0000005 in VideoThread (kernel_video.cpp:604, the call to the
+  title's interrupt callback) while ordnance loaded.
+- The same startup stall + freed read appeared in 0.5.422 (36 s) and
+  0.5.423 (23 s) and those runs recovered. Rerun of 0.5.425: clean, all
+  eight native checks passed (bench-city-425-rerun.log). OPEN: an
+  intermittent startup race between the vertical blank interrupt and the
+  title's setup (memory 0xA0D90000 given by 8231430C, freed by 822C1AC8,
+  still read by the handler).

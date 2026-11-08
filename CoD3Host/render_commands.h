@@ -21,6 +21,14 @@ namespace RenderCommands
     // nothing to draw: the skip has been counted with its reason.
     bool PrepareDraw(uint32_t initiator, uint32_t indexBase, RenderState::DrawCommand& out);
 
+    // 0.5.809: the draw just prepared, again, mirrored left to right (its
+    // vertex program's c12, the clip's x row, negated; no culling), when its
+    // vertices are one of Render::SetMirrorBuffers' (the dual pistols' left
+    // gun and arm). Called right after PrepareDraw, for the same draw.
+    // 0.5.811: in may be changed (moved right); skipOriginal: in is not to be
+    // drawn (the second part of the dual reload: only the left gun shows)
+    bool PrepareMirror(RenderState::DrawCommand& in, RenderState::DrawCommand& out, bool& skipOriginal);
+
     // The resolve the registers describe, as a command. False when it
     // amounts to nothing.
     bool PrepareResolve(RenderState::ResolveCommand& out);
@@ -32,11 +40,27 @@ namespace RenderCommands
     // depth of field pass, three draws the pixel programs name.
     void SetAimBlur(bool drawn);
 
+    // Surface light (F11): how much the world's solid surfaces are
+    // brightened in their own pass, 0 (none) .. 127; set once a frame.
+    void SetSurfaceLight(uint32_t level);
+
+    // Filling a screen of another shape than 16:9 (render_d3d11.cpp): the
+    // flat (2D) draws into the frame squeezed across by `squeeze` (or, when
+    // negative, up and down by its size) so the HUD keeps its shape in the
+    // middle. Called at each frame's end; it also turns over whether the
+    // frame drew the world, which leaves full screen 2D (a film, a menu's
+    // picture) squeezed too when it did not.
+    void SetFill(float squeeze);
+
     // 0.5.234: whether the host's player is down (dead, waiting to respawn).
     // While he is, the depth of field pass is drawn even with the blur while
     // aiming off: the death view's "double vision" is built on it, and
     // without it the two copies of the frame came out sharp.
     void SetPlayerDown(bool down);
+
+    // 0.5.616: in the spectator's seat (spectator.cpp): the blur the game
+    // keeps behind the team choice left out of its last full screen pass.
+    void SetSpectatorSeat(bool seated);
 
     // 0.5.248: whether the host's player has the binoculars at his eyes
     // (called every frame). While he has, the depth of field pass is drawn,

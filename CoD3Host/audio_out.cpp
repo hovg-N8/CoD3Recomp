@@ -17,6 +17,94 @@
 #include <mmreg.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <map>
+#include <memory>
+#include <vector>
+
+// 0.5.653: clips of our own mixed into the title's frames (CoD2's Webley's
+// sounds): each read once into 48 kHz mono floats; a playing one is a voice.
+namespace
+{
+    struct Clip { std::vector<float> samples; };
+    struct Voice { std::shared_ptr<Clip> clip; size_t at = 0; float gain = 1.0f; };
+    std::mutex g_clipLock;
+    std::map<std::string, std::shared_ptr<Clip>> g_clips;
+    std::vector<Voice> g_voices;
+
+    std::shared_ptr<Clip> ReadClip(const std::string& path)
+    {
+        FILE* f = fopen(path.c_str(), "rb");
+        if (!f) return nullptr;
+        std::vector<uint8_t> d;
+        uint8_t chunk[65536];
+        for (size_t n; (n = fread(chunk, 1, sizeof chunk, f)) > 0;) d.insert(d.end(), chunk, chunk + n);
+        fclose(f);
+        if (d.size() < 44 || memcmp(d.data(), "RIFF", 4) != 0 || memcmp(d.data() + 8, "WAVE", 4) != 0) return nullptr;
+        auto u16 = [&](size_t at) { return uint32_t(d[at] | (d[at + 1] << 8)); };
+        auto u32 = [&](size_t at) { return uint32_t(d[at] | (d[at + 1] << 8) | (d[at + 2] << 16) | (uint32_t(d[at + 3]) << 24)); };
+        uint32_t format = 0, channels = 0, rate = 0, bits = 0;
+        size_t data = 0, bytes = 0;
+        for (size_t at = 12; at + 8 <= d.size();)
+        {
+            const uint32_t size = u32(at + 4);
+            if (!memcmp(&d[at], "fmt ", 4) && at + 24 <= d.size()) { format = u16(at + 8); channels = u16(at + 10); rate = u32(at + 12); bits = u16(at + 22); }
+            if (!memcmp(&d[at], "data", 4)) { data = at + 8; bytes = std::min<size_t>(size, d.size() - data); }
+            at += 8 + size + (size & 1);
+        }
+        if (format != 1 || bits != 16 || channels < 1 || channels > 2 || rate < 8000 || !data) return nullptr;
+        const size_t frames = bytes / (2 * channels);
+        std::vector<float> mono(frames);
+        for (size_t i = 0; i < frames; i++)
+        {
+            float sum = 0.0f;
+            for (uint32_t c = 0; c < channels; c++) sum += float(int16_t(u16(data + (i * channels + c) * 2))) / 32768.0f;
+            mono[i] = sum / float(channels);
+        }
+        auto clip = std::make_shared<Clip>();
+        const double step = double(rate) / 48000.0;   // the device's rate (SampleRate, below)
+        const size_t out = size_t(double(frames) / step);
+        clip->samples.resize(out);
+        for (size_t i = 0; i < out; i++)
+        {
+            const double pos = double(i) * step;
+            const size_t a = size_t(pos);
+            const float t = float(pos - double(a));
+            const float s0 = mono[std::min(a, frames - 1)], s1 = mono[std::min(a + 1, frames - 1)];
+            clip->samples[i] = s0 + (s1 - s0) * t;
+        }
+        return clip;
+    }
+
+    // the voices' next frame, into add (SamplesPerChannel samples)
+    void MixClips(float* add)
+    {
+        std::lock_guard<std::mutex> lock(g_clipLock);
+        for (size_t v = 0; v < g_voices.size();)
+        {
+            Voice& voice = g_voices[v];
+            const std::vector<float>& s = voice.clip->samples;
+            // a frame: 256 samples (SamplesPerChannel, below)
+            for (uint32_t i = 0; i < 256u && voice.at < s.size(); i++) add[i] += s[voice.at++] * voice.gain;
+            if (voice.at >= s.size()) g_voices.erase(g_voices.begin() + long(v));
+            else v++;
+        }
+    }
+}
+
+void Audio::PlayClip(const std::string& path, float gain)
+{
+    std::lock_guard<std::mutex> lock(g_clipLock);
+    auto it = g_clips.find(path);
+    if (it == g_clips.end())
+    {
+        it = g_clips.emplace(path, ReadClip(path)).first;
+        printf("audio: clip %s %s\n", path.c_str(), it->second ? "read" : "could NOT be read (16-bit PCM WAV only)");
+        fflush(stdout);
+    }
+    if (!it->second || gain <= 0.0f) return;
+    if (g_voices.size() >= 16) g_voices.erase(g_voices.begin());
+    g_voices.push_back(Voice{ it->second, 0, gain });
+}
 
 namespace
 {
@@ -315,6 +403,8 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
     // own speaker in the order they came, or folded into two.
     float mixed[SamplesPerChannel * Channels];
     float framePeak = 0.0f;
+    float clips[SamplesPerChannel] = {};   // 0.5.653: our clips' share, to the front left and right
+    MixClips(clips);
     for (uint32_t i = 0; i < SamplesPerChannel; i++)
     {
         const uint32_t offset = guestAddress + i * 4;
@@ -332,6 +422,8 @@ bool Audio::SubmitFrame(uint32_t guestAddress)
             mixed[i * 2 + 0] = l + 0.707f * c + 0.707f * ls;
             mixed[i * 2 + 1] = r + 0.707f * c + 0.707f * rs;
         }
+        mixed[i * out + 0] += clips[i];
+        mixed[i * out + 1] += clips[i];
         for (uint32_t c = 0; c < out; c++)
         {
             float& v = mixed[i * out + c];

@@ -13,6 +13,7 @@
 #include "log.h"
 #include "overlay.h"
 #include "settings.h"
+#include "net.h"   // 0.5.428: PublicShutdown
 #include "render.h"
 #include "input.h"
 #include "window_geometry.h"
@@ -135,7 +136,13 @@ namespace
         // Windows asks the window what the pointer should look like whenever it
         // moves over it, and answering with nothing is how a pointer is hidden
         // over one window without touching it anywhere else.
-        if (message == WM_SETCURSOR && LOWORD(l) == HTCLIENT && g_cursorHidden.load())
+        // Hidden whenever the window has the focus (the game is being played),
+        // not only while the mouse is held; the settings menu keeps its own.
+        // 0.5.600: that only when "Hide the mouse pointer while playing" is on
+        // (F11, Controls), and never in a menu with the mouse free (the
+        // campaign's menus are pointed at, menu_mouse.cpp).
+        if (message == WM_SETCURSOR && LOWORD(l) == HTCLIENT &&
+            (g_cursorHidden.load() || (Settings::Get().hideCursor && GetForegroundWindow() == window && !Overlay::IsOpen() && !Input::MenuMode())))
         {
             SetCursor(nullptr);
             return TRUE;
@@ -151,6 +158,7 @@ namespace
         if (message == WM_CLOSE)
         {
             printf("window: close requested; ending the game process\n");
+            Net::PublicShutdown();   // 0.5.428: off the public list first
             Log::Finish();
             ExitProcess(0);
             return 0;
@@ -258,7 +266,15 @@ namespace
         if (RegisterRawInputDevices(&mouse, 1, sizeof(mouse)) != FALSE) g_rawRegistered.store(true);
         else printf("window: raw mouse input could not be asked for, error %lu; the pointer is followed instead\n", GetLastError());
 
-        ShowWindow(window, SW_SHOW);
+        // (co-op v46, merged in 0.5.671) the checkpoint reload's new copy: where the old window
+        // is (COD3_WINDOW_RECT), and hidden till it is back in (COD3_COOP_HIDDEN; Window::Reveal)
+        static const bool hiddenStart = []() { const char* t = getenv("COD3_COOP_HIDDEN"); return t != nullptr && t[0] == '1'; }();
+        if (const char* r = getenv("COD3_WINDOW_RECT"))
+        {
+            int x = 0, y = 0, w = 0, h = 0;
+            if (sscanf(r, "%d,%d,%d,%d", &x, &y, &w, &h) == 4 && w > 200 && h > 150) SetWindowPos(window, nullptr, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (!hiddenStart) ShowWindow(window, SW_SHOW);
         ReportSize(window);
         // In front and taking the keys from the start, rather than behind
         // the console it was started from. COD3_BACKGROUND=1 leaves it
@@ -268,7 +284,7 @@ namespace
             const char* text = getenv("COD3_BACKGROUND");
             return text != nullptr && text[0] != 0 && text[0] != '0';
         }();
-        if (!background)
+        if (!background && !hiddenStart)
         {
             SetForegroundWindow(window);
             SetFocus(window);
@@ -349,6 +365,15 @@ void Window::Close()
 bool Window::IsOpen() { return g_running.load(); }
 
 void* Window::Handle() { return g_window.load(); }
+
+void Window::Reveal()
+{
+    HWND window = g_window.load();
+    if (!window) return;
+    ShowWindow(window, SW_SHOW);
+    SetForegroundWindow(window);
+    BringWindowToTop(window);
+}
 
 void Window::SetCursorHidden(bool hidden)
 {

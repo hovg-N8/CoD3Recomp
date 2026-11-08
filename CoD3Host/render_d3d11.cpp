@@ -14,6 +14,8 @@
 #include "render_commands.h"
 #include "render_internal.h"
 #include "render_pipeline.h"
+#include "render_post.h"
+#include "film_hd.h"
 #include "render_shaders.h"
 #include "render_resources.h"
 #include "render_stats.h"
@@ -31,6 +33,7 @@
 #include <algorithm>
 #include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -40,6 +43,7 @@
 #include <filesystem>
 #include <condition_variable>
 #include <cstddef>
+#include <thread>
 #include <type_traits>
 #include <intrin.h>
 #include <smmintrin.h>
@@ -82,6 +86,11 @@ namespace
     bool g_started = false;
 
     std::atomic<HWND> g_window{ nullptr };
+    // Filling the screen: the window's shape the title's view is made for
+    // (0: the console's 16:9), and the title's frame's own shape (its front
+    // buffer, 1040 by 624, which the console stretches to 16:9).
+    std::atomic<float> g_fillAspect{ 0.0f };
+    std::atomic<float> g_frameShape{ 1040.0f / 624.0f };
     std::atomic<int> g_clientWidth{ 0 }, g_clientHeight{ 0 };
     std::atomic<uint64_t> g_lastPresent{ 0 };   // steady clock milliseconds
 
@@ -431,6 +440,7 @@ namespace
                 (flags & D3D11_CREATE_DEVICE_DEBUG) ? ", with the debug layer" : "", g_tearing ? ", tearing allowed" : "");
         }
         RenderPipeline::Initialize(g_device.Get());
+        RenderInternal::SetPromptDevice(g_device.Get());   // 0.5.478
         RenderShaders::Initialize(g_device.Get());
         RenderResources::Initialize(g_device.Get(), g_context.Get());
         RenderStats::Initialize(g_device.Get(), g_context.Get());
@@ -1642,6 +1652,13 @@ namespace
         const bool timed = RenderStats::DrawsTimed();
         if (timed) RenderStats::DrawTimed(0xDull << 60);
         if (command.bindingsLost) ForgetBindings();
+        // The ambient occlusion into the scene, as its depth is resolved.
+        if (command.occlusion)
+        {
+            RenderPost::Occlusion(g_context.Get(), Settings::Get(), command.occlusionTarget, command.source, command.sourceSamples,
+                                  command.x0, command.y0, command.width, command.height, command.depthReversed);
+            ForgetBindings();
+        }
         if (command.copy)
         {
             // The source may be bound as a texture from the draws before,
@@ -2220,43 +2237,47 @@ namespace
         return g_gammaView.Get();
     }
 
-    // The last swapped frame onto the window, the overlay over it, and the
-    // present with or without vertical sync.
-    void PresentLocked(const Settings::Values& settings)
+    // Whether a film is playing (Team Friend's look; this tree has the
+    // kernel's own test, the one the frame rate code uses too).
+    bool FilmPlaying()
     {
-        Timed timed(RenderStats::Frame().presentNanoseconds);
-        if (!SwapChainReady() || !BuiltInPrograms()) return;
-        const int clientWidth = g_swapChainWidth, clientHeight = g_swapChainHeight;
-        const float black[4] = { 0, 0, 0, 1 };
-        g_context->ClearRenderTargetView(g_backView.Get(), black);
-        const bool hdr = g_hdrSwapChain;
-        QueryDisplay();
+        return Kernel::FilmPlaying();
+    }
 
-        const RenderResources::Resolved* frame = RenderResources::ResolvedAt(g_frontBuffer);
-        const bool fxaa = (AntiAliasing(settings) == 1 || AntiAliasing(settings) == 5) && g_fxaaPixelShader;
-        if (frame != nullptr && frame->resource != nullptr)
+    // A film's frames shown for each of its own (30 a second): as many as
+    // the screen shows in that time, at least two (60 a second), so a
+    // screen of 120 shows four, 144 four, 240 eight. COD3_FILMSTEPS=n
+    // for a number.
+    int FilmSteps()
+    {
+        static const int forced = getenv("COD3_FILMSTEPS") ? atoi(getenv("COD3_FILMSTEPS")) : 0;
+        if (forced > 0) return std::clamp(forced, 2, 8);
+        static HMONITOR monitor = nullptr;
+        static int steps = 2;
+        const HMONITOR now = MonitorFromWindow(g_swapChainWindow, MONITOR_DEFAULTTONEAREST);
+        if (now != monitor)
         {
-            // Sixteen by nine, as the console sends it, centred.
-            const float aspect = 16.0f / 9.0f;
-            float width = float(clientWidth), height = width / aspect;
-            if (height > clientHeight) { height = float(clientHeight); width = height * aspect; }
-            const D3D11_VIEWPORT viewport{ std::floor((clientWidth - width) * 0.5f), std::floor((clientHeight - height) * 0.5f), std::floor(width), std::floor(height), 0.0f, 1.0f };
-            // The anti aliasing reads the frame itself, in its own pixels,
-            // and writes into the picture's rectangle: the frame is the
-            // chosen resolution, so its rows are the window's, and it has
-            // no black either side to bleed a dark rim into the edges.
-            if (!hdr)
-                DrawQuad(frame->resource, frame->width, frame->height, 0, 0, float(frame->width), float(frame->height),
-                         g_backView.Get(), viewport, fxaa ? g_fxaaPixelShader.Get() : g_presentPixelShader.Get(), g_linearSampler.Get(), GammaTable());
-            // The HDR mode: RenoDX's swap chain pass (hdr/cod3_hdr.hlsl),
-            // the frame already tone mapped when its scene pass ran.
-            else if (ID3D11PixelShader* program = HdrProgramFor("present", 0, 1, fxaa))
-            {
-                HdrUpload(g_hdrPresentGraded, Kernel::FilmPlaying());
-                DrawQuad(frame->resource, frame->width, frame->height, 0, 0, float(frame->width), float(frame->height),
-                         g_backView.Get(), viewport, program, g_linearSampler.Get(), GammaTable());
-            }
+            monitor = now;
+            MONITORINFOEXW info{};
+            info.cbSize = sizeof(info);
+            DEVMODEW mode{};
+            mode.dmSize = sizeof(mode);
+            if (GetMonitorInfoW(now, &info) && EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode) && mode.dmDisplayFrequency > 1)
+                steps = std::clamp(int(mode.dmDisplayFrequency / 30), 2, 8);
+            printf("render: films shown at %d frames for each of their own (the screen at %lu Hz)\n", steps, mode.dmDisplayFrequency);
+            fflush(stdout);
         }
+        return steps;
+    }
+
+    // What is on the back buffer onto the window: the overlay over it, and
+    // the present with or without vertical sync. `between` for a film's
+    // frame made between two of its own (Team Friend's film pacer), which
+    // is no frame of the title's: not counted, and not held to the frame
+    // rate cap.
+    void ShowOnWindow(const Settings::Values& settings, int clientWidth, int clientHeight, bool between)
+    {
+        const bool hdr = g_hdrSwapChain;
         // The menu, the counters and the screenshot key, over the picture.
         Overlay::Initialize(g_swapChainWindow, g_device.Get(), g_context.Get());
         if (!hdr) Overlay::Render(g_backView.Get(), g_backTexture.Get(), clientWidth, clientHeight);
@@ -2264,8 +2285,12 @@ namespace
         {
             // The screenshot of the picture alone, made 8 bit (the game's
             // white at the top); then Dear ImGui into its layer, laid over
-            // at the UI's brightness.
-            if (Overlay::TakeScreenshotRequest()) Overlay::SaveScreenshot(g_backTexture.Get(), clientWidth, clientHeight, g_hdrValues[1] / 80.0f);
+            // at the UI's brightness. (0.5.683: COD3_SHOT_OVERLAY, the
+            // tests: taken after the layer is laid over, below, so what
+            // the overlay draws over the view, the flamethrower's flame, is
+            // in it.)
+            static const bool shotOverlay = getenv("COD3_SHOT_OVERLAY") != nullptr;
+            if (!shotOverlay && Overlay::TakeScreenshotRequest()) Overlay::SaveScreenshot(g_backTexture.Get(), clientWidth, clientHeight, g_hdrValues[1] / 80.0f);
             if (UiLayerReady(clientWidth, clientHeight))
             {
                 const float clear[4] = { 0, 0, 0, 0 };
@@ -2279,13 +2304,14 @@ namespace
                                  g_backView.Get(), whole, program, g_pointSampler.Get(), nullptr, g_premultipliedBlend.Get());
                     }
             }
+            if (shotOverlay && Overlay::TakeScreenshotRequest()) Overlay::SaveScreenshot(g_backTexture.Get(), clientWidth, clientHeight, g_hdrValues[1] / 80.0f);
         }
         ID3D11RenderTargetView* noTargets[1] = { nullptr };
         g_context->OMSetRenderTargets(1, noTargets, nullptr);
         ForgetBindings();
         DumpFrame(g_backTexture.Get());
 
-        RenderStats::EndGpuFrame();
+        if (!between) RenderStats::EndGpuFrame();
         // COD3_VSYNC=0|1 over the settings.
         static const int vsyncOverride = []() { const char* t = getenv("COD3_VSYNC"); return t ? (t[0] == '0' ? 0 : 1) : -1; }();
         const bool vsync = vsyncOverride >= 0 ? vsyncOverride != 0 : settings.vsync;
@@ -2295,7 +2321,7 @@ namespace
         // swap, which the title's next frame waits for anyway. A sleep for
         // most of it and a spin for the last bit: Windows' sleep is late by
         // up to a millisecond even at its finest.
-        if (settings.frameCap > 0)
+        if (settings.frameCap > 0 && !between)
         {
             using clock = std::chrono::steady_clock;
             static clock::time_point due = clock::now();
@@ -2338,6 +2364,198 @@ namespace
         }
         g_lastPresent.store(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
         if (getenv("COD3_D3DDEBUG") != nullptr) DrainDebugMessages();
+    }
+
+    // The film pacer: a film's frames between its own after the first, and
+    // its own frame last, each onto the window at its time (a step of the
+    // film's interval apart from the swap), by a thread of its own under
+    // the renderer's lock. A new swap, or any present, ends what is left.
+    struct FilmPacing
+    {
+        std::chrono::steady_clock::time_point start;
+        double step = 0.0;
+        int steps = 0, next = 0;          // the next to show: 2..steps-1 a frame between, steps the film's own
+        D3D11_VIEWPORT viewport{};
+        uint64_t generation = 0;
+        bool remastered = false;          // the remastered film's frames (film_hd.cpp), of the picture's size
+        uint32_t size[2] = {};
+    };
+    FilmPacing g_filmPacing;              // under g_mutex
+    std::atomic<bool> g_filmPacingActive{ false };
+    std::mutex g_filmPacerMutex;
+    std::condition_variable g_filmPacerWake;
+
+    void FilmPacer()
+    {
+        using clock = std::chrono::steady_clock;
+        for (;;)
+        {
+            {
+                std::unique_lock<std::mutex> wait(g_filmPacerMutex);
+                g_filmPacerWake.wait(wait, []() { return g_filmPacingActive.load(); });
+            }
+            clock::time_point due;
+            uint64_t generation;
+            {
+                std::lock_guard<std::recursive_mutex> lock(g_mutex);
+                if (!g_filmPacingActive.load()) continue;
+                due = g_filmPacing.start + std::chrono::duration_cast<clock::duration>(std::chrono::duration<double>(g_filmPacing.step * (g_filmPacing.next - 1)));
+                generation = g_filmPacing.generation;
+            }
+            for (auto now = clock::now(); now < due; now = clock::now())
+            {
+                if (due - now > std::chrono::microseconds(1500)) Sleep(1);
+                else YieldProcessor();
+            }
+            std::lock_guard<std::recursive_mutex> lock(g_mutex);
+            if (!g_filmPacingActive.load() || generation != g_filmPacing.generation) continue;
+            Settings::Values settings = Settings::Get();
+            if (!SwapChainReady())
+            {
+                g_filmPacingActive.store(false);
+                continue;
+            }
+            // Merged on 0.5.546: this tree's drawing thread (render_queue.h)
+            // may still be running draws queued before this lock was taken;
+            // as the queue asks of anything else using the context, it is
+            // let finish first, and its bindings forgotten. Render::Draw
+            // queues only under g_mutex, so nothing more comes in meanwhile.
+            RenderQueue::Sync(15);
+            ForgetBindings();
+            const float black[4] = { 0, 0, 0, 1 };
+            g_context->ClearRenderTargetView(g_backView.Get(), black);
+            const float phase = float(g_filmPacing.next) / g_filmPacing.steps;
+            if (g_filmPacing.remastered)
+            {
+                settings.filmSharpen /= 4;
+                FilmHd::Draw(g_context.Get(), phase, RenderPost::Target(g_device.Get(), g_compile, g_filmPacing.size[0], g_filmPacing.size[1]),
+                             g_filmPacing.size[0], g_filmPacing.size[1], GammaTable());
+            }
+            else if (g_filmPacing.next < g_filmPacing.steps) RenderPost::FilmBetween(g_context.Get(), settings, phase);
+            else RenderPost::FilmShowNew(g_context.Get());
+            RenderPost::Apply(g_context.Get(), settings, true, g_backView.Get(), g_filmPacing.viewport);
+            ForgetBindings();
+            ShowOnWindow(settings, g_swapChainWidth, g_swapChainHeight, true);
+            if (++g_filmPacing.next > g_filmPacing.steps) g_filmPacingActive.store(false);
+        }
+    }
+
+    void StartFilmPacer()
+    {
+        static std::once_flag once;
+        std::call_once(once, []() { std::thread(FilmPacer).detach(); });
+        {
+            std::lock_guard<std::mutex> wake(g_filmPacerMutex);
+            g_filmPacingActive.store(true);
+        }
+        g_filmPacerWake.notify_one();
+    }
+
+    // The last swapped frame onto the window. `swapped` when the title has
+    // just swapped (not the window asking for the last frame again).
+    void PresentLocked(const Settings::Values& settings, bool swapped)
+    {
+        Timed timed(RenderStats::Frame().presentNanoseconds);
+        if (!SwapChainReady() || !BuiltInPrograms()) return;
+        const int clientWidth = g_swapChainWidth, clientHeight = g_swapChainHeight;
+        const float black[4] = { 0, 0, 0, 1 };
+        g_context->ClearRenderTargetView(g_backView.Get(), black);
+        const bool hdr = g_hdrSwapChain;
+        QueryDisplay();
+
+        const RenderResources::Resolved* frame = RenderResources::ResolvedAt(g_frontBuffer);
+        const bool fxaa = (AntiAliasing(settings) == 1 || AntiAliasing(settings) == 5) && g_fxaaPixelShader;
+        if (frame != nullptr && frame->resource != nullptr)
+        {
+            // Sixteen by nine, as the console sends it, centred; filling the
+            // screen, the frame is already the window's shape (ApplySettings).
+            const float aspect = g_fillAspect.load() > 0.0f ? float(clientWidth) / float(std::max(1, clientHeight)) : 16.0f / 9.0f;
+            float width = float(clientWidth), height = width / aspect;
+            if (height > clientHeight) { height = float(clientHeight); width = height * aspect; }
+            const D3D11_VIEWPORT viewport{ std::floor((clientWidth - width) * 0.5f), std::floor((clientHeight - height) * 0.5f), std::floor(width), std::floor(height), 0.0f, 1.0f };
+            // The anti aliasing reads the frame itself, in its own pixels,
+            // and writes into the picture's rectangle: the frame is the
+            // chosen resolution, so its rows are the window's, and it has
+            // no black either side to bleed a dark rim into the edges.
+            // With a look chosen, or a film to smooth or sharpen (F11), the
+            // picture goes to render_post.cpp's own target of the frame's
+            // size first, and from there onto the window.
+            const bool film = FilmPlaying();
+            // 0.5.549: not in HDR: the HDR swap chain pass below draws it
+            ID3D11RenderTargetView* look = !hdr && RenderPost::Active(settings, film)
+                ? RenderPost::Target(g_device.Get(), g_compile, frame->width, frame->height) : nullptr;
+            if (look != nullptr)
+            {
+                const D3D11_VIEWPORT whole{ 0.0f, 0.0f, float(frame->width), float(frame->height), 0.0f, 1.0f };
+                DrawQuad(frame->resource, frame->width, frame->height, 0, 0, float(frame->width), float(frame->height),
+                         look, whole, fxaa ? g_fxaaPixelShader.Get() : g_presentPixelShader.Get(), g_linearSampler.Get(), GammaTable());
+                // A remastered film (film_hd.cpp): kept in step by this
+                // swap's picture, then its frames in the title's place, the
+                // first now and the rest by the film pacer as below; less
+                // of the films' sharpening, which its frames do not need.
+                Settings::Values filmSettings = settings;
+                bool remastered = false;
+                if (swapped) remastered = FilmHd::Swap(g_device.Get(), g_context.Get(), g_compile, RenderPost::Picture(), frame->width, frame->height,
+                                                       film && settings.filmRemastered);
+                else remastered = film && FilmHd::Active();
+                g_filmPacing.generation++;
+                g_filmPacingActive.store(false);
+                if (remastered)
+                {
+                    filmSettings.filmSharpen /= 4;
+                    const int steps = swapped ? FilmSteps() : 1;
+                    FilmHd::Draw(g_context.Get(), 1.0f / steps, look, frame->width, frame->height, GammaTable());
+                    if (steps > 1)
+                    {
+                        g_filmPacing.start = std::chrono::steady_clock::now();
+                        g_filmPacing.step = 1001.0 / 30000.0 / steps;
+                        g_filmPacing.steps = steps;
+                        g_filmPacing.next = 2;
+                        g_filmPacing.viewport = viewport;
+                        g_filmPacing.remastered = true;
+                        g_filmPacing.size[0] = frame->width;
+                        g_filmPacing.size[1] = frame->height;
+                        StartFilmPacer();
+                    }
+                }
+                else
+                {
+                RenderPost::FilmClean(g_context.Get(), settings, film);
+                // A film at 30: the first of the frames between the last and
+                // this one (halfway at 60 a second, more on a faster screen)
+                // shown now, the rest and this one last in turn by the film
+                // pacer (below), a film frame less a step late. The title's
+                // thread goes on with its next frame meanwhile: waiting here
+                // held the film's swaps up, and with several frames between
+                // the film player fell behind and stopped.
+                const int steps = film && swapped ? FilmSteps() : 2;
+                if (swapped && RenderPost::FilmFrame(g_context.Get(), settings, film, 1.0f / steps))
+                {
+                    g_filmPacing.start = std::chrono::steady_clock::now();
+                    g_filmPacing.step = RenderPost::FilmFrameInterval() / steps;
+                    g_filmPacing.steps = steps;
+                    g_filmPacing.next = 2;
+                    g_filmPacing.viewport = viewport;
+                    g_filmPacing.remastered = false;
+                    StartFilmPacer();
+                }
+                }
+                RenderPost::Apply(g_context.Get(), filmSettings, film, g_backView.Get(), viewport);
+                ForgetBindings();
+            }
+            else if (!hdr)
+                DrawQuad(frame->resource, frame->width, frame->height, 0, 0, float(frame->width), float(frame->height),
+                         g_backView.Get(), viewport, fxaa ? g_fxaaPixelShader.Get() : g_presentPixelShader.Get(), g_linearSampler.Get(), GammaTable());
+            // The HDR mode: RenoDX's swap chain pass (hdr/cod3_hdr.hlsl),
+            // the frame already tone mapped when its scene pass ran.
+            else if (ID3D11PixelShader* program = HdrProgramFor("present", 0, 1, fxaa))
+            {
+                HdrUpload(g_hdrPresentGraded, Kernel::FilmPlaying());
+                DrawQuad(frame->resource, frame->width, frame->height, 0, 0, float(frame->width), float(frame->height),
+                         g_backView.Get(), viewport, program, g_linearSampler.Get(), GammaTable());
+            }
+        }
+        ShowOnWindow(settings, clientWidth, clientHeight, false);
     }
 
     // The anti aliasing asked for: 0 none, 1 FXAA, 2 MSAA 2x, 3 MSAA 4x,
@@ -2408,9 +2626,29 @@ namespace
             if (scale < 0.25f) scale = 0.25f;
         }
         RenderResources::RequestScale(scale);
+        // Filling the screen (F11): the frame drawn the window's shape, its
+        // width widened over the scale by that shape over the title's frame's,
+        // so its pixels are square; the title's view is made that shape too
+        // (title_fixes.cpp), and the HUD squeezed back to 16:9 in the middle
+        // (render_commands.cpp, xenos_hlsl.cpp).
+        float fill = 0.0f;
+        if (settings.fillScreen && g_swapChainWidth > 0 && g_swapChainHeight > 0)
+        {
+            fill = float(g_swapChainWidth) / float(g_swapChainHeight);
+            if (std::fabs(fill - 16.0f / 9.0f) < 0.01f) fill = 0.0f;
+        }
+        g_fillAspect.store(fill);
+        // The shadow maps' detail (F11): 1 the console's, up to 4 times finer.
+        static const int shadowPinned = []() { const char* t = getenv("COD3_SHADOWDETAIL"); return t ? atoi(t) : 0; }();
+        RenderResources::RequestShadowDetail(uint32_t(shadowPinned > 0 ? shadowPinned : settings.shadowDetail));
+        RenderResources::RequestWiden(fill > 0.0f ? fill / g_frameShape.load() : 1.0f);
+        RenderCommands::SetFill(fill <= 0.0f ? 0.0f : fill > 16.0f / 9.0f ? (16.0f / 9.0f) / fill : -(fill / (16.0f / 9.0f)));
         // The blur while aiming: COD3_AIMBLUR=0|1 over the settings.
         static const int aimBlurOverride = []() { const char* t = getenv("COD3_AIMBLUR"); return t ? (t[0] == '0' ? 0 : 1) : -1; }();
         RenderCommands::SetAimBlur(aimBlurOverride >= 0 ? aimBlurOverride != 0 : settings.aimBlur);
+        // The surface light (F11): at night, the world's solid surfaces lit
+        // more in their own draws (render_post.cpp says how much it is night).
+        RenderCommands::SetSurfaceLight(RenderPost::SurfaceLight(settings));
         RenderCommands::SetShellShockBlur(settings.shellShockBlur);
         RenderCommands::SetRendering(settings.sharpShadows, settings.fastShadowMaps, settings.foliageCoverage);
         RenderCommands::SetSteadyDecals(settings.steadyDecals);
@@ -2805,8 +3043,12 @@ void Render::Draw(uint32_t initiator, uint32_t indexBase, uint32_t indexWord)
     const bool queue = g_queueOn && g_queueActive;
     t_deferring = queue;
     const bool prepared = RenderCommands::PrepareDraw(initiator, indexBase, command);
+    // 0.5.809: the dual pistols' left gun and arm: this draw again, mirrored
+    RenderState::DrawCommand mirror;
+    bool skipOriginal = false;
+    const bool mirrored = prepared && RenderCommands::PrepareMirror(command, mirror, skipOriginal);
     t_deferring = false;
-    if (prepared)
+    if (prepared && !skipOriginal)
     {
         command.blendObject = RenderPipeline::BlendObject(command.blend);
         command.depthObject = RenderPipeline::DepthObject(command.depth);
@@ -2816,6 +3058,18 @@ void Render::Draw(uint32_t initiator, uint32_t indexBase, uint32_t indexWord)
         {
             RenderQueue::Sync(14);
             ExecuteDraw(command);
+        }
+    }
+    if (mirrored)
+    {
+        mirror.blendObject = RenderPipeline::BlendObject(mirror.blend);
+        mirror.depthObject = RenderPipeline::DepthObject(mirror.depth);
+        mirror.rasterizerObject = RenderPipeline::RasterizerObject(mirror.rasterizer);
+        if (queue && Queueable(mirror)) QueueDraw(mirror);
+        else
+        {
+            RenderQueue::Sync(14);
+            ExecuteDraw(mirror);
         }
     }
     if (g_queueOn && g_queuePublished.load(std::memory_order_relaxed) != g_queueWritten && ++g_unpublishedDraws >= PublishDraws)
@@ -2895,7 +3149,6 @@ void Render::LogNextFrame()
 
 void Render::Swap(uint32_t frontBufferPhysical, uint32_t width, uint32_t height)
 {
-    (void)width; (void)height;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!Start()) return;
     RenderQueue::Sync(12);
@@ -2931,6 +3184,7 @@ void Render::Swap(uint32_t frontBufferPhysical, uint32_t width, uint32_t height)
     RenderCommands::CheckLateWrites();
     PollLayerQueries();
     g_frontBuffer = Guest::GpuOffset(frontBufferPhysical);
+    if (width >= 320 && height >= 200) g_frameShape.store(float(width) / float(height));   // Team Friend: the frame's shape, for filling the screen
     if (FrameLogged()) printf("frame: swap %llu of %08X\n", (unsigned long long)g_swaps.load(std::memory_order_relaxed), frontBufferPhysical);
     // Whether this frame had the HDR mode's scene pass: it is shown so,
     // and again by an idle present until the next swap.
@@ -2940,7 +3194,7 @@ void Render::Swap(uint32_t frontBufferPhysical, uint32_t width, uint32_t height)
     // The frame's end: onto the window, the counters closed, the next
     // frame's settings taken.
     const Settings::Values settings = Settings::Get();
-    PresentLocked(settings);
+    PresentLocked(settings, true);
     RenderStats::EndFrame();
     // Verify mode (verify.h): what each check has looked at, every ten
     // seconds while any is on, so the log says it ran even when it found
@@ -2986,7 +3240,7 @@ void Render::PresentIdle()
     if (!lock.owns_lock()) return;
     if (!g_started || g_failed) return;
     RenderQueue::Sync(13);
-    PresentLocked(Settings::Get());
+    PresentLocked(Settings::Get(), false);
 }
 
 void Render::Report()
@@ -3025,5 +3279,21 @@ bool Render::HdrActive() { return g_hdrSwapChain; }
 int Render::HdrCompiling() { return g_hdrCompiling.load(std::memory_order_relaxed); }
 
 bool RenderInternal::FrameLogged() { return ::FrameLogged(); }
+float Render::FillAspect() { return g_fillAspect.load(); }
 uint64_t RenderInternal::Swaps() { return g_swaps.load(std::memory_order_relaxed); }
 int RenderInternal::DumpNumber() { return g_dumpNumber; }
+
+// 0.5.477: the depth resolve the title reads on the CPU (cpu_depth.cpp).
+namespace { std::atomic<uint32_t> g_cpuDepthAt{ 0 }; }
+uint32_t RenderInternal::CpuDepthAt() { return g_cpuDepthAt.load(std::memory_order_relaxed); }
+void Render::CpuReadsDepthAt(uint32_t physical)
+{
+    static const bool off = []() { const char* t = getenv("COD3_DEPTHREADBACK"); return t != nullptr && t[0] == '0'; }();
+    if (off) return;
+    const uint32_t at = physical & 0x1FFFF000u;
+    if (g_cpuDepthAt.exchange(at, std::memory_order_relaxed) != at)
+    {
+        printf("render: the title reads the depth resolved to %08X on the CPU; it is written back there\n", at);
+        fflush(stdout);
+    }
+}

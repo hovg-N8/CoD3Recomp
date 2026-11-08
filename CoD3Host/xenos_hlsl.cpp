@@ -1030,7 +1030,7 @@ uint64_t XenosHlsl::Version()
     // A number that changes when the translation would, or when one of the
     // environment knobs that shape the HLSL is set: the disk cache keyed by
     // it then starts afresh rather than serving the other translation.
-    std::string text = "xenos_hlsl 2026-10-06 bswap packed flat3d fetch offsets alu pairs read first pixel params gradients dx dy depth offset pixel centre loop ids index offset in program hud scale";
+    std::string text = "xenos_hlsl 2026-10-06 bswap packed flat3d fetch offsets alu pairs read first pixel params gradients dx dy depth offset pixel centre loop ids index offset in program hud scale surface light fill";
     text += Depth24() ? " depth 20e4 centroid" : " depth 32";
     text += " shadow weights, coverage 2026-10-18, hdr clamp 2026-10-19";
     if (const char* lanes = getenv("COD3_SCALARLANES")) { text += " lanes="; text += lanes; }
@@ -1243,6 +1243,15 @@ XenosHlsl::Translation XenosHlsl::Translate(const std::vector<uint32_t>& words, 
         // over. The source changes, so the cache keeps the real programs.
         // COD3_D3DSHOW=rN puts out a register instead, and rN@M the
         // register as it stood after the Mth instruction, for walking a
+        // Surface light (F11, render_post.cpp): bits 24 to 30 of the flags,
+        // set by render_commands.cpp only on the world's solid surfaces (a
+        // depth written, no blending), brighten what they put out the way
+        // more light on them would: the brightness through a curve that
+        // lifts the dark most and keeps white white, the colour kept. The
+        // sky, smoke, flashes and the HUD are left as they are.
+        hlsl += "    { uint level = (flags.x >> 24) & 0x7Fu; if (level != 0u) { float k = float(level) / 50.0;\n"
+                "        float l = dot(saturate(oC0.rgb), float3(0.2126, 0.7152, 0.0722)); float lit = l * (1.0 + k) / (1.0 + k * l);\n"
+                "        oC0.rgb = saturate(oC0.rgb * (lit / max(l, 1e-4))); } }\n";
         // program and seeing where a value goes wrong. Either form takes a
         // program's hash before a colon (COD3_D3DSHOW=1234...:r11@70) so
         // only that one program is changed and the rest of the picture
@@ -1304,6 +1313,15 @@ XenosHlsl::Translation XenosHlsl::Translate(const std::vector<uint32_t>& words, 
                 // The polygon offset's constant part, in depth units, as the
                 // console adds it (viewportOffset.w; see render_commands.cpp).
                 "      cz += viewportOffset.w * ww;\n"
+                // Filling a screen wider (or narrower) than 16:9: a flat draw
+                // (w of one: the HUD, a menu) squeezed into the 16:9 middle
+                // (viewportScale.w across, or up and down when negative), so
+                // it keeps its shape; one reaching the screen's edges (a fade,
+                // a flash, the game's own full screen passes) is left to cover
+                // it, unless bit 22 says to squeeze those too (no world drawn:
+                // a film, a menu's picture). render_commands.cpp sets them.
+                "      if (viewportScale.w != 0.0 && abs(ww - 1.0) < 1e-5) { bool all = (vte & 0x400000u) != 0; float s = abs(viewportScale.w);\n"
+                "          if (viewportScale.w > 0.0) { if (all || abs(cx) < 0.999) cx *= s; } else { if (all || abs(cy) < 0.999) cy *= s; } }\n"
                 "      output.position = float4(cx, cy, cz, ww); }\n";
         for (uint32_t i = 0; i < 16; i++) hlsl += Format("    output.o%u = o%u;\n", i, i);
         hlsl += "    return output;\n}\n";

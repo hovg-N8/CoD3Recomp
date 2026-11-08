@@ -1,0 +1,12 @@
+name = "cod3-master"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+
+[[durable_objects.bindings]]
+name = "DIRECTORY"
+class_name = "Directory"
+
+# SQLite-backed Durable Objects are on Cloudflare's free plan.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Directory"]

@@ -1,0 +1,98 @@
+Co-op v35 (Team Friend, 2026-10-20), made on Team Justin's 0.5.313 source. Answers co-op test 6.
+Only CoD3Host/coop.cpp changed (campaign program only, #ifndef COD3_MP; nothing in CoD3MP).
+Built here as CoD3.exe from 0.5.313 + this coop.cpp; one-PC test (two copies, Forest) results are in
+COOP-V35-ONE-PC-TEST.txt. UNTESTED between two PCs. Both PCs need the same CoD3.exe: the messages
+changed (CWS2 / CWG2 / 44-byte CWP1); an older host is reported on the joining screen.
+
+What the joining player saw in test 6 and earlier: soldiers jittering, cartwheeling in place, running
+sideways, popping up far away; few of the host's grenades or smoke; few weapon drops.
+
+Causes found (from test 6's host log and the joiner's own coop-join-play.log of Oct 18):
+ a. The host's whole world went as ONE UDP message of ~340 entities (12 KB, up to 32 KB) 20 times a
+    second. Tailscale's packets are 1280 bytes, so each message was 10+ IP fragments; losing any one
+    lost the whole update. Then the next one jumped.
+ b. Places were timed by when they ARRIVED, so internet jitter became speed jitter.
+ c. The joiner never forgot entities the host had deleted (its list sat at 348 for minutes), so
+    their partners kept being pulled to old places.
+ d. A soldier was slid toward the host's place every frame while his own legs (setgoalpos) also
+    walked him, and his body was turned to the host's facing whatever way his legs went: the two
+    fought (jitter) and he ran sideways.
+ e. When a host soldier died and his entity lost its actor, it was sent as an ordinary moving thing.
+    The joiner's soldier paired with it was NOT killed (the kill path needed the actor flag) and got
+    the corpse's lying-down angles every frame: the cartwheels. No death there = no weapon dropped.
+ f. Soldiers were paired with the nearest of their class at ANY distance (worst 20000+ units in the
+    joiner's log), then snapped there: the "random spawning".
+ g. Only the players' grenades were sent; the joiner's soldiers threw their own (not the host's).
+ h. magicgrenade (sub_824B27A8) fails when its three arc tries (sub_823D6DB0, sub_823D6EB0,
+    sub_823D85B8) find no arc from the hand: test 6's "NOT thrown". It reads the weapon from actor
+    +2564 (checked in the code; the builtins table's +2504 is the scripts' grenadeweapon field).
+ i. The joiner's smoke was thrown from inside his stand-in on the host and hurt him (586/449/821).
+
+What v35 does:
+ 1. CWS2 world parts: header "CWS2", sequence u32, host clock f64 (seconds), part u16, parts u16;
+    then up to 30 SyncEntry (36 bytes; same layout as before) = 1100 bytes, one packet, each part
+    useful alone. Only soldiers, the players, the stand-ins and things that have moved are sent
+    (30-60 entries instead of 340). (a, c)
+ 2. NetClock + Track: the receiver learns the clock offset (min-tracking, jitter measured) and
+    shows each thing at sender time "now - offset - delay" (delay 0.1 s + 1.5 x jitter, at most
+    +0.25; COD3_COOP_DELAY sets the base), interpolating between real updates and predicting ahead
+    from the last speed for up to 0.2 s when an update is late (no vertical prediction). (b)
+ 3. An entry not heard for 1 s is dropped on the joiner (only while updates are arriving). (c)
+ 4. DriveActor (soldiers, and both players' bodies): his own legs walk him (setgoalpos, 0.35 s
+    ahead of the host's movement, renewed every 0.2 s if it moved 16 units, goal radius 24 moving /
+    12 standing). He is only pushed when off by more than a dead zone (32 units; a player's body
+    16), at a speed that grows with the error (capped 700/s), and put there outright only past
+    COD3_COOP_SNAP (320). A soldier's angles are NEVER written (except at a snap: yaw only); a
+    player's body turns to the player's view yaw only while standing still. (d)
+    DriveThing (doors, gates, vehicles): placed exactly at the buffered place and angles.
+ 5. Deaths: the host remembers which entities were soldiers; one that loses its actor is still sent
+    as a soldier with health 0. The joiner kills its partner (dodamage, as before: he falls and drops
+    his weapon there) and never moves a body or a non-soldier into a soldier again. Things of class
+    'actor_*' are never moved as things. (e)
+ 6. Pairing: a living host soldier pairs only with a LIVING soldier here within 800 units. A pair
+    whose soldier died here while the host's lives is let go. A living host soldier with no partner
+    for 1.5 s gets a new one: dospawn (sub_824B9118) from the nearest spawner (type 12) whose
+    type+classname key matches, put at the host's place (4 a second at most, 3 tries each). (f)
+    The story's own soldiers (no "_reg" in the class: Dixon, the medic, Guzzo, Huxley) pair at
+    any distance and are never hidden or removed. The joiner's own unpaired "_reg" soldiers are
+    hidden after 0.75 s (hide flag 0x400 of entity +632, shown again if paired); at 4 s the
+    scripts' delete is tried once (the one-PC test: it leaves a LIVING soldier be), then he is
+    kept below the level (HideBelow) each second until paired again.
+ 7. Grenades, CWG2 (32 bytes): id u32 (sent twice, taken once), thrower u16 (the sender's entity
+    number; 1 = the sender's player), kind u16 (1 frag, 2 smoke), landing place, weapon u32, fuse
+    f32. The host sends EVERY grenade (thrower = nearest soldier/player within 150 units when it
+    appears); the joiner only its player's. A grenade must have flown 40 units (one lying smoke was
+    re-sent 3 times in test 6). The joiner's soldiers keep no grenades of their own (actor +2576
+    grenadeammo = 0 each 0.5 s; one is lent for a remote throw). Grenades thrown for the other copy
+    are never sent back. RemoteGrenade tries 4 release points: hand height, higher, halfway up, and
+    last straight above the landing place. (g, h)
+ 8. The host's stand-in for the joiner takes no damage from his own grenade until its fuse + 1 s
+    (logged "the stand-in's own grenade hit him for N: not sent"), and never more than 250 at once. (i)
+ 9. Stances on bodies change only after holding 0.25 s (test 6's "->1" then "->4" pairs).
+10. Stand-in choice: MakeBody tried for a minute (30 tries, was 10) before borrowing; borrowing any
+    non-"_reg" ally (Dixon in test 6) is off unless COD3_COOP_ANYALLY=1.
+11. CWP1 (joiner -> host) now 44 bytes: + the joiner's clock (f64) for the same buffer on the host.
+    The host still takes 28/32/36-byte ones.
+12. COD3_COOP_APPLY is on by default for the joiner now (=0 turns it off); the old "=1" slide mode
+    and COD3_COOP_SNAPPY are gone.
+13. Sprint (SprintPoll, campaign only): made to play like multiplayer's. The campaign program has no
+    sprint of its own (multiplayer's start sub_8248E970 and stamina sub_82495980, ps +44 flags
+    0x10000/0x20000, stamina +1168, have no counterpart in default.xex), so it is still g_speed:
+    tap to run (toggle_sprint as before; firing, aiming, crouch, prone or letting go of forward ends
+    it), speed rises to 1.5x over 0.25 s (it jumped at once), a run lasts 4 s (COD3_SPRINT_SECONDS),
+    run dry = out of breath 1.5 s then back from a quarter; stopped yourself = refills after 0.75 s,
+    full from empty in 3 s (the numbers of mp_fixes.cpp's quick sprint recovery). No lowered-gun
+    sprint animation: the campaign has none to play.
+
+14. One-PC testing (LOCAL-COOP-TEST.bat in this package): COD3_SPINWAIT=0 for both copies and
+    the joiner started 40 s after the host. On an 8-thread PC two copies that spin on their waits
+    starved each other to 0 fps at the menu (black screens), and two started at once stalled the
+    first in its opening film (a GPU wait). Not a two-PC problem; no code change for it.
+
+New log lines to grep: "coop: world at" (now with clock delay/jitter and "put in place outright"
+counts), "coop: move:", "made one (from spawner", "has no partner on the host: let go", "coop: body:
+N threw the other copy's ... (try N)", "coop: world: a soldier's grenade", "sprint:".
+
+Not changed (still open from test 6): after the host's relaunch for the next mission his game went to
+the main menu and nothing reconnected (item 5): needs the joiner's coop-relaunch.log; the mission's
+story and objectives still run on both copies separately.

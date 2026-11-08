@@ -25,4 +25,8 @@ namespace Net
     // next one waiting here (-1 for none).
     void SideSend(const void* data, int size, unsigned int only = 0);
     int SideReceive(void* data, int size, unsigned int* from);
+
+    // 0.5.428: a game hosted here off the public list (at most 2 s), before
+    // the process ends.
+    void PublicShutdown();
 }

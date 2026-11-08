@@ -1,0 +1,62 @@
+Co-op v38 (Team Friend, 2026-10-24), on top of v36 (= the co-op in 0.5.320 .. 0.5.416). Answers co-op test 8.
+Only CoD3Host/coop.cpp changed (campaign program only, #ifndef COD3_MP). Diff: coop-v38-vs-v36.diff.
+NEW MESSAGES (CWG3, CWA1, CWI1): both PCs need the same new CoD3.exe.
+
+What test 8 showed (island; host log from Justin, joiner's coop-join-play.log):
+ a. Dropped MP40s spun on the joiner's ground: the world sync moved "anything that moved" on the host onto
+    the joiner's nearest thing of that kind, every frame, dropped weapons (type 2) and grenades (type 3)
+    too, against their own physics.
+ b. Grenades came a second or more late (sent only once landed, re-thrown from wherever the thrower's
+    partner stood), and were also moved about by (a).
+ c. The host's body on the joiner was put back in place ~70 times a second for 30 s (470 units off each
+    time: something of the joiner's own held it), so the host flickered / was not where he was.
+ d. After the host's in-place restart the joiner never made a body for the host again (110 s).
+ e. 1665 "film: CWF1 for count 2 left" lines: the joiner read the film port only in films, so v36's
+    once-a-second CWF1s piled up there.
+ f. 129 "spawner N made nobody": host soldiers with no partner on the joiner (invisible there, but their
+    shots still hurt from the host's world). The one-PC test showed why: the game's soldiers are full of
+    the joiner's own unpaired soldiers (hidden below the level, still alive).
+ g. On the joiner every soldier fired whenever its own AI liked; the shots that hurt came from the host.
+
+What v38 does:
+ 1. Dropped weapons and grenades are never sent, paired or moved (each copy's own physics). (a)
+ 2. CWI1 (20 bytes: key, place): a dropped weapon picked up or cleared away in one copy is deleted in the
+    other (its own of that key nearest the place, within 128 units; the scripts' delete). Both ways.
+ 3. Grenades, CWG3 (56 bytes): sent the frame a grenade appears, with its own trajectory (entity +32
+    where it was let go, +44 its speed; found by dumping a thrown grenade). The other copy throws one
+    (magicgrenade, from that same place; 64/128 higher targets if no arc) and writes the same +32/+44
+    into it: the same arc, off the same walls. The CWG2 of its landing (same id) follows: the other
+    copy's grenade, once it lies still too, is moved there if 80+ units off (bodies, not the same in the
+    two copies, can bounce it). An id thrown early is never thrown again. A CWG2 alone (CWG3 lost) is
+    thrown as before. Grenade ids now start from the clock (not 1 again after a relaunch). (b)
+ 4. Soldiers' shots, CWA1: sub_823ED9B8 (actor shoot; only the scripts' shoot builtins sub_824B8FF8 /
+    sub_824B9088 call it, the animscripts' fire included) is hooked. Host: each soldier's shot is sent
+    (his clock, entity number) every 50 ms. Joiner: the soldier paired with him fires at the host's time
+    less the world's display delay; the joiner's paired soldiers and the host's body do not fire on their
+    own while the host's world arrives (they do again if it stops for 1 s). Host: the joiner's stand-in
+    no longer fires on its own (only when the joining player does). (g)
+ 5. Facing by the game's orientmode "face angle" (sub_824ABE18 writes actor +372 = 1, +376/+388 a
+    constant at 0x82062C54, +380/+384 the yaw): the players' bodies always face where that player looks
+    (strafing/backpedalling no longer runs sideways); a soldier standing still faces where the host's
+    does; moving, his own facing is given back.
+ 6. Stuck: one put in place 5 times in 2 s is not driven again; a stuck player body / stand-in is hidden
+    and replaced, a stuck soldier's pair released. (c)
+ 7. A host soldier with no partner for 1.5 s: first one of the joiner's own unpaired "_reg" soldiers is
+    taken for him (his kind, else his side), put at his place and shown; only then the spawners: 3 tries
+    of his kind, 3 of his side (another kind). The joiner's own unpaired soldiers are no longer deleted
+    (the scripts' delete left them alive, unmovable, and filling the game's soldiers): hidden, silent
+    and kept below the level until one is taken for a host soldier. (f)
+ 8. MakeBody (the players' bodies) takes each friendly spawner in turn, not always the first, and logs
+    failures. "coop: players: no body for the host after N s: ..." says once a mission why there is
+    none (player record, host's place, entries, tries). (d: cause still to be seen in a log.)
+ 9. The joiner reads the film port every frame (stale CWF1s dropped; logged 5 times at most). (e)
+10. Diagnostics: COD3_COOP_NADESHOT=1 (grenades thrown for the other copy followed to where they go off,
+    pictures at +0.3 s and +1 s), COD3_COOP_SHOTLOG=1 (weapon time, buttons, trigger).
+
+One-PC test (two copies, Forest, joiner 40 s after the host, scripted pads, 7 min), last runs:
+  soldiers 0.9-4.8 units from the host's on average once settled, 0 put in place outright, 0 host soldiers
+  with no partner (3 taken from the joiner's own), 400+ of the host's soldiers' shots shown on the joiner,
+  the joiner's 6 shots shown on the host; the joiner's grenades came down 14 and 15 units from where his
+  did on the host; the host soldiers' grenades 28-366 (bounced off bodies; moved there once still).
+UNTESTED between two PCs. Still open: the host's relaunch for a retry/next mission; why the joiner made no
+host body after test 8's restart (the new diagnostic line will say).
