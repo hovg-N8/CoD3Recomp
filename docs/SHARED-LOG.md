@@ -1,3 +1,7 @@
+<!-- claude-2026-11-07-handoff -->
+**2026-11-07 (Claude):** 0.5.828-0.5.851. Dual Colt flash (render_commands.cpp PrepareMirror flash path: the draw's own vertex, particle program c0/c3; the far glow in shots is the impact spark). COD3_DAMAGE_LOG; tank shell (means 10) kills to seat 0's player. DualColtWorldModel (w_us_pist_dual_WORLD). Render::SetNightLight (ps 9a14f83313a256a4 c18-c26 on seelownight). Bots in tanks (bots.cpp: g_lookVehicleUntil, corners, g_vehicleGoal in Think). Not a bug: tank surface sound layers (no cues in any bank). GitHub: CoD3Recomp-fork clone + GitHub Desktop; release v0.5.851. Friend zip 0.5.851 full.
+<!-- /claude-2026-11-07-handoff -->
+
 <!-- claude-2026-11-05-handoff -->
 **2026-11-05 (Claude):** 0.5.781-0.5.795. Map changes with tanks: 783 vehicle files once a map, 784 after-map archives reused (781 reload reverted), 787 DemonWare guard (sub_821C08B0), 788 Kangaroo before the map, 790 vehicle packs with the first map + Stuka cut. 791 Saint-Lo gentler cut (tanks visible), tankblast command. 792-795 tank events from Merville's table (sub_82555160; set name '<archive>.fx', EVENT.FX; unverified). Logs: game heap per extra archive, DemonWare allocation failures, physics presets/kinds per map, COD3_PEERTRAP.
 <!-- /claude-2026-11-05-handoff -->

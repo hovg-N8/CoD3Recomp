@@ -40,7 +40,24 @@ if ((Test-Path -LiteralPath $vehicles) -and $target -ne $payload) { Copy-Item -L
 # 0.5.204: the host's bot kits (his old one is in the backup).
 $kits = Join-Path $payload 'bot_kits.txt'
 if ((Test-Path -LiteralPath $kits) -and $target -ne $payload) { Copy-Item -LiteralPath $kits -Destination $target -Force; Write-Host 'Bot kits (bot_kits.txt) installed.' }
-foreach ($name in 'dlc-tool','textures','kangaroo-technical-dossier') {
+# 2026-10-18: the co-op launchers and notes (and the test findings zip).
+foreach ($name in 'PLAY-COOP-HOST.bat','PLAY-COOP-JOIN.bat','COOP-README.txt','LOCAL-COOP-TEST.bat') {
+    $from = Join-Path $payload $name
+    if ((Test-Path -LiteralPath $from) -and $target -ne $payload) { Copy-Item -LiteralPath $from -Destination $target -Force }
+}
+Get-ChildItem -LiteralPath $payload -Filter 'coop-test-*-for-friend.zip' -File -ErrorAction SilentlyContinue | ForEach-Object { if ($target -ne $payload) { Copy-Item -LiteralPath $_.FullName -Destination $target -Force } }
+# 0.5.851: the host's other data files (gun fits, flags, CTF routes); his old ones go to the backup first.
+foreach ($name in 'world_models.txt','dom_flags.txt','ctf-flags.txt','ctf-routes.txt') {
+    $from = Join-Path $payload $name
+    if ((Test-Path -LiteralPath $from) -and $target -ne $payload) {
+        $existing = Join-Path $target $name
+        if (Test-Path -LiteralPath $existing) { Copy-Item -LiteralPath $existing -Destination $backup }
+        Copy-Item -LiteralPath $from -Destination $target -Force
+    }
+}
+# 0.5.851: 'saves' brings the map packs (Carentan, Seelow, Seelow Night) and 'game' the tank, Stuka
+# and mortar files: both merged into his folders, nothing of his removed.
+foreach ($name in 'dlc-tool','textures','kangaroo-technical-dossier','custom','saves','game') {
     $from = Join-Path $payload $name
     if ((Test-Path -LiteralPath $from) -and $target -ne $payload) { Copy-Item -LiteralPath $from -Destination $target -Recurse -Force }
 }
@@ -54,4 +71,5 @@ if ($LASTEXITCODE -ne 0) { throw 'Executables installed, but settings could not 
 Write-Host "VERIFIED: build $($manifest.version) installed at $target" -ForegroundColor Green
 Write-Host "Launch this exact file: $target\CoD3MP.exe"
 Write-Host 'Your network addresses and player name were preserved.'
+if (Test-Path -LiteralPath (Join-Path $payload 'saves')) { Write-Host 'New maps installed: Carentan, Seelow and Seelow Night.' }
 if (!$NoLaunch) { Start-Process -FilePath (Join-Path $target 'CoD3MP.exe') -WorkingDirectory $target }

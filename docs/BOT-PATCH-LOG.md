@@ -1,3 +1,7 @@
+<!-- claude-2026-11-07-handoff -->
+**Bots, 2026-11-07 (Claude), 0.5.839-0.5.851:** bots get into tanks. (1) Think's yaw steering (wanted yaw less learnt offset, 8 deg/frame) undid any other turn every frame: g_lookVehicleUntil[slot] (real-time ms) pauses it while LookAtVehicle or the vehicle walk has his facing. (2) A tank takes a use press only from a CORNER: the bots' vehicle code walks to the nearer rear corner (100 out, yaw +-135); over 300 away that corner is Think's goal (g_vehicleGoal/g_vehicleGoalAt; no ring, no long way) so the learnt-map route takes him; near it, the corner changes every 8 s (all four) and he walks round on a 170 ring. tank_fire: 8 places at 95/130, COD3_TANK_FIRE_KIND=sherman|panzer. Results, 4 bots 6 min Seelow: 0 entries before, 3-4 now (Shermans too). Left: ~9 give-ups (took too long) and ~24 'is stuck: backs up' (driving) a match.
+<!-- /claude-2026-11-07-handoff -->
+
 <!-- claude-2026-11-05-handoff -->
 **Bots, 2026-11-05 (Claude):** no bot code changed. Bots on Seelow go for the tanks ('bots: vehicle: slot N goes for mp_shermanTank ... as driver/gunner') and sometimes fire them (tankevents2/4), often giving up ('took too long', 'a fight'). A test can only see a tank shot when a bot fires one.
 <!-- /claude-2026-11-05-handoff -->

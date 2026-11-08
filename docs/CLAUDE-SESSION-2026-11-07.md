@@ -1,4 +1,82 @@
-# Claude session 2026-11-07 (overnight, user asleep)
+# Claude session 2026-11-07 (overnight + day): dual Colt flash, tank damage, Stuka, Seelow Night arms, bots in tanks, GitHub 0.5.851, friend zip
+
+## LATEST: HANDOFF 2026-11-07 ~22:00 (READ THIS FIRST)
+
+**State:** source + install **0.5.851**, built OK, last test clean (botveh8: 6 min, no crash).
+**GitHub:** the fork is up to date. github.com/hovg-N8/CoD3Recomp main = b6f76d5 (README for 0.5.851)
+on top of 8e52594 (all source/tools/docs 0.5.424 -> 0.5.851). Release **v0.5.851** published by the user
+("CoD3 Recomp 0.5.851 (Newest Release) Including MP & CO-OP"), source only, no binaries.
+**Friend update:** D:\Call of Duty 3 (USA, Europe)\CoD3MP-update-0.5.851.zip (760 MB, FULL: maps, custom
+guns, game files, textures) + CoD3MP-source-0.5.851.zip. Made and dry-run installed; whether it was sent
+to the friend is up to the user.
+
+### How committing works now (new this session)
+- D:\Call of Duty 3 (USA, Europe)\CoD3Recomp-main\CoD3Recomp-main (the WORKING source, where builds run)
+  is a downloaded copy with NO .git.
+- D:\Call of Duty 3 (USA, Europe)\CoD3Recomp-fork is a git clone of the fork (made this session). To
+  commit: copy the source over it with tar, excluding build/, CoD3RecompLib/ppc*, private, levels,
+  tools/build*, tools/XenosRecomp, tools/xenia-tests, tmp-video, *.log, build-status.txt,
+  build-request.taken.txt, __pycache__ (the exact command is in this file's commit section below);
+  then git add -A and check `git diff --cached --name-only` for game data (.cod .wbk .xex .iso .bin
+  .exe .dll .png .wav ...): must be empty. The fork's .gitignore also ignores .claude/,
+  tools/master-server/.wrangler/, CoD3Host/_backup_before_controller_fix/, CoD3Recomp/ (an old nested
+  repo copy). tools/XenonRecomp shows as a modified submodule: never stage it.
+- Pushing: command-line git push hangs on a GitHub sign-in (no stored CLI credential). Push through
+  **GitHub Desktop** (signed in): its repo list has the OLD clone "CoD3Recomp" (2 commits behind; do
+  not use) and the new CoD3Recomp-fork (added this session); "Push origin" sends commits. Tags do
+  not go up that way: the user made the release on github.com with "create tag on publish".
+- The built-in browser pane is NOT signed in to GitHub (the user declined); releases are made by the
+  user in his own browser.
+
+### Confirmed by the user in play (0.5.838)
+- Tanks on Seelow work: cannon, MG, sounds, shell explosions. "the tanks weapons work great".
+- Seelow Night arms (0.5.837 moonlight scale): "perfect". Seelow Night fog: keep as is.
+- Dual Colt muzzle flash lined up on both barrels ("Yes, lined up").
+
+### Done this session, not yet confirmed in play
+- 0.5.834: a tank shell's kill is the driver's (was the tank's). Seen in the log (tankdmg3).
+- 0.5.835-836: COLT .45 DUAL world model = the Colt's body twice (second 5 along -z, 1 back).
+  Built, logged, NEVER seen on screen (cg_thirdperson does nothing; bench camera cannot aim).
+  Who can see it: the friend online, or a killcam. If wrong: COD3_DUAL_WORLD_Z/_Y/_X tune it.
+- 0.5.841-851: bots get into tanks. Two real bugs found:
+  1) Think's yaw steering (bots.cpp ~5588) undid every other turn each frame -> g_lookVehicleUntil
+     pauses it while LookAtVehicle / the vehicle walk have his facing;
+  2) a tank lets you in only from a CORNER (sides never) -> bots walk to the nearer rear corner (100
+     out, yaw +-135), take Think's learnt-map route to it when >300 away (g_vehicleGoal), try the other
+     corners every 8 s, walk round the tank on a 170 ring. tank_fire tries 8 places at 95/130.
+  Results (4 bots, 6 min Seelow, no tank_fire): before 0 entries; now 3-4 per match incl. Shermans.
+- seelow_install.sh + tools/kapf/kapf_lists.py remake the vehicles' effects packs exactly.
+- MAKE-FRIEND-UPDATE.ps1 / INSTALL-FRIEND-UPDATE.ps1 (install folder AND port\ in source) now carry the
+  map packs, all custom\ guns (flame_arms.bin was missing before!), the 8 tank/mortar game files and the
+  data files. UPDATE-README.txt = the friend's instructions.
+- docs/RELEASE-0.5.851-NOTES.md = the release notes; README.md (source and fork) updated to 0.5.851.
+
+### What's left (the user's list, in rough order)
+1. Bots and tanks, polish: ~9 "took too long" give-ups a match and ~24 "is stuck: backs up" (DRIVING
+   pathing) per match. Ideas: longer give-up time for a far tank; driving route following.
+2. Dual Colts in third person: needs eyes (friend online / killcam).
+3. Kangaroo treads on Merville (0.5.815 fix): never checked on screen. The user dropped the Kangaroo
+   and BMW on Seelow; Merville's Kangaroo still matters.
+4. Tank MG with a HUMAN gunner: untested.
+5. Remove/limit diagnostics: env-gated ones are fine (COD3_FLASH_DRAWS, COD3_DAMAGE_LOG,
+   COD3_EVENT_SHOTS, COD3_ALL_EFFECTS, COD3_VEHICLE_PROBE, COD3_TANK_FIRE_KIND); ungated but capped:
+   0.5.815-820 effect lookup / asset-slot lines, "on his way to" / "routes to" every 4 s per bot
+   (these two are useful; maybe cap them).
+6. Seelow Night: DONE (user). Tank hit surface sound layers: NOT A BUG (no such cues in any bank).
+   UAV Stuka: draws fine (stuka3).
+7. Nothing else promised. Friend zip on CLAUDE.md is "on hold" but the user asked for one tonight: make
+   friend zips only when asked.
+
+### Traps learnt this session (also in memory)
+- Bash heredocs eat backslashes: a printf "\n" written through a heredoc broke two builds (0.5.847,
+  0.5.849 caught before building). Write C++ with the Edit tool.
+- Tests cannot see brief effects or third person (memory: test-camera-limits).
+- run_test.py backs up logs itself (-before dirs); the user's own play log of the day was in
+  logs-backup\20261107-124351-sherman1-before.
+- Old boot-time "GPU is hung" guest text in a log is harmless (seen in many runs).
+
+---
+
 
 Source and install: 0.5.832 built OK at start of the night. Nothing committed. Friend zip on hold.
 User's words before sleeping: keep working down the list, keep notes so the next session picks up.
@@ -134,3 +212,29 @@ User's words before sleeping: keep working down the list, keep notes so the next
 - Still: ~9 "took too long" give-ups a match and ~24 "is stuck: backs up" (driving). Possible next steps:
   longer give-up time for a far tank; driving pathing. botveh6 had the old boot-time "GPU is hung"
   guest text (seen in many earlier logs, harmless).
+
+## ~21:00 Friend update 0.5.851 (full)
+- D:\Call of Duty 3 (USA, Europe)\CoD3MP-update-0.5.851.zip (760 MB) via MAKE-FRIEND-UPDATE.ps1 full.
+- MAKE-FRIEND-UPDATE.ps1 now always adds: custom\flare, custom\mosin, custom\mantle (whole, no dumps or
+  vsconst probes), flame_arms.bin (was missing from the flamethrower list since 0.5.709!), the map packs
+  Carentan/Seelow/SeelowNight (saves\content\00000002), 8 game files (mp_merv vehicles + vehiclefx,
+  sp\vehfx, Saint-Lo panzer cut, Crossroads Stuka cut, 3 Laison mortar files) and the data files
+  (vehicles, bot_kits, world_models, dom_flags, ctf-flags, ctf-routes).
+- INSTALL-FRIEND-UPDATE.ps1 copies saves and game (merged) and the data files (old ones backed up).
+- UPDATE-README.txt rewritten as the friend's full instructions (install, copy-paste fallback, how to pick
+  the new guns and maps, playing together, troubleshooting).
+- Dry run: extracted + installed into a scratch folder: 93 files identical to the host's, exe matches.
+  Both scripts copied into port\ in the source.
+
+
+## ~21:30 GitHub commit section (how 0.5.851 went up)
+- Clone: git clone --filter=blob:none https://github.com/hovg-N8/CoD3Recomp.git CoD3Recomp-fork (beside
+  CoD3Recomp-main). Copy (from the source root):
+  tar -cf - --exclude=./build --exclude=./CoD3RecompLib/ppc --exclude=./CoD3RecompLib/ppc_mp
+  --exclude=./CoD3RecompLib/private --exclude=./CoD3RecompLib/levels --exclude=./tools/build
+  --exclude=./tools/build-scan --exclude=./tools/XenosRecomp --exclude=./tools/xenia-tests
+  --exclude=./tmp-video --exclude='*.log' --exclude=./build-status.txt --exclude=./build-request.taken.txt
+  --exclude='__pycache__' . | (cd ../../CoD3Recomp-fork && tar -xf -)
+  then in the clone: git checkout -- .gitignore (keep the fork's), git add -A, check for binaries.
+- Commits: 8e52594 "Release 0.5.851 source" (201 files) and b6f76d5 "README: what the fork adds up to
+  0.5.851". Local tag v0.5.851 exists in the clone (not pushed; the release made its own on GitHub).

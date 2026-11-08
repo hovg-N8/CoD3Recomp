@@ -1,3 +1,7 @@
+<!-- claude-2026-11-07-handoff -->
+**Claude handoff 2026-11-07 ~22:00 (0.5.851 built and installed; pushed to GitHub, release v0.5.851; full friend zip made):** docs/CLAUDE-SESSION-2026-11-07.md (its LATEST section) is the handoff. 0.5.828-832 dual Colt flash on both barrels (user: lined up); 0.5.833-834 tank shell kills credited to the driver; 0.5.835-836 two-Colt world model (unseen); 0.5.837 Seelow Night arms by moonlight (user: perfect); 0.5.839-851 bots get into tanks (steering pause g_lookVehicleUntil, corners, g_vehicleGoal route). Tools: kapf_lists.py; friend update scripts carry maps, custom guns and game files.
+<!-- /claude-2026-11-07-handoff -->
+
 <!-- claude-2026-11-05-handoff -->
 **Claude handoff 2026-11-05 ~22:20 (0.5.795 built and installed; nothing committed; friend zip on hold):** docs/CLAUDE-SESSION-2026-11-05.md is the handoff. 0.5.781-0.5.795: map changes with tanks fixed and tested both ways; tanks visible (Saint-Lo cut 7 of 8 blocks); Stuka cut (game\sp\crssrds\vehicles_stuka.cod); kapf.py decompresses campaign blocks; tank events through sub_82555160 + Merville's mp_merville.fx (0.5.795, unverified).
 <!-- /claude-2026-11-05-handoff -->

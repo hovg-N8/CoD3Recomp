@@ -1,3 +1,7 @@
+<!-- claude-2026-11-07-handoff -->
+**Next session (2026-11-07 handoff): read the LATEST section of docs/CLAUDE-SESSION-2026-11-07.md.** 0.5.851 installed and on GitHub (fork main b6f76d5, release v0.5.851). Open, in order: 1) bots and tanks polish (about 9 'took too long' give-ups and 24 'is stuck: backs up' a match: give-up time for far tanks, driving route following); 2) dual Colts' third-person model needs eyes (friend online / killcam; COD3_DUAL_WORLD_Z to flip); 3) Kangaroo treads on Merville (0.5.815) unchecked; 4) tank MG with a human gunner untested; 5) cap or remove diagnostics. To commit: copy the source into CoD3Recomp-fork (exclusions in that file), check no game data, push with GitHub Desktop.
+<!-- /claude-2026-11-07-handoff -->
+
 <!-- claude-2026-11-05-handoff -->
 **Next session (2026-11-05 handoff): read docs/CLAUDE-SESSION-2026-11-05.md, 'Where to pick up'.** 0.5.795 installed, nothing committed. 1) verify the tank guns' events (the user fires a cannon and MG on Seelow; log lines 'is named' and 'made by the game from Merville's table -> R'); 2) if R is -1, read sub_8254D628 and its scope r24; 3) Merville-first heap with the gentler Saint-Lo cut; 4) look at the UAV Stuka since its cut; 5) engine sound by ear, shell damage.
 <!-- /claude-2026-11-05-handoff -->
