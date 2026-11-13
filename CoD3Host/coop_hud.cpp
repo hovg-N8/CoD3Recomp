@@ -100,7 +100,7 @@ namespace Coop
                         const float r = 10.0f * scale;
                         dl->AddRectFilled(ImVec2(x - r * 0.35f, y - r), ImVec2(x + r * 0.35f, y + r), red);
                         dl->AddRectFilled(ImVec2(x - r, y - r * 0.35f), ImVec2(x + r, y + r * 0.35f), red);
-                        char line[64]; snprintf(line, sizeof line, "REVIVE  %d", int(std::ceil(s.bleed[other])));
+                        char line[64]; snprintf(line, sizeof line, "DOWN  %d", int(std::ceil(s.bleed[other])));
                         Text(dl, x, y + r + 4, red, line, scale * 0.9f);
                     }
                     Text(dl, x, y - 22.0f * scale, Colour[other], s.names[other], scale);
@@ -112,7 +112,7 @@ namespace Coop
                     s.down[other] ? IM_COL32(220, 50, 50, 255) : Colour[other]);
                 if (s.down[other] && fmod(t, 3.5) < 2.5)
                 {
-                    char line[96]; snprintf(line, sizeof line, "%s needs to be revived!", s.names[other]);
+                    char line[96]; snprintf(line, sizeof line, "%s is down: revive within %d s", s.names[other], int(std::ceil(s.bleed[other])));
                     Text(dl, width * 0.5f, height * 0.30f, IM_COL32(255, 80, 80, 255), line, 1.3f * k);
                 }
                 if (s.down[other] && s.revive[other] > 0.0f)
@@ -121,7 +121,12 @@ namespace Coop
                     Text(dl, width * 0.5f, height * 0.58f, IM_COL32(255, 255, 255, 255), line, 1.1f * k);
                     Bar(dl, width * 0.5f - 120 * k, height * 0.58f + 26 * k, 240 * k, 8 * k, s.revive[other], IM_COL32(255, 255, 255, 230));
                 }
-                else if (s.down[other] && s.nearDowned) Text(dl, width * 0.5f, height * 0.58f, IM_COL32(255, 255, 255, 255), "Hold [Use] to revive", 1.1f * k);
+                // (0.5.875) the revive is back: beside him, hold Use (X, or the keyboard's Use key)
+                else if (s.down[other] && !s.down[me] && s.nearDowned)
+                {
+                    char line[96]; snprintf(line, sizeof line, "Hold Use (X) to revive %s", s.names[other]);
+                    Text(dl, width * 0.5f, height * 0.58f, IM_COL32(255, 255, 255, 255), line, 1.1f * k);
+                }
             }
             // you, down: the screen greying red as you bleed out
             if (s.down[me])
@@ -131,7 +136,7 @@ namespace Coop
                 Text(dl, width * 0.5f, height * 0.22f, IM_COL32(255, 70, 70, 255), "YOU ARE DOWN", 1.6f * k);
                 char line[96];
                 if (s.revive[me] > 0.0f) snprintf(line, sizeof line, "%s is reviving you", s.names[other]);
-                else snprintf(line, sizeof line, "%s can revive you: %d s", s.names[other], int(std::ceil(s.bleed[me])));
+                else snprintf(line, sizeof line, "Waiting for a revive: back in beside %s in %d s", s.names[other], int(std::ceil(s.bleed[me])));
                 Text(dl, width * 0.5f, height * 0.22f + 34 * k, IM_COL32(255, 255, 255, 255), line, 1.1f * k);
                 Bar(dl, width * 0.5f - 120 * k, height * 0.22f + 64 * k, 240 * k, 8 * k, s.revive[me] > 0.0f ? s.revive[me] : left,
                     s.revive[me] > 0.0f ? IM_COL32(255, 255, 255, 230) : IM_COL32(220, 50, 50, 230));

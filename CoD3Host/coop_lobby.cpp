@@ -223,11 +223,38 @@ namespace Coop
             static double connectedAt = -1;
             static bool started = false;
             if (PeerConnected() && connectedAt < 0) connectedAt = now;
+            // (0.5.973) COD3_COOP_SOLO=1 (tests: tools/coop/coop_test.py --solo): the mission starts with no friend, 8 s in
+            {
+                static const bool solo = getenv("COD3_COOP_SOLO") != nullptr;
+                static double firstAt = -1;
+                if (firstAt < 0) firstAt = now;
+                if (solo && connectedAt < 0 && now - firstAt > 8) connectedAt = now;
+            }
+            // (0.5.946) asked again every 15 s while it has not begun, three times, as the lobby's own start is: three tests
+            // of forty-odd (t914a, t928a, t945f) stood in the menu after this one ask
+            static double wantAt = -1; static int wantAsked = 0;
+            if (want && want[0] && started && !in && MyMap().empty() && wantAsked < 3 && now - wantAt > 15)
+            {
+                wantAsked++; wantAt = now;
+                printf("coop: lobby: %s did not begin: asked again (COD3_COOP_MAP)\n", want); fflush(stdout);
+                Kernel::QueueConsoleCommand(std::string("spmap ") + want);
+            }
             if (want && want[0] && !started && MyMap().empty() && connectedAt >= 0 && now - connectedAt > 3)
             {
-                started = true;
+                started = true; wantAt = now;
                 printf("coop: lobby: starting %s (COD3_COOP_MAP)\n", want); fflush(stdout);
                 Notice(std::string("Co-op: starting ") + want + "...", 5000);
+                // (0.5.965) COD3_COOP_PREMAP="set skipto 2;...": console commands before the map (a level's start point)
+                if (const char* pre = getenv("COD3_COOP_PREMAP"))
+                {
+                    std::string all(pre); size_t at = 0;
+                    while (at <= all.size())
+                    {
+                        size_t end = all.find(';', at); if (end == std::string::npos) end = all.size();
+                        const std::string one = all.substr(at, end - at); at = end + 1;
+                        if (!one.empty()) { Kernel::QueueConsoleCommand(one); printf("coop: lobby: before the map: %s\n", one.c_str()); fflush(stdout); }
+                    }
+                }
                 Kernel::QueueConsoleCommand(std::string("spmap ") + want);
             }
         }

@@ -2543,6 +2543,23 @@ void MpFixesFlareRest(PPCContext& ctx, uint8_t* base, uint32_t entity, const flo
 // view is drawn (a throw cannot be scripted; screenshots)
 void MpFixesFlareModelTest(PPCContext& ctx, uint8_t* base)
 {
+    // 0.5.853: COD3_ADS_TEST="20 40": the left trigger (the sights) held from
+    // the first number of seconds after the view is first drawn to the second,
+    // for tests of a scope (COD3_PAD's holds keep the test from joining a side)
+    {
+        static double from = -1, to = -1;
+        static const bool on = []() { const char* t = getenv("COD3_ADS_TEST"); return t && sscanf(t, "%lf %lf", &from, &to) == 2; }();
+        static std::chrono::steady_clock::time_point since{};
+        static bool started = false, held = false;
+        float eye[3];
+        if (on && Flame::Eye(eye))
+        {
+            if (!started) { started = true; since = std::chrono::steady_clock::now(); }
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - since).count();
+            const bool want = now >= from && now < to;
+            if (want != held) { held = want; Input::HoldAim(want); printf("test: sights %s at %.1f s\n", want ? "up" : "down", now); fflush(stdout); }
+        }
+    }
     // 0.5.744: COD3_FLARE_THROW_TEST="20 40": the left bumper (the special
     // grenade: a pad's 0x0100 threw 740's flare) held that many seconds
     // after the view is first drawn: a throw for the tests (COD3_PAD's presses
@@ -15036,7 +15053,22 @@ void MpFixesMosinView(uint8_t* base, uint32_t held)
         for (size_t i = 0; i < sizeof(Guns) / sizeof(Guns[0]); i++)
             if (strcmp(Guns[i].name, "mosin_scoped") == 0) mosin = int32_t(i);
     if (mosin < 0) return;
-    const bool holding = g_campaignWeapon[mosin] > 0 && held == uint32_t(g_campaignWeapon[mosin]);
+    const bool held_ = g_campaignWeapon[mosin] > 0 && held == uint32_t(g_campaignWeapon[mosin]);
+    // 0.5.852: the user: through the Mosin's scope "i could see the sides of
+    // the scopes both left and right". The scoped Kar98's black surround is
+    // its own view (scope.w_ge_RFL_SCOPE and the body), hidden for CoD2's
+    // mesh. Once the view has zoomed past 55% of the player's field of view
+    // the Kar98's own scoped view is drawn (the same scope, zoom and
+    // numbers); CoD2's Mosin at the hip and early in the zoom.
+    extern float g_localViewFov;
+    const float ownFov = float(std::clamp(Settings::Get().fov, 50, 120));
+    const bool scopedIn = held_ && g_localViewFov > 1.0f && g_localViewFov < ownFov * 0.55f && !getenv("COD3_MOSIN_SCOPE_OWN");
+    const bool holding = held_ && !scopedIn;
+    {
+        static bool wasScoped = false;
+        static int told = 0;
+        if (scopedIn != wasScoped) { wasScoped = scopedIn; if (told < 20) { told++; printf("mosin: %s (view %.1f of %.0f)\n", scopedIn ? "scoped in: the Kar98's scope view drawn" : "out of the scope: CoD2's Mosin again", g_localViewFov, ownFov); fflush(stdout); } }
+    }
     if (getenv("COD3_MOSIN_NO_VIEW")) return;
     std::lock_guard<std::mutex> guard(g_bodyLock);
     static const uint32_t Fields[] = { 28, 0x40 + 88, 0x40 + 104, 0x138 + 24, 0x138 + 28, 0x158 + 24, 0x158 + 28 };
@@ -18441,6 +18473,64 @@ void MpFixesHeapReport(uint8_t* base)
            peak / 1048576.0, before ? (double(used) - double(before)) / 1048576.0 : 0.0);
     fflush(stdout);
     before = used;
+}
+// 0.5.868: frees of things that are not heap blocks. 867's log (the flare
+// freeze): the game heap's used count went 600 -> 3364 -> 1552 -> 3970 MB of 608.
+// The count moves by the size word 4 bytes before a block, and each step is a
+// word in 0x48000000-0x6E000000: a guest POINTER read as a size. Whatever was
+// being freed there is no block, and handing it to the real free breaks the free
+// lists. A size larger than the whole heap cannot be real: that free is refused
+// (a small leak), the count put back, and the caller named so the cause can be
+// fixed. Only at the one caller that has already taken it for a normal block
+// (sub_820DE470; the small pools before it have no such word).
+namespace HeapGuard
+{
+    void Tell(PPCContext& ctx, uint8_t* base, const char* what, uint32_t block, uint32_t size)
+    {
+        static std::atomic<int> told{ 0 };
+        if (told.fetch_add(1) >= 24) return;
+        printf("heapguard: %s of %08X, size word %08X is bigger than the heap; words around it:", what, block, size);
+        for (uint32_t o = 0; o < 32; o += 4) printf(" %08X", Guest::Read32(base, block - 16 + o));
+        printf("; guest call chain %08X", uint32_t(ctx.lr));
+        uint32_t frame = ctx.r1.u32;
+        for (int depth = 0; depth < 12; depth++)
+        {
+            if (frame < 0x10000u || frame >= 0xC0000000u) break;
+            const uint32_t caller = Guest::Read32(base, frame);
+            if (caller <= frame || caller - frame > 0x100000u || (caller & 7) != 0 || caller >= 0xC0000000u) break;
+            const uint32_t address = Guest::Read32(base, caller - 8);
+            if (address < 0x82000000u || address >= 0x8A000000u) break;
+            printf(" %08X", address);
+            frame = caller;
+        }
+        printf("\n");
+        fflush(stdout);
+    }
+}
+extern "C" PPC_FUNC(__imp__sub_820DF0F0);
+PPC_FUNC(sub_820DF0F0)
+{
+    if (uint32_t(ctx.lr) == 0x820DE65Cu && ctx.r3.u32 >= 0x10000u)
+    {
+        const uint32_t heap = ctx.r9.u32, capacity = Guest::Read32(base, heap + 1156), size = Guest::Read32(base, ctx.r3.u32 - 4) & ~3u;
+        if (capacity && size > capacity)
+        {
+            Guest::Write32(base, heap + 1160, Guest::Read32(base, heap + 1160) + size);
+            HeapGuard::Tell(ctx, base, "free refused", ctx.r3.u32, size);
+            return;
+        }
+    }
+    __imp__sub_820DF0F0(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_820DDCC0);
+PPC_FUNC(sub_820DDCC0)   // the resize: named only, it has to give the caller something back
+{
+    if (ctx.r3.u32 >= 0x10000u)
+    {
+        const uint32_t heap = Guest::Read32(base, 0x82A84120u + 9392), capacity = heap ? Guest::Read32(base, heap + 1156) : 0, size = Guest::Read32(base, ctx.r3.u32 - 4) & ~3u;
+        if (capacity && size > capacity) HeapGuard::Tell(ctx, base, "resize", ctx.r3.u32, size);
+    }
+    __imp__sub_820DDCC0(ctx, base);
 }
 // 0.5.557: the damage direction (the HUD's arrow toward where a hit came
 // from) for a victim that is no local player. sub_82452580 puts a 36-byte

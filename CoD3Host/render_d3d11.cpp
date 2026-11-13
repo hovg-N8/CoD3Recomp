@@ -10,6 +10,9 @@
 // creates a Direct3D object on a draw.
 
 #include "render.h"
+#include "menu_mouse.h"
+#include "DividerFilter.h"
+namespace MenuMouse { bool RemasteredBackdrop(); }
 #include "render_state.h"
 #include "render_commands.h"
 #include "render_internal.h"
@@ -2200,6 +2203,38 @@ namespace
         static int brightnessWas = 100;
         const int brightness = std::clamp(Settings::Get().brightness, 50, 150);
         bool have = !off && Gpu::DisplayGamma(table, version);
+#ifndef COD3_MP
+        // Entering the campaign menu applies the saved game gamma ramp.
+        // Present the remastered artwork with the ramp from Press Start.
+        // F11 brightness is applied below to either screen's shared ramp.
+        static uint32_t titleGamma[256];
+        static uint64_t titleGammaVersion = 0;
+        static bool capturedTitleGamma = false;
+        if (MenuMouse::RemasteredBackdrop() && !Kernel::FilmPlaying())
+        {
+            if (!capturedTitleGamma && MenuMouse::TitleScreen())
+            {
+                if (!have)
+                {
+                    for (uint32_t i = 0; i < 256; ++i)
+                    {
+                        const uint32_t v = (i << 2) | (i >> 6);
+                        table[i] = v | (v << 10) | (v << 20);
+                    }
+                    version = ~uint64_t{1};
+                }
+                memcpy(titleGamma, table, sizeof(titleGamma));
+                titleGammaVersion = version;
+                capturedTitleGamma = true;
+            }
+            if (capturedTitleGamma)
+            {
+                memcpy(table, titleGamma, sizeof(table));
+                version = titleGammaVersion;
+                have = true;
+            }
+        }
+#endif
         if (!have && (brightness != 100 || brightness != brightnessWas))
         {
             for (uint32_t i = 0; i < 256; i++) { const uint32_t v = (i << 2) | (i >> 6); table[i] = v | (v << 10) | (v << 20); }
@@ -2471,7 +2506,8 @@ namespace
             // screen, the frame is already the window's shape (ApplySettings).
             const float aspect = g_fillAspect.load() > 0.0f ? float(clientWidth) / float(std::max(1, clientHeight)) : 16.0f / 9.0f;
             float width = float(clientWidth), height = width / aspect;
-            if (height > clientHeight) { height = float(clientHeight); width = height * aspect; }
+            if (MenuMouse::RemasteredBackdrop()) { auto cover=JarcMenu::Cover(float(clientWidth),float(clientHeight)); width=cover.width;height=cover.height; }
+            else if (height > clientHeight) { height = float(clientHeight); width = height * aspect; }
             const D3D11_VIEWPORT viewport{ std::floor((clientWidth - width) * 0.5f), std::floor((clientHeight - height) * 0.5f), std::floor(width), std::floor(height), 0.0f, 1.0f };
             // The anti aliasing reads the frame itself, in its own pixels,
             // and writes into the picture's rectangle: the frame is the
@@ -2632,7 +2668,7 @@ namespace
         // (title_fixes.cpp), and the HUD squeezed back to 16:9 in the middle
         // (render_commands.cpp, xenos_hlsl.cpp).
         float fill = 0.0f;
-        if (settings.fillScreen && g_swapChainWidth > 0 && g_swapChainHeight > 0)
+        if (settings.fillScreen && !MenuMouse::RemasteredBackdrop() && g_swapChainWidth > 0 && g_swapChainHeight > 0)
         {
             fill = float(g_swapChainWidth) / float(g_swapChainHeight);
             if (std::fabs(fill - 16.0f / 9.0f) < 0.01f) fill = 0.0f;

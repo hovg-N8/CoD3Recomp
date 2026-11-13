@@ -639,6 +639,25 @@ PPC_FUNC(sub_8252B850)
         const std::string n = Text(base, ctx.r3.u32, 64), val = Text(base, ctx.r4.u32, 64);
         if (seen.size() < 3000 && seen.insert(n + "=" + val).second) { printf("coop: dvar set: %s = %s (from %08X)\n", n.c_str(), val.c_str(), lr); fflush(stdout); }
     }
+    // (0.5.967) a test aid: COD3_COOP_FORCEDVAR="skipto=2;start=x": the level scripts' setdvar of that name takes this
+    // value instead (a level's start point: the scripts set skipto "0" themselves at the start)
+    if (lr >= 0x824AB260u && lr < 0x824AB478u && ctx.r3.u32 && ctx.r4.u32)
+        if (const char* force = getenv("COD3_COOP_FORCEDVAR"))
+        {
+            const std::string n = Text(base, ctx.r3.u32, 64);
+            std::string all(force); size_t at = 0;
+            while (at <= all.size())
+            {
+                size_t end = all.find(';', at); if (end == std::string::npos) end = all.size();
+                const std::string one = all.substr(at, end - at); at = end + 1;
+                const size_t eq = one.find('=');
+                if (eq != std::string::npos && _stricmp(one.substr(0, eq).c_str(), n.c_str()) == 0)
+                {
+                    printf("coop: test: the scripts' %s \"%s\" forced to \"%s\"\n", n.c_str(), Text(base, ctx.r4.u32, 64).c_str(), one.substr(eq + 1).c_str()); fflush(stdout);
+                    ctx.r4.u64 = GuestText(base, one.substr(eq + 1));
+                }
+            }
+        }
     if (GetMode() == Mode::Host && lr >= 0x824AB260u && lr < 0x824AB478u && ctx.r3.u32 && ctx.r4.u32)
         HostScriptDvar(Text(base, ctx.r3.u32, 64), Text(base, ctx.r4.u32, 256), ctx.r5.u32);
     if (GetMode() == Mode::Join && lr >= 0x824AB260u && lr < 0x824AB478u && ctx.r3.u32 && ctx.r4.u32)

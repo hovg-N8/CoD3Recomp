@@ -1,15 +1,1848 @@
 # CoD3 Recomp: patch notes since 0.4.0
 
-**Current source version: 0.5.851.** See the newest entry below.
+**Current source version: 0.6.4.** See the newest entry below.
 
 Historical versioning note: 0.5.0 was the build of October 11, 2026, evening.
 From now on, every rebuild numbers itself one higher: 0.5.1, 0.5.2 and so on.
 The number shows in the window's title, at the top of CoD3MP.log, in the F11
 menu's title bar, and in VERSION.txt in the game folder.
 
+Rollover rule (2026-11-12): the last number stops at 999. The build after
+0.5.999 is 0.6.0, then 0.6.1 and so on; after 0.6.999 comes 0.7.0. The five
+builds first numbered 0.5.1000 to 0.5.1004 were renamed 0.6.0 to 0.6.4 in
+these notes and the docs. Those exes still say 0.5.100x in their title bars
+and logs; the next build is the first one that says 0.6.
+
 The numbers between 0.4.0 and 0.5.0 below are given after the fact, grouping
 the work by what it added. Only 0.4.0 and 0.5.0 were real builds with those
 names.
+
+---
+
+## 0.6.4: co-op: the joiner's live-grenade pick-up held back by who used the grenade
+
+- t1003a: still nothing held back; [[0x82A2AB6C]+40] is not the owner (sub_824F18C0's "r5 = JOINER" was a register
+  left from the caller). The caller is the game's USE, sub_82545F68(r3 activator, r4 entity): it calls the entity's
+  use callback - for a live grenade sub_82550400 - as (entity, activator, activator). So r4 there is the player who
+  picked it up: held back when that is the joining player. The probe line now names him.
+- t1004a: WORKS. Two pick-ups of the joining player's held back, the host's player given nothing; the level went on
+  ("Take the Church"). The joiner cannot pick live grenades up yet (they stay and go off).
+- t1004c: the HOST'S own pick-up still works ("an action started ... by A1B175F0 = the host's player", given).
+
+---
+
+## 0.6.3: co-op: the joiner's live-grenade pick-up held back by the action's own owner
+
+- t1002a: 0.6.2 still held nothing back (the slot was not his at that moment). sub_82550400(r3 = the live
+  grenade) takes the action's OWNER from [[0x82A2AB6C] + 40] (passed on as sub_824F18C0's r5 = THE JOINING
+  PLAYER) and its state by this machine's number: the action is held back when that owner is the joining player.
+
+---
+
+## 0.6.2: co-op: the held-back joiner action is found where it starts
+
+- t1001a: 0.6.1 held nothing back: the host's player still got the grenade. The pick-up's action starts from
+  82546050 (sub_82550400, r3 = the grenade), outside the joining player's Use pass, but with the local client's
+  slot [0x82A2AB40]+4 already his (the probe: sub_824F18C0 r5 = THE JOINING PLAYER). It is now held back when that
+  slot holds him too.
+
+---
+
+## 0.6.1: co-op: an action the joining player starts no longer plays on the host's player
+
+- Until the joining player has an action state of his own (0.6.0: the game has one, this machine's), a scripted
+  action started while his Use and hints run on the host (a live grenade's pick-up) is held back: before, the
+  HOST'S player picked the grenade up and threw it by himself (t999a). The joiner cannot pick live grenades up yet;
+  the grenade stays where it lies. COD3_COOP_JOINERACTIONS=1: as before.
+
+---
+
+## 0.6.0: co-op probe: who a scripted action is started for (the live grenade goes to the host)
+
+- t999a: CORRECTION to t997a. The joining player's Use by a live German grenade gave the grenade to the HOST'S
+  player ("the host's player was given stielhandgranate: the joining player too"), who threw it by himself (weapon
+  state 2 -> 1 -> 15, no button: the action's own throw). The joining copy's stielhandgranate was only the host's
+  inventory mirrored.
+- Why: the pick-up is a scripted ACTION (PickLiveGrenade). The action probe: sub_824F18C0 called with r5 = THE
+  JOINING PLAYER from sub_82550400 (lr 82550454). sub_82550400 takes the action's state from the table
+  0x82A59DA0 by this machine's local client number [0x82A2A1C8] (0 on the host), not by the entity: so every
+  action plays on the host's player. This probe logs the entity, that number and the table's first four states.
+- t1000a: ONE state only (826A6C00; the next words are not pointers: 19F9F0E8 EE078129 ...): the game has no
+  action state for a second local client. sub_82550400 is called (lr 82546050) with the live grenade's entity,
+  the state taken by local number 0. A fix needs a second state made for client 1 and the action module run for
+  him (its first-person side is the host's view): a project of its own.
+
+---
+
+## 0.5.999: co-op test aid: a picked-up live grenade is thrown back
+
+- COD3_COOP_TESTLIVE now, 1.5 s after holding Use by a live grenade, holds the grenade button 1 s (the game throws
+  on the release), to test the throw-back on either copy. Test only. (0.5.998 failed to build: a heredoc ate
+  the printf's backslash.)
+
+---
+
+## 0.5.997: co-op test aid: the grenade test looks at every entity slot
+
+- t996a: the joining copy drew all 16 German grenades (none over its puppet ceiling), but its test aid still
+  told none: it looked at slots 1..1023 only, and the puppets made later in the level lie past that. 4096 now.
+- t997a: THE JOINING PLAYER PICKS UP A LIVE GERMAN GRENADE. His copy's aid saw the Germans' grenades (slots ~1500
+  to 2200 there), held Use by one lying 25 from him, and the host's world gave him a stielhandgranate (count 1,
+  "the host has 1 for me: taken"). Throwing it back was not tried (the aid only picks up).
+
+---
+
+## 0.5.996: co-op test aid: the joining copy's grenade test knows the host's grenades by his word
+
+- t995a: the joining copy DOES draw the Germans' grenades ("the host's missile 505: class grenade, model
+  w_geNADE_WORLD, place yes", 14 German ones) - no bug in play. Its test aid missed them (it looked for the model's
+  name on the puppet); it now takes what stands for a missile of the host's from the joining copy's own list.
+
+---
+
+## 0.5.995: co-op probe: the host's grenades as the joining copy draws them
+
+- t994a (joining copy's live-grenade test only): his copy saw the host's own training grenades but NOT ONE German
+  grenade in the graveyard, though the host's missile probe had German ones land 40 from him (275 at 1079 -1181).
+  If the joining player cannot see the Germans' grenades, that is a real bug in play. The joining copy now logs each
+  missile of the host's as it is drawn ("the host's missile N: class, model, place").
+
+---
+
+## 0.5.994: co-op test aid: the joining copy's live-grenade test sees the host's grenades
+
+- t993a (0.5.993, two copies, Saint-Lo): THE WALL IS FIXED. After the hop the joining player is in the graveyard
+  in front of the host (room made at 1059 -1200, the host's side; shots show him among the gravestones).
+- t993a: the HOST'S live-grenade pick-up works: COD3_COOP_TESTLIVE held Use by a German grenade lying 21 away and
+  the game said "You have picked up a live grenade. Press G to throw".
+- The joining copy's test saw no grenade: there the host's grenades are puppets (not type 3). It now also knows
+  them by the model's name ("nade_world"), so the joiner's pick-up (his Use, through the host's world) can be tested.
+
+---
+
+## 0.5.993: co-op: room for the joining player after a scripted scene is on the host's side of it
+
+- t991a (0.5.991): the catch-up worked ("left behind by the host's scripted passage: put beside him (1100 -1239)")
+  but a second later the host saw the two players inside each other and MADE ROOM at a place from his trail:
+  1146 -1469 / 1140 -1278, from before the wall, on its far side. The joining player's shots: still at the wall,
+  field side. The trail was cleared only by a jump of 600+; the wall's scene carried the host ~185.
+- Now a scripted scene breaks the trail (cleared when it ends), and for 30 s after a scene the room is 56 IN FRONT
+  of the host (the scene leaves him facing the way on; behind him is what it carried him over), not behind.
+
+---
+
+## 0.5.992: co-op test aid: the live-grenade test sees first-generation grenades
+
+- t990g (two copies standing in Saint-Lo's graveyard fight): COD3_COOP_TESTLIVE told of no grenade, though the
+  missile probe saw 37 (the host's training ones, German ones in the graveyard). Its "told" check compared the
+  slot's generation with a remembered 0, so a grenade of generation 0 was never told. Fixed (the pick-up itself was not affected: none came within 90).
+  Test only; nothing changes in play. The German grenades there fell 1000+ from both players (they stood back).
+
+---
+
+## 0.5.991: co-op: the joining player lands with the host after Saint-Lo's wall
+
+- The user: the joiner is still stuck on the far side of the wall after the hop. The logs (t990a/d/e) show why:
+  riding beside the host, the joiner was set down on the host's spot MID-hop (on top of the wall, 1169 -1325)
+  when the host's link ended, dropped back on the field side, and at the scene's end was 171 from the host,
+  with the wall between them. The catch-up after a scripted passage (0.5.971) only acted at 350 or more.
+  Now it acts at 80 or more: after the host's scene has moved him 150+, the joiner is put on his spot.
+- Also: Saint-Lo's opening has NO button struggle (t990e/f: the 30 s hold behind the wall is a cinematic; the
+  "r1/l1 alternately" prompts were from a string dump). The joiner can board the truck himself (t990c).
+
+---
+
+## 0.5.990: co-op: a sprinting host no longer pulls the joining player along
+
+- The joining copy starts "riding beside the host (at a vehicle's speed)" when the host moves over 300 a second
+  for a second (0.5.961, Falaise's jeep). One fast reading was enough to start that second, and the ride then
+  held until the host stood still: the readings' times are when the host's messages arrive, so two that come close
+  together make a sprinting host (~285) read over 300. Now the smoothed speed must be over 300 too, and a slow
+  reading in the first second cancels it. t990a's TESTGO teleports set it off twice; t990b (0.5.990, the
+  same run) none, and the truck and the wall hop still carried the joiner ("carried by the scripts"), then put him
+  beside the host; "Take the Church" reached.
+- t990a (two copies, Saint-Lo's wall hop, desktop shots): the host's "cutscene" is his own first-person view moved
+  by the scripts (no separate camera). The joining player, carried beside him, sees the host's body go over the
+  wall with the Germans there, then is put beside him. The cutscene-camera lead is closed.
+
+---
+
+## 0.5.989: co-op probe: the view scan reports what it searched
+
+- t988a: the scan found no place with the player's eye, in the image or the heaps. It now also reports how many
+  committed 64 KB blocks it searched and how many places hold the player's feet (his own origin must be one).
+
+## 0.5.988: co-op probe: the view scan skips NaN
+
+- t987a: all 64 places the scan kept were NaN pairs ("not 2 or more away" let NaN through). NaN fails now,
+  and up to 200 places are kept.
+- t987a (two copies, hands-off, all of Saint-Lo's training by script): the joining player rode the truck,
+  was carried with the host through the wall-hop cutscene (the host's link passed from the truck to the
+  cutscene's mover), and was set down on the host's spot after it (68 from him at the scene's end).
+
+## 0.5.987: co-op probe: the view searched in the heaps too
+
+- t986e: no place in the game's image held the player's eye: COD3_COOP_VIEWSCAN searches the heaps too (virtual
+  0x40000000.., physical 0xA0000000..), only what is committed (coop_memscan.cpp), 10 to 90 above the feet.
+- The host's melee in co-op (0.5.983-0.5.986) was the test's: COD3_PAD's "r3" lasts two pad reads and, with two
+  copies running, the host's server misses it; held 0.4 s it melees (t986d). The route holds r3 and y now.
+
+## 0.5.986: co-op diagnostic: what the melee is told
+
+- t985a/b: the melee's weapon tests pass with a friend too ([0x82A92360]+1512 = 150, +180 = 1). The difference
+  is the host's record +128, an entity handle: entity 1. Alone it is a thing with no record. With a friend,
+  entity 1 is the joining player, so sub_82560B88 goes on to look at his record (+1556 ...).
+- sub_82560B88's answer to the melee (call returning to 0x82493718) is logged when it changes.
+
+## 0.5.985: co-op diagnostic: the melee's own tests
+
+- The melee begins in the shared movement code sub_824936E8 (weapon state 10). With the melee button (0x10) in
+  the command, it asks sub_82560B88 (about the record's +128 entity) and skips the melee if that says yes. It
+  needs [0x82A92360]+1512 set and +180 not 7. The host logs these values every 5 s (t984a/b: +40/+44/+48 the
+  same alone and with a friend; melee only alone).
+
+## 0.5.984: co-op diagnostic: the host's allowances
+
+- FOUND: in a co-op session the HOST's melee never begins (t983d, Forest: three right-stick clicks reached the
+  game, no weapon state 10; t983b/c, Saint-Lo: the crate's lid could not be broken, so the training stopped).
+  Alone it works (t983e, t982g). The action probe is not the cause (t983c with it off).
+- The host logs his record's +40/+44/+48/+12 and entity +632 every 5 s in a mission, alone and with a friend.
+
+## 0.5.983: co-op probe: where the client game keeps its view
+
+- The host logs his player's link (a truck, a gun) and the scene count when either changes, and up to 2000
+  server commands (200 before). In t982h (two copies), the host held Use at Saint-Lo's truck and never got on;
+  the solo host did (t982f).
+- COD3_COOP_VIEWSCAN="t1 t2 ...": at t1 the game's image is searched for this copy's eye position (the client
+  game's view among the places found). At each later time those places are read again. The aim is the host's
+  cutscene camera for the joining player: Saint-Lo's wall hop is now reached hands-off (tools/coop/stlo_route.py
+  --upto struggle) and it is a letterboxed cutscene from about 512 s to 546 s on the pad clock.
+
+## 0.5.982: co-op test aid: a settled shot can hit through G_Damage
+
+- COD3_COOP_TESTHITMODEL=1: each settled shot of COD3_COOP_TESTAIMMODEL also hits its target through the game's
+  own G_Damage (50, MOD_RIFLE_BULLET, this copy's player the attacker). In t981a, 44 settled shots at
+  Saint-Lo's helmets brought none down: the record's angles are not exactly the drawn view.
+  Test runs only.
+
+## 0.5.981: co-op test aid: the aim past the stick's dead zone
+
+- t980a: the aim stood 1.2 degrees off; a stick of 0.2 is inside the game's dead zone. The least stick is 0.3
+  now (none within 0.4 degrees), and a shot goes within 0.6 degrees (a helmet is 0.5 to 1.3 degrees wide there).
+
+## 0.5.980: co-op test aid: the aim's pitch the right way
+
+- t979a: the stick steered the yaw onto each helmet, but the pitch went the wrong way (stick up looks up,
+  and the pitch falls). Fixed, and the stick's gain is doubled (full at 6 degrees off).
+
+## 0.5.979: co-op test aid: aim steered like a player
+
+- COD3_COOP_TESTAIMMODEL steers the right stick from the error between the angles it wants and the record's own
+  view (+172, +176), holds the sights, and fires only once within 0.4 degrees for three frames. A target is
+  left when its model changes (hit) or after 6 s.
+  Before, the game's setplayerangles changed the record's angles but not the host's drawn view (t978b: the
+  view never turned, so the sights stood on empty places in t977a).
+- Input::SetLook(rx, ry, ms) and Input::PullTriggers(leftMs, rightMs).
+- (0.5.978's "delta NaN" was a misreading: the delta angles are integers.)
+
+## 0.5.978: co-op test aid: the aim's angles logged
+
+- COD3_COOP_TESTAIMMODEL logs the angles it wants beside the record's view angles and delta angles
+  (t977a: aimed at all six helmets' places, yet the sights stood on empty places).
+
+## 0.5.977: co-op test aid: aim at things of a model
+
+- COD3_COOP_TESTAIMMODEL="from-to:text": in those seconds this copy's player turns, four times a second, to the
+  nearest thing (within 3000) whose model's name holds the text. A thing aimed at for 2 s counts as done.
+  This is for Saint-Lo's training helmets, which move when the step begins (t976a: aiming at their census
+  places missed). It runs on both copies and in solo tests.
+- tools/coop/stlo_route.py: Saint-Lo's training as a host script (TESTGO, pad, TESTAIMMODEL).
+
+## 0.5.976: co-op solo tests log the objectives
+
+- With COD3_COOP_SOLO and no friend, the server's commands to the player (objectives, pickups) are logged with
+  the seconds since the start and the player's place ("coop: solo: server command"): following a scripted
+  route through Saint-Lo's training (t975b: the Garand taken hands-off, "Pull LMB to fire").
+
+## 0.5.975: co-op solo tests run their aids
+
+- With COD3_COOP_SOLO and no friend, the host's frame runs only the tests' aids (TESTGO, TESTLIVE, TESTGOD).
+  Before, it returned at once with no friend (t974a: nothing ran).
+
+## 0.5.974: co-op test aid: every grenade the live-grenade test sees
+
+- COD3_COOP_TESTLIVE logs each grenade (a missile, or a type 0 "grenade" left lying) once with its distance
+  and height from this copy's player (t973a: a grenade was thrown at the feet and none was seen near).
+
+## 0.5.973: co-op: the action probe in every co-op session, a solo test start
+
+- The scripted-action probe (0.5.972) is on in every co-op session once a friend is connected (host and
+  joining copy), so a played run records what runs at a wall hop, a struggle or a vehicle;
+  COD3_COOP_ACTIONPROBE=0 turns it off, =1 turns it on always. At most 8000 lines.
+- COD3_COOP_SOLO=1 (coop_test.py --solo): the co-op host starts COD3_COOP_MAP with no friend, 8 s in (the
+  lobby waited for one: t972b stood at the title).
+
+## 0.5.972: co-op: a probe of the scripted-action module, and a live-grenade test aid
+
+CORRECTION to the notes of 2026-11-11: sub_82535A40 / sub_82535B78 are NOT scripted-action handlers. They are
+called by the client game's entity-event code (sub_8244C248) for events 1..23 and 70..92, groups of 23, one per
+surface type (footsteps and landings), and 0x8253xxxx is the sound code. Their "local player only" test
+is a rumble or sound for this machine's own player and says nothing about struggles. What really
+reads the action definitions (PlayAnims ... VehicleLink, PickLiveGrenade) is sub_824F3308 (type at +32, control
+at +36), in 0x824F0000..0x8250FFFF.
+
+- COD3_COOP_ACTIONPROBE=1: every function of 0x824F0000..0x8250FFFF not hooked elsewhere (636) counts its
+  calls. The first call of each is logged with its arguments (=PLAYER, =RECORD, =JOINER marked), and once a
+  second the functions that became active are listed with the player's place ("coop: action probe:").
+  Generated by tools/coop/make_actionprobe.py. It replaces COD3_COOP_SCENEPROBE.
+- COD3_COOP_TESTLIVE=1 (or a pad mask in hex): Use held 1.2 s by a grenade lying still within 90 units
+  (either copy).
+- Input::HoldButtons(mask, ms).
+
+## 0.5.971: co-op: the joining player brought over after the host's scripted passage
+
+t959u (the user playing the host on Saint-Lo): the scripts carried the host over the wall (the hop is a
+scripted action) and into the struggle behind it; the joining player stayed behind the wall with no way
+across. Scripted actions play only for a machine's own player, so his copy cannot do the hop yet.
+
+- When the host's scene ends (K_PS flag 1 down for a second) having moved him 150 or more, and the joining
+  player is 350 or more from him (not riding), the joining player is put on the host's spot.
+- Logged: "the host's scene ended: it moved him N, I am M from him", "left behind by the host's scripted
+  passage".
+- tools/coop/coop_test.py --solo: the host alone (route finding).
+
+## 0.5.970: co-op: the host's change of body without a flicker (the joining copy)
+
+t969a (0.5.969, Forest, 12 changes of gun by the host's pad): the host's NEW body (a change of gun gives
+him another: 231 / 233) was drawn on the joining copy with nothing weighing on it (pose weight 0.00, a
+T-pose) on its first frame in 3 of the 12; the old body was hidden by the host in the same snapshot. The
+0.5.936 check (hidden till animated) took an animation SET at weight 0 as animated.
+
+- The new body is held hidden from the moment the snapshot puts it there till its pose weighs (the
+  animations playing on it adding to 0.5 or more), and the 0.5.936 check takes the same measure.
+- Till then the host's OLD body stays drawn in its last pose, a second at most.
+- (The 0.5.968 probe found no other frame short of a pose: moves, aim, fire, crouch, prone, reload,
+  melee all whole.)
+
+## 0.5.969: co-op: a probe of the host's change of body on the joining copy
+
+t968a (0.5.968, Forest, hands off, the host's pad aiming, firing, crouching, prone, reloading, melee and
+12 changes of gun; 0 s under 20 fps; the GPU reached 74 C): NOT ONE frame of the host's body short of a
+whole pose. The flicker is elsewhere: each change of gun gives the host a different body (231 / 233), and
+the body's number comes in the host's K_PS while its hide/show comes in the snapshot.
+
+- For 0.6 s after the host's body number changes, every frame: each of his two bodies, drawn here or
+  hidden, the weight of what plays on it, and the host's hide/show for it.
+
+## 0.5.968: co-op: a probe of the host's body short of a pose (the joining copy)
+
+The user: seen from the joining player, the host's body sometimes does "that flicker and tpose
+animation really fast". In t959u's log the host's body weighed 0.16 / 0.24 on its move at times (the rest
+on its aim up/down: a whole pose), "bare 0.4 s", 23 replays (its animation lost and set again).
+
+- The joining copy adds up the weights of what plays on the host's body each frame: under 0.9 while it is
+  drawn is logged ("THE HOST'S BODY SHORT OF A POSE", 60 at most) with what played, and counted per 30 s.
+
+## 0.5.967: co-op tests: a script dvar forced (a level's start point)
+
+t966b: "set skipto 2" before the map did nothing (the host still began at Saint-Lo's training, 8347
+9449): the level's scripts set skipto "0" themselves. t966a (0.5.965, Falaise, TESTGOD): the joining
+player ended the ride ~200 from the host, standing (his copy plays its own intro till its freeze, 105 s;
+he was shot down in it: TESTGOD covers the host's world only).
+
+- COD3_COOP_FORCEDVAR="skipto=2;...": the level scripts' setdvar of that name takes this value.
+
+## 0.5.966: co-op tests: a level's start point
+
+The levels' code reads the dvars "start" (every level: "start") and "skipto" (every level: "0"), next to
+"checkpoint" / "checkpoint_resetter" in Saint-Lo's code (saint_lo.dll unpacked with tools/kapf/xex.py:
+names like ev2_start, ev2_use_melee, event2_off_the_truck, event2_player_is_on_wall_hack).
+
+- COD3_COOP_PREMAP="set skipto 2;...": console commands queued just before the test's spmap.
+
+## 0.5.965: co-op tests: players that cannot go down
+
+t964u (the user's played Falaise, host keyboard live): a key at the host's front end started the
+multiplayer game ("asked to launch another title: codmp_xenonf.xex"): the run never reached Falaise.
+
+- COD3_COOP_TESTGOD=1 (host): both players' health topped up each frame, so hands-off runs get through
+  fights (Falaise's jeep: both went down and back to the checkpoint before its ride ended).
+
+## 0.5.964: co-op: off his own copy's intro vehicle at the freeze
+
+t963a (0.5.963, Falaise, hands off): what the user saw stuck "in the vehicle" was not a ride of ours: the
+joining copy plays its OWN intro (its own jeep) until its world freezes (105 s its clock); the freeze
+deletes its vehicles ("1 of our vehicles deleted") and his player stayed where his jeep was (3487 ...),
+while the host's jeep had gone on and stopped (4298 21645); by then the host was not moving, so no ride.
+
+- A vehicle of ours within 250 of my player when the freeze deletes it: my player is put where the host
+  stands as soon as the host's place is fresh ("I rode one of our vehicles at the freeze").
+
+## 0.5.963: co-op: off a ride where the host stands
+
+t962a (0.5.962, Falaise, hands off, 0 s under 20 fps): the joining player rode along the jeep's route
+(host x 2780 / his 2792 at 60 s, 2367 / 2351 at 80 s). The user: "when the vehicle comes to its stop or
+(end) the joiner is stuck in the vehicle": set down inside the vehicle's model while riding, he was left
+in it when his collision came back.
+
+- At a ride's end his player is put where the host stands (the scripts put the host off; the two players
+  do not block each other), then his collision is back.
+- A driven ride (at a vehicle's speed) ends only once the host has stepped 64 away from where the vehicle
+  stopped (its place fixed once he is still for 0.5 s): before, 2 s after the stop, the host still on its gun.
+
+## 0.5.962: co-op: riding along when the host is driven (Falaise's jeep gun)
+
+t961a (0.5.961, Falaise, hands off, 0 s under 20 fps): the host manned the jeep's gun while it drove (view
+yaw fixed at 0) and the joining player was left at the start: the host is not "carried by the scripts"
+there, so the ride rule never came on. (Both were shot down twice and went back to the checkpoint.)
+
+- Riding now also when the host moves at a vehicle's speed (over 300 a second, faster than any run) for
+  a second; it ends 2 s after he slows. A jump over 3000 a second (a checkpoint, a comeback) is not
+  travel. The host's speed and heading are taken all the time, not only while riding.
+
+## 0.5.961: co-op: a seat beside the host in a ride
+
+The user (t959u): in Saint-Lo's truck the joining player "is bouncing around and hasn't taken a proper
+seat". While the scripts carry the host (a ride), the joining copy sets its player 36 units to the host's
+side each frame: the side came from the host's VIEW yaw (each look round swung him about the host) and
+the host's place came in steps (one per host message).
+
+- The side is now of the way the host TRAVELS (from his place's change, smoothed, kept while stopped), and
+  the host's place is carried on between messages by his speed (at most 0.15 s).
+- The struggle plan was corrected (docs/CLAUDE-SESSION-2026-11-11.md): a scripted action only runs for this
+  machine's own player (sub_82535A40 / sub_82535B78 cancel it otherwise); nothing built for it.
+
+## 0.5.960: co-op: no comeback into a ride's path; a probe of the scene system
+
+t959u (the user playing the host on Saint-Lo, 0.5.959): the first struggle is at 1160 -1414 136, 553..583 s,
+after the truck ride (47..524 s) and the wall hop (~547 s). The user: "when i died i teleported to the
+joiner stuck outside the map": down at -873 1017 (756 s), back in at 1168 -1364 145 (a point of the joining
+player's trail), then fell out of the map (means 24, 782 s). The trail held points of his truck ride (his
+copy sets him beside the host each frame, through things).
+
+- Neither player's trail (the room to come back in beside) takes a point while a scripted scene plays or
+  while the player moves up or down.
+- COD3_COOP_SCENEPROBE=1: the first 30 calls of each function that uses the scene list (0x825F51A0)
+  with their arguments, marked HOSTPLAYER / HOSTRECORD / JOINER.
+
+## 0.5.959: co-op: where the host's player is (finding the struggles)
+
+Struggles are one use of the engine's scripted-action system (control types ButtonMash, StickSwirl ...;
+actions Melee*, PickLiveGrenade, Mortar*, Vehicle*, LeverPush ...; names at 0x825D1168..0x825D1224, see
+docs/CLAUDE-SESSION-2026-11-11.md). To watch one start, a test must reach one: the co-op host logs
+"coop: where: host x y z yaw" every 2 s.
+
+## 0.5.958: co-op: the swap's target is the gun itself
+
+t957a (0.5.957, hands off, 0 s under 20 fps): the joining player held the Gewehr 43 in the same second as
+his swap (was ~3 s), but the presses went on to his Garand: the host's word gave weapon 11 (the Gewehr)
+AND 81 with it (never held in hands), and the last one was taken as the target. Now the first.
+The muzzle flash hook ran ("put at his body's gun") five times; seeing it is the user's.
+
+## 0.5.957: co-op: a swapped gun in the joining player's hands at once
+
+t955u (the user, played): one swap per Use worked, but "the response time of actually switching out
+the weapons felt slow", and after a swap of his Garand for a Gewehr 43 the weapon cycle first raised
+his Springfield (206 s) and only then the Gewehr (209 s). His copy dropped the old gun 2 s after the
+host's word, then waited 0.5 s of empty hands, then pressed the cycle every 0.8 s to whatever came next.
+
+- A host's word that gives a gun his copy lacks while it lacks one his copy has (a swap there): the old
+  gun goes at once (no 2 s wait), and the weapon cycle is pressed at once and every 0.45 s (up to four)
+  till the gun picked up is the one in his hands. Empty hands otherwise: pressed after 0.2 s (was 0.5).
+
+## 0.5.956: co-op: the joining player's muzzle flash on his own gun
+
+The user (t955u, played, Forest): his shots still flashed the host's gun (0.5.950 did not cure it):
+"when the joiner is using the sniper and the host is also holding the sniper when the joiner shoots the
+sniper its muzzle flash goes off for the host"; with his Garand and the host's sniper, nothing.
+
+- sub_8242E5F0(out, entity) places a shot's flash: at the tag_flash of the client's FIRST-PERSON model of
+  the shooter's weapon (cg weapon info 0x82A9A460 + 196 * entity byte 3) when the shooter is the local
+  client ([0x82A2AB40][local index + 1]), else at his model (+508), else his origin. His fire runs with
+  that slot his (0.5.950): his flash went on the host's first-person model of HIS gun, seen only when
+  the host held the same. Now for him the host's player is in the slot for this call and the flash is
+  placed at the gun of the body drawn for him. COD3_COOP_FLASHFIX=0: as before.
+- sub_8254AAC8 (where a shot starts) takes the LOCAL camera when the shooter's client +208 has 0x00100000
+  (the scope): off for him for that call, his own eye used. COD3_COOP_SCOPEFIX=0: as before.
+
+## 0.5.955: co-op: one swap per Use for the joining player
+
+t954a (0.5.954): the joining player's screen at a dropped gun reads "Press and hold E to swap Springfield
+for Gewehr 43" (0.5.953's registration; it said "null" before). t954b: the HOST's own player holding Use
+10 s on a dropped gun swapped ONCE and never back: the game wants Use let go between swaps. For the
+joining player it swapped every ~2 s while held (t952u, the user: "just the ammo"): that latch is not
+his on the host (his copy never sees the swap).
+
+- After a swap of his on the host (a gun gained and one lost between two thinks, Use held), his Use
+  (command button 0x40, seen in t952a) is held back from his command until he lets go of it.
+
+## 0.5.954: co-op tests: put a player at the newest dropped gun
+
+t953a: the joining copy registered weapon 11 when the host's prompt named it ("its name now there").
+Seeing the prompt and testing a held Use need a player looking at the gun, and the drops land a few
+units apart each run.
+
+- COD3_COOP_TESTGUN="t:d" (either copy): at t, d short of the newest gun dropped within 900 of the
+  joining player (the host's item watch writes coop-testgun.txt in the game folder while it is set),
+  on the line from where the player stands, looking at it.
+
+## 0.5.953: co-op: the gun's name in the joining player's swap prompt
+
+The user (t952u, played, Forest): the prompt over a gun on the ground said "swap for null", and "i cant
+seem to pick up the weapon on the ground just the ammo". The log: his swaps DID happen on the host
+(Gewehr 43 taken at 234 s, his Garand dropped), then 2 s later the gun just dropped was taken back, and
+again: the Use still held over it. Whether the game itself swaps again on a held Use is being tested.
+
+- sub_824ED5A8 builds the prompt: hint 12..139 = a gun on the ground (weapon h - 11), its name from the
+  client's weapon info 0x82A9A460 + 196 * w (+140), filled by sub_82448C78 when the client registers that
+  weapon. The joining copy's world froze before it saw that gun: empty, "null". Now a gun the host's
+  hint names is registered on the joining copy first (once, if this copy has its definition).
+- t952u otherwise: three kills, 0 s under 20 fps.
+
+## 0.5.952: co-op: the picked-up gun comes up in the joining player's hands
+
+t951a (0.5.951, Forest, hands off, 0 s under 20 fps): three kills; his pickup off the ground swapped
+properly now (owned after: the Gewehr 43, not the Springfield; no second Springfield). But his hands
+were EMPTY after it on both copies (weapon 0): the host's swap took the gun he held, his command still
+asked for the old one, and the 0.5.948 press only came for a gun given while the hands were already
+empty. (The swaps back and forth after it were the test's three Use holds on the same spot.)
+
+- His copy presses the weapon cycle (Y) when its hands have been empty for 0.5 s while it owns a gun:
+  once each time they go empty, up to three presses.
+
+## 0.5.951: co-op: the joining player's pickups off the ground
+
+t950a (0.5.950, Forest, hands off, 0 s under 20 fps): his shots still kill with the fire alone run as
+the local client's (two kills, each dropping a weapon_gewehr43). Put beside one and holding Use: the
+host showed him its hint (thing weapon_gewehr43), the Gewehr went from the ground and his Springfield lay
+there instead: THE GAME'S OWN SWAP, on the host, for him. Two faults after it:
+1. His copy, given the Gewehr, told the host its whole list again (R_INVMINE) and the host gave the
+   Springfield back: two rifles, and one more on the ground.
+2. His copy kept the Springfield in his hands (its command asked for it).
+
+- R_INVMINE carries only what his copy gained ITSELF (its start, its own pickups); what the host's word
+  gave or took is not his copy's news (coop_inventory.cpp, g_ownGain).
+- When the gun the host has in his hands changes while his copy's had not for a second (a pickup's swap,
+  a script's switch), his copy presses the weapon cycle until it holds the same (at most three, 0.9 s
+  apart). Logged "the host put weapon N in my hands".
+
+## 0.5.950: co-op: the joining player's shot no longer flashes the host's gun
+
+The user: "when the joiner shoots the muzzle flash also appears on the hosts weapon even though host
+hasnt shot". Since 0.5.915 the local client's slot ([0x82A2AB40]+4) was the joining player's for his
+whole ClientThink so that his fire (sub_82569C40) would run; the first-person weapon follows that slot
+somewhere else in the think. The fire's own subtree reads it only at its first check (sub_82558E58,
+sub_82556688, sub_8254D930 do not; sub_8254AAC8 uses the local index for the eye only in one state).
+
+- The slot is his now only inside sub_82569C40 (a hook); his think runs with the host's player in it.
+  COD3_COOP_THINKLOCAL=1: the whole think again; COD3_COOP_C1LOCAL=0: never.
+- t949b (0.5.949, Forest): his kills drop their guns where they fall (weapon_gewehr43 type 2 at
+  ~900 -5878 both times); other fights' guns lie up the valley. No pickup by him yet.
+- Noted: sub_8254AAC8 (where a shot starts) takes the LOCAL index's camera when client +208 bit
+  0x00100000 is set, not the shooter's: to look at for vehicles and guns.
+
+## 0.5.949: co-op: a probe of guns lying in the world
+
+t948u (played, 0.5.948): stable, 0 s under 20 fps; the user's pad only reached the game in the last
+minute (prone matched on both copies). The name tag over the other player is the game's own friendly
+name (left as it is). Next: the joining player's pickups off the ground, never tested.
+
+- The host logs every entity of class weapon_* when it comes and when it goes, with both players'
+  distances ("coop: item:"), four looks a second.
+
+## 0.5.948: co-op: a gun given to the joining player is drawn (and played tests take his keys)
+
+t947v (0.5.947, played by the user and by SendInput, Saint-Lo, 0 s under 20 fps): the joining player
+took the M1 Garand. The host gave client 1 the rifle and 128 rounds and his copy owned it ("what I own is
+the host's word now: m1garand"), but he held weapon 0 on both copies: the training's script switches only
+level.player (the host's) to it. His screen showed no gun; the host saw his body's pose with no rifle.
+
+- The joining copy: when a gun bit is gained while it holds weapon 0 (+132), the weapon cycle (Y) is
+  tapped (120 ms, up to three times 0.8 s apart) so the game itself raises the gun and his command asks
+  the host for it. Input::PressWeaponCycle (input.cpp). Logged "a gun given and none in my hands" and
+  "I hold weapon N now".
+- tools/coop/coop_test.py --played: the joining copy without COD3_BACKGROUND (that setting ignores the
+  keyboard and mouse: in t947u nothing the user pressed reached the game) and the host with COD3_NOPAD.
+
+## 0.5.947: co-op: today's probes out
+
+t946a (0.5.946, Saint-Lo): the start came in; with the joining player looking 20 degrees left of
+the host's player 120 away, the name over the host's body stood over it across but about 90 pixels
+above his head (30 meant): high, on the right player (cosmetic, left as it is).
+
+- Out: the probe at the joining player's eye (0.5.934) and the hints' search probe (0.5.939).
+- Kept test aids: COD3_COOP_TESTGO (aimed, with a heading), COD3_COOP_TESTAIM, COD3_COOP_LISTTYPE,
+  coop_test.py --desk-shots.
+
+## 0.5.946: co-op tests: the test start is asked again
+
+t945a (0.5.945, Forest): the host sees the joining player on the MG aiming and shooting. t945b (Forest,
+the joining player alone fighting forward, 5 min): he killed two soldiers, set off the mission's triggers
+(a damage trigger among them), "Objectives updated." twice; 0 s under 20 fps. t945d/e (Saint-Lo): the
+Thompson on the crate gives no hint to either player at that point of the training (not pickable).
+t945f: neither copy went in: the third test (t914a, t928a) whose COD3_COOP_MAP start was not taken by
+the menu; the lobby's own start asks again every 15 s, the test's asked once.
+
+- COD3_COOP_MAP's start is asked again every 15 s while it has not begun, three times.
+
+## 0.5.945: co-op: "on a mounted gun" is the record's +1148
+
+t944a (0.5.944, Forest, MG42 62): a second after the joining player's Use took the gun, his record
+had +1144 0 -> 1 and +1148 0 -> 0x403E (the gun's handle, entity 62); +208 took 0x6000, not 0x100000.
+
+- On a gun = the record's +1148 set (0.5.943's body aims and shoots by it now). Probe out.
+
+## 0.5.944: co-op: a probe of what a mount changes in the record
+
+t943a (0.5.943): he mounted (hint gone at his Use) but +208 0x100000 never showed: not the player's
+"on a gun". Probe: the joining player's record words that changed in the second after his Use.
+
+## 0.5.943: co-op: a player on a mounted gun aims and shoots on the other's screen
+
+t942a (0.5.942, Forest, MG42 62): the joining player took the gun ON HIS OWN COPY now (its prompt,
+the gunner's view, its muzzle flash, back to his rifle after), on the host too (the gun's impacts
+there). On the host his body stood by the gun idle with its rifle. The game's anim.cod has no
+gunner's and no jump animation for a soldier (2623 names: no "jump" but two side-hops, no "mg42").
+
+- A player whose record says he is on a mounted gun (+208 0x100000) is drawn aiming, and shooting
+  while his trigger is held (both players, both copies).
+
+## 0.5.942: co-op: the joining copy keeps its own stationary MGs
+
+t941a (0.5.941, Forest, MG42 62): FIXED his view: on the host he faced yaw -45 as on his copy. His
+hint was the MG on the host ("misc_mg42") and on his own screen ("Press and hold E to use the MG42");
+his Use put him on it ON THE HOST (hint gone) and he fired. His own copy did not: he held his rifle
+in front of a puppet of the gun (his copy deletes all its type 10 at the freeze, turrets with them,
+and the host's turrets were drawn by puppets that cannot be used).
+
+- The joining copy keeps its own misc_mg42 (stationary MGs; vehicles' turrets are still deleted:
+  the Falaise crash), and draws the host's gun of the same number and model with it, so his own Use
+  takes it on his copy as on the host.
+
+## 0.5.941: co-op: FIX, the joining player faces on the host where he looks on his copy
+
+t940a (0.5.940): the bodies were never solid (no "was solid" line): not that. t940b: the hints' search
+inputs for each player at the MG: the joining player's view ON THE HOST was yaw 109.6 while his copy
+had turned him to -45. The think makes the view from the command's angles plus the client's delta
+angles (record +88, +92, +96; SetClientViewAngle sub_82540168 sets them to the short angle minus the
+command's +1360..+1368), and client 1's deltas on the host are not his copy's. So he looked one way
+on his screen and faced another in the host's world: no MG hint, and shots off where he aimed.
+
+- Before his think, client 1's deltas are set so his command gives the view his copy has.
+  COD3_COOP_VIEWFIX=0: as before.
+
+## 0.5.940: co-op: the players' bodies stop no trace (the joining player's mounted gun)
+
+t939b (0.5.939, Forest, MG42 62): the hints' search (sub_825528C0) for the HOST's player behind the
+gun returned 1 (the misc_mg42, 61.5 away); for the joining player at the same place it returned 0.
+His body stands where he is (the host's own is parked far below), and MakeBody's notsolid is the
+scripts' brush-model one: the body kept its contents (+324), and the look from his eye met his own
+body first.
+
+- The players' bodies (and the ones put aside at a change of gun) have no contents on the host.
+
+## 0.5.939: co-op: a probe of the hints' search (the mounted gun)
+
+t938c (0.5.938, Forest, MG42 62 at -1857 -1145): the HOST's player put behind it got its hint (+1156 6,
+the thing misc_mg42), held Use, was on it (hint gone), fired it and came off. t938b: the joining
+player put at the same place and turned the same way got no hint: his Use and fire reached the host
+but he fired his own rifle.
+
+- Probe "coop: probe: hints' search": sub_825528C0 for each player, its result and first entries.
+
+## 0.5.938: co-op test aid: list a type's entities
+
+t937a (0.5.937, Forest): FIXED, the joining player's smoke is on both screens now.
+
+- COD3_COOP_LISTTYPE=N on the host: its entities of type N once a mission, with where they stand
+  (10: the mounted guns, to put the joining player on one in a test).
+
+## 0.5.937: co-op: the joining player's smoke is seen on his own screen
+
+t936b (0.5.936, hands off, Saint-Lo in daylight, face to face 120 apart, both windows side by side in
+one desktop shot): both bodies play fire, reload, crouch, crouch fire, prone, melee, the change of gun
+(no bind pose now), aiming and walking on the other copy. No jump move yet (the body rises standing).
+t936c (Forest, smokes): the host's smoke showed on both screens; the joining player's smoke showed
+on the host's and NOT on his own: his copy's own smoke makes none (its world is frozen) and 0.5.916
+held the host's back as "his own".
+
+- Only his frags are his own (class "grenade"); his smokes are the host's, sent to him like any.
+
+## 0.5.936: co-op: no bind pose at a change of gun; test windows side by side
+
+t935b (0.5.935, hands off, Forest, face to face; each player fired, reloaded, crouched, went
+prone, fired prone, struck with the butt, changed gun, aimed, walked, strafed, ran, jumped, threw a
+frag and a smoke): both bodies play the right moves on the other copy for all of these but the jump
+(none in the moves) and the change of gun: a body is made anew with the new gun and stood a frame or
+more with no animation ("move -1, animation -1"): arms out. t935c (Saint-Lo): the desktop shots
+showed one game window over the whole screen, not the two side by side.
+
+- The joining player's new body on the host is drawn only once an animation of his plays on it, and
+  his old body stays drawn till then (1 s at most). The host's body on the joining copy likewise is
+  drawn only once his animation plays on it.
+- Windows: COD3_WINDOW_RECT keeps its place; the settings' resolution applied on the first frame
+  centred the window over the screen.
+- tools/coop/coop_test.py --desk-shots "t t": the whole desktop (both windows) at those seconds.
+
+## 0.5.935: co-op: FIX, the players' bodies are never drawn as one of the joining copy's own things
+
+t934b (0.5.934, hands off, Saint-Lo, 0 s under 20 fps; the joining player took the Garand, switched
+guns, crouched, moved): the probe at his eye showed the host's body (the host's 282) "ours, adopted":
+the joining copy had taken ITS OWN entity 282 (a soldier model with no tree of the host's) for it,
+drawn and not drawn by turns (156-160 s). When the Garand was taken the host freed slot 244 (the
+Garand, w_m1_OBJTV) and made the joining player's new body in it; the host's new body went to 130.
+The joining copy takes one of its own things for a host's thing by number, type and class only
+("script_model"): the bodies, made in freed slots, landed on whatever the joining copy had there.
+That is the "headless torso, sideways, flashing" (t933u, the user, on the joining window).
+
+- One of the joining copy's own is taken for the host's only if it wears the same model (slot 0),
+  and never for the host's body (K_PS's body number).
+- The probe at his eye (0.5.934) stays for one played test.
+
+## 0.5.934: co-op: a probe of what is drawn at the joining player's eye
+
+t933u (0.5.933, Saint-Lo, the user played the joining player; 0 s under 20 fps on both): "it still
+shows a headless torso sideways flashing", most likely on the joining window. The user's two clips
+show the host's window: the joining player's body there is whole in every frame. His two bodies on
+the host (283 put aside at his change to the Garand, 284) were not sent to his copy.
+
+- Probe "coop: join: probe: drawn at my eye": every thing drawn within 60 units of the joining
+  player on his copy, when the set changes (ours or a puppet of the host's, which, its yaw and roll).
+
+## 0.5.933: co-op: the turret probe out
+
+t932a (0.5.932, Saint-Lo): Saint-Lo's three "turrets" are the Sherman tanks' guns on the road
+(v_gunturret), not guns a player mounts: no mounted gun near the start to test the joining player on.
+OPEN: a level with a mountable MG near its start.
+
+- The turret probe (0.5.931) is out.
+
+## 0.5.932: co-op test aid: stand along a given heading
+
+t931a (0.5.931, Saint-Lo): 3 turrets (misc_turret, v_gunturret): 282 at 10305 8642 320 (yaw 178),
+284 at 8650 8568 332 (yaw 199), 312 at 9404 8731 330 (yaw 179).
+
+- COD3_COOP_TESTGO's aimed form takes a sixth number, the heading to stand along:
+  "t:x,y,z,d,feet,yaw" puts the player d short of the point along that heading, looking at it.
+
+## 0.5.931: co-op: a probe of the level's turrets
+
+t930a/t930b (0.5.930, hands off, Forest and Saint-Lo, 0 s under 20 fps): everything of tonight as
+before with the probes out (his grenade his, his hit on the host refused, the host's grenade to him;
+the Garand taken by him with the host's prompt).
+
+- Probe "coop: probe: N turrets": the level's turrets (type 10) once a mission, where they stand: to
+  put the joining player on a mounted gun in a test.
+
+## 0.5.930: co-op: tonight's probes out
+
+t929a (0.5.929, Saint-Lo): after the joining player took the Garand, the things within 80 units of him
+on the host were the objective grenades (w_us_nade_OBJTV, w_us_smoke_grenade_OBJTV), brush models and
+soldiers: no rifle. The rifle still drawn on the barrel on his screen is his copy's own, not matched
+to anything of the host's: OPEN (cosmetic: his prompts are the host's, so he cannot take it twice).
+
+- Out: the "garand thing" probe (0.5.928), the "near the joining player" probe (0.5.929), the host's
+  view lines (0.5.927).
+
+## 0.5.929: co-op: a probe of what is by the joining player when he uses
+
+t928b (0.5.928, Saint-Lo): no thing of the host's has a "garand" model. (t928a: the host never left
+the front end after "starting saint_lo": a start that stalls now and then, also t914a.)
+
+- Probe "coop: probe: near the joining player": while he holds Use and 5 s after, everything within
+  80 units of him on the host (type, class, model, flags, opacity), when it changes.
+
+## 0.5.928: co-op: a probe of the taken Garand
+
+t927a (0.5.927, hands off, Forest): the host's view did not move while the joining player fired
+eleven shots and threw a grenade (no kick of his reaches the host's view). t927b (Saint-Lo): the
+joining copy draws the host's soldiers again; he took the Garand; it still lies on the barrel on
+his screen: the host's scripts do not hide it by opacity.
+
+- Probe "coop: probe: garand thing": the host's things with a "garand" model, their flags, opacity
+  and place whenever they change.
+
+## 0.5.927: co-op: a check of the host's view
+
+t926a (0.5.926, hands off, Forest, 0 s under 20 fps): THE JOINING PLAYER KILLED A SOLDIER IN THE
+HOST'S WORLD for the first time ("score: the joining player killed actor_axis_wehr_reg_gewehr43"):
+the aim aid saw the host's soldiers again (one 272 away), he fired, was shot down by the others
+(down, back in after 10 s).
+
+- Logged: the host's view when it turns by more than half a degree (does the joining player's fire,
+  run as the local client's, kick the host's view?).
+
+## 0.5.926: co-op: FIX, the host's soldiers are drawn for the joining player again
+
+t925a (0.5.925, hands off, Forest): the aim aid's list showed EVERY soldier of the host's, allies
+and enemies, HIDDEN on the joining copy: 0.5.920's rule (a model instance at opacity 0 is hidden)
+caught soldiers, whose +236 is 0 while they are drawn. From 0.5.920 to 0.5.925 the joining player
+saw no soldier at all (t920a..t925a).
+
+- The rule is now only for a thing the scripts hide: never a soldier (type 11), and only after its
+  opacity was seen over a half (drawn) and then 0.
+
+## 0.5.925: co-op test aid: says what soldiers it hears
+
+t924a (0.5.924, hands off, Forest, 0 s under 20 fps): NO FRIENDLY FIRE works: twelve hits of the
+joining player's on the host (bullets 150, his grenade 177) refused. The aim aid still found no
+enemy: it now says, three times, the host's soldiers its copy has heard (class, hidden or not).
+
+## 0.5.924: co-op: no friendly fire between the two players
+
+t923a (0.5.923, hands off, Forest, 0 s under 20 fps): the joining player put where t899a was shot
+at was shot down by a Gewehr 43 (down, 10 s, back in beside the host: the rules work); the aim aid
+found no enemy within 2500 units. Back beside the host his rifle and grenade HIT THE HOST (150, 176,
+150, 150 "by player"): his shots are real in the host's world since 0.5.915.
+
+- No damage from one player to the other (World at War's co-op default); a player's own grenade
+  still hurts him. Logged "no friendly fire". COD3_COOP_FF=1: friendly fire on.
+- The aim aid looks 6000 units out.
+
+## 0.5.923: co-op test aid: aim at the host's soldiers
+
+- COD3_COOP_TESTAIM="a-b" on the joining copy: in those seconds its player is turned four times a
+  second to the nearest axis soldier drawn there (within 2500 units), at his chest. With COD3_PAD's
+  trigger: a hands-off test of the joining player's shots on the host's soldiers.
+
+## 0.5.922: co-op: his grenade's leftover held back as long as it stays
+
+t921a (0.5.921, hands off, Forest, 0 s under 20 fps): all as before with the probes out (his frag
+made at him, not sent, its blast not sent; the host's reaches him). The slot his grenade leaves
+(type 0, class "grenade") still reached him 4 s after the blast: 0.5.919 held it back 3 s. Now
+for as long as that slot is a "grenade".
+
+## 0.5.921: co-op: the test-only probes are out
+
+t920a (0.5.920, hands off, Saint-Lo, 0 s under 20 fps): the joining player's bullets hit things in
+the host's world (two script_models hit for 150, means 2, told as the host's player's). The
+training's next steps ("Pull LMB to fire", "Pull RMB to aim down the weapon sights") are the
+host's own buttons, like its first.
+
+- Out: the weapon-number probe (0.5.895), the touch and trigger probes (0.5.898, with their hooks
+  on sub_825471D8 and sub_825661A8), the Use probe (0.5.908, its hook on sub_82551DB8), the give
+  probe (0.5.911, sub_8253FC18), the blast probe (0.5.914). The NearProbe went in 0.5.908.
+- Kept: the missile watch (0.5.914; 0.5.918 needs it), its lines "coop: probe: missile" (80 at most).
+
+## 0.5.920: co-op: what the scripts hide on the host is hidden for the joining player
+
+t919a (0.5.919, hands off, Saint-Lo, 0 s under 20 fps): PROVEN, the joining player's prompt is
+the host's world's: looking at the Garand his screen said "Press and hold E to pick up the M1
+Garand" (host: his hint 2 / 85640683, trigger_use 130), he held Use, the scripts gave it, and the
+prompt went a second later; he holds the Garand. But the Garand stayed lying on the barrel on his
+screen: the scripts' hide (built-in 0x5E0: sub_824A4A60 -> sub_820B23F8) sets the model instance's
+(+548) opacity at +236, which the snapshots did not carry (only +632 0x400).
+
+- An entity whose model instance's opacity is 0 is sent as hidden.
+
+## 0.5.919: co-op: the joining player's prompts are the host's world's
+
+t918a (0.5.918, hands off, Forest, 0 s under 20 fps): his grenade, missile 255, known as his at its
+first frame: not sent to his copy, its blast's effects not sent (his copy plays its own); the
+host's grenade and its blast reach him as before. One thing of it still went: the slot left
+after the blast (a type 0 "grenade") for a moment.
+
+- What his grenade leaves behind is not sent either (3 s after it ends, class "grenade").
+- His prompt ("Press and hold ... to pick up the M1 Garand") on his own screen is the one the host's
+  world has for him: the host sends his record's +1156, +1160, +1164 with K_PS; his copy writes them
+  over its own after its hint code (sub_82553BB0), once frozen and while fresh. His copy's world is
+  frozen: its own prompts could be for a thing already gone. COD3_COOP_HOSTHINTS=0: as before.
+
+## 0.5.918: co-op: his own grenade known from its first frame
+
+t917a (0.5.917): still sent. The snapshot looks at the world a few times a second, and by then a
+thrown grenade has flown past the 48 units. Now the missile watch, which runs each frame before
+the snapshot, decides at the missile's first frame: within 64 units of him (flat) and nearer him
+than the host's player is his.
+
+## 0.5.917: co-op: his own grenade known by its number
+
+t916a (0.5.916): his grenade (missile 293, made 10 units from him) was still sent to his copy:
+its generation changed after it was made, and 0.5.916 knew his missiles by number and generation.
+Now by number for as long as that slot stays a missile.
+
+## 0.5.916: co-op: the joining player sees his own grenade once
+
+t915a (0.5.915, hands off, Forest, 0 s under 20 fps): FIXED, the joining player's frag is thrown
+in the host's world: missile 253 made 10 units from him (49 from the host's player), its blast
+3.1 s later; his shots are fired there too. His own copy throws its own grenade as well, so he
+saw two: his own and the host's (puppet 253, then its blast's effects).
+
+- A missile first seen within 48 units of the joining player, nearer him than the host's player,
+  is his: not sent to his copy, and effects (both kinds) within 160 units of it, while it flies
+  or up to 1.5 s after it ends, are not sent either. The host's world keeps the real one.
+
+## 0.5.915: co-op: the joining player's shots and throws are fired in the host's world
+
+t914b (0.5.914, hands off, Forest, 0 s under 20 fps): the joining player threw a frag ("does 3"
+on the host) and NO missile was made on the host; the host's own throw made one (missile 282,
+gone 2.7 s later in its blast). No test log has ever had a hit of his on the host: his shots
+and grenades were on his own screen only, the enemies untouched.
+
+Why: ClientThink (sub_8256D2B8 -> sub_8256C260 -> sub_8256B060) reaches the weapon's fire
+(sub_82569C40 -> sub_82558E58; a grenade: sub_82556688), and sub_82569C40 fires only for the
+LOCAL client's entity, [0x82A2AB40][local index + 1].
+
+- For the joining player's think on the host, that slot (+4, the host's player's) holds his
+  entity, and is given back right after; the same around his Use and hints (0.5.909, 0.5.912),
+  which read the local player's weapon state there. COD3_COOP_C1LOCAL=0: as before.
+
+## 0.5.914: co-op: probes of grenades on the host
+
+t913a (0.5.913, hands off, Forest, 0 s under 20 fps): the host's frag reached the joining copy
+(a puppet "grenade, w_us_nade_world", then its explosion's effects from 82429318). The joining
+player's frag was thrown on the host (his frags there 4 -> 3, the grenade's sounds, his body's
+throw) and blew up on his own screen, but NO explosion of it was sent from the host, which sent
+four for the host's own: does his grenade blow up in the host's world at all?
+
+- Probe "coop: probe: missile N": every missile entity on the host, where it is made and how far
+  from each player, and where and when it goes.
+- Probe "coop: probe: blast of missile N by WHO hits ...": every hit whose inflictor is a missile.
+
+## 0.5.913: co-op test aid: aimed
+
+t912a (0.5.912, hands off, Saint-Lo, 0 s under 20 fps): THE JOINING PLAYER TOOK THE M1 GARAND.
+On the host his hint came (+1156 2, the thing: trigger_use 130), he held Use, the scripts gave
+the Garand ("Objectives updated."), and the host's screen went on to "Pull LMB to fire.".
+That step, like the first ("move and look around"), reads the host's own buttons and sticks
+(the training's tutorial only).
+
+- COD3_COOP_TESTGO with five numbers "t:x,y,z,d,feet": d units short of the point x,y,z along
+  the player's heading, feet at that height, turned to look straight at the point (the game's
+  setplayerangles, sub_82540168). Hands-off tests can hit a target now.
+
+## 0.5.912: co-op: the joining player's hints and pick-ups are the game's own
+
+t911b (0.5.911, hands off, Saint-Lo, 0 s under 20 fps): the HOST's player, put at the M1
+Garand, looking down and holding Use, took it: the scripts' giveweapon (sub_8253FC18 from
+824A9BDC) after the training's trigger_use with its hint (sethintstring, built-in 0x66C;
+saint_lo_sub_8906D798). No thing to use at +1556 and no prompt at client +132 came with it:
+that hint system is sub_82553BB0, the end of frame's part after the Use (sub_82551DB8). Like
+the Use, it ran for the host's player only.
+
+- sub_82553BB0 runs for the joining player too, after his Use (its byte of the local HUD,
+  0x82A2A0C9, kept). Logged: each player's hint fields (+1156, +1160, +1164, thing +1216).
+
+## 0.5.911: co-op: probes of a pickup (the host's player's, to copy for the joining player)
+
+t910a (0.5.910, hands off, Saint-Lo, 0 s under 20 fps): with the host's player moving and
+looking for two seconds the training went on ("The gold star on your compass points to your
+current objective"): its first step reads the host's own sticks. The joining player at the
+M1 Garand held Use: on the host neither a thing to use nor a prompt came for him.
+
+- Probe "coop: probe: use:" now says each player's prompt (client +132), buttons and place.
+- Probe "coop: probe: give:": sub_8253FC18 (behind giveweapon), its caller and arguments.
+
+## 0.5.910: co-op: "is the player here" is yes when either player is
+
+t909a (0.5.909, hands off, Saint-Lo, 0 s under 20 fps): the joining player's Use runs on the
+host now (his thing to use: the sergeant, entity 242, as the host's player's). The training
+did not move: the host's own screen still says "Use the right and left sticks to move and
+look around": the scripts wait for the host's player himself to move and look, and only
+then is the M1 Garand there to pick up (the joining copy's own prompt for it is its own).
+
+- The scripts' istouching (built-in 0x5CC, sub_824AD7C8) asked of the host's player and
+  false is asked again of the joining player: an area the scripts wait for the player to
+  reach counts when either player is in it. Logged once a thing. COD3_COOP_TOUCHING=0: off.
+
+## 0.5.909: co-op: the joining player's Use is the game's own
+
+t908a (0.5.908, hands off, Saint-Lo, 0 s under 20 fps): the player's Use, sub_82551DB8 (the
+thing he can use at record +1556, its prompt at his client +132, the use queued to the
+level), ran 14000 times for the host's player and NEVER for the joining player. It is part
+of a player's end of frame, sub_8256CFB0(entity, time), which G_RunFrame (sub_8256D3E0) runs
+for clients 0 .. level +148 (one in the campaign); a client that is not the machine's own
+gets the focus block [0x82A2AB60] = 0 there.
+
+- After the host's player's end of frame, the joining player's Use runs the same way (focus
+  block 0): his prompts and his Use on the level's use triggers, doors, charges and mounted
+  guns are the game's own. Logged: "the joining player's prompt here: N". COD3_COOP_USE=0: off.
+
+## 0.5.908: co-op: a host's swap is his own; a probe of the Use
+
+t907a (0.5.907, hands off, Saint-Lo, 0 s under 20 fps on both, GPU 50 C at most): the
+joining player put inside the training's trigger_use (130, 8140..8191 9343..9404) held Use
+twice (his command's buttons 0x40 on the host) and NOTHING was queued: his Use does not reach
+the level. He owned no gun (the training gives it), so no shot or throw happened either.
+
+- A gun the host's player gains in the same frame as he loses one is his own swap (a pickup):
+  the joining player is no longer given it (he used to keep both). Gains with nothing lost
+  (the scripts' gives) are still both players'.
+- COD3_COOP_TESTGO works on the host's copy too (its own player).
+- Probe: "coop: probe: use: ...": sub_82551DB8, the player's thing-to-use (record +1556),
+  for each player; "queued from ADDRESS" says who queued each trigger event.
+- The 0.5.904 NearProbe is out.
+
+## 0.5.907: co-op: the joining player's hits on the level's things count for the mission
+
+- G_Damage on the host (coop_laststand.cpp): a hit by the joining player on anything that is
+  not a player or a soldier (damage triggers, targets, things to blow up) is told as the
+  host's player's, as his touches are since 0.5.897: the level's compiled scripts act for the
+  host's player only. Logged "coop: host: the joining player hit ...". COD3_COOP_DMGASHOST=0: off.
+- Test aid: COD3_COOP_TESTGO="170:x,y,z 200:x,y,z,d" on the joining copy puts its player at a
+  place at that second of the process (or d units short of x,y along his heading, facing it):
+  hands-off tests of Use prompts and damage triggers.
+- The host logs the joining player's command buttons up to 200 changes (was 20).
+
+## 0.5.906: co-op: one body a gun; a body is never "deleted"
+
+t905a (0.5.905, hands off, Forest; stopped at 68 s by the temperature watch: the graphics
+card went from 64 to 84 C within 20 s of both copies drawing): "the replaced body 231 is
+STILL HERE 10.1 s after its delete (type 7)", after 20 more deletes. What the co-op code
+calls the scripts' delete (sub_824A7280, which goes to sub_82540D78) is UNLINK: it takes an
+entity off its parent and returns at once when it has none. A replaced body was never
+deleted: every change of gun (0.5.896) left one standing where it was. That is the frozen
+soldier by the host (the user's clip of t903u), and, sent to the joining copy as any
+script_model, the white headless soldier on its side round his own eye (t902u): his own
+old body. 0.5.903 kept it back for 10 s only.
+
+- A body put aside at a change of gun is hidden (+632 0x400), never sent to the joining
+  copy, and KEPT for that gun: changing back takes the same body again. A player has one
+  body a gun, however often he switches.
+- docs/builtins-table.md's 0x5A0 "delete" is unlink (still to be corrected there; the
+  joining copy's own DeleteEntity calls hide first, which is why they looked right).
+- NOT tested: two copies overheat this PC within a minute tonight.
+
+## 0.5.905: co-op: a replaced body is checked until it is gone
+
+t904a (0.5.904, hands off, Saint-Lo): nothing wrong stood on either player, but no gun was
+changed in it (the joining player owned nothing hands off) and both copies fell under 10 fps
+from 126 s. So did t902u and t903u (125 and 161 s under 20 fps on the host; t899u and t901u:
+1 s). The graphics card read 78 C at 6 % load right after: the PC throttles from heat after
+back-to-back two-copy runs. Runs are spaced out now, with a temperature watch.
+
+- A body replaced at a change of gun is looked for again each frame: still there half a
+  second after its delete it is said ("STILL HERE"), kept hidden, and deleted again.
+
+## 0.5.904: co-op: a probe of what stands on each player
+
+t903u (0.5.903): the user's clip of the HOST's window: a soldier frozen with his arms out
+right by the host's eye, a second one later; "still messed up the second player". 0.5.903's
+guess was wrong: the bare-body puppets of t902u (288, 279) matched the joining player's old
+bodies' numbers by chance (the level has many script_models of that model; t899u had 23).
+
+- Probe: "coop: host/join: near my player ...": every entity with a model within 90 units
+  of this copy's player, when the set changes (number, type, class, model, tree, flags).
+- A replaced body is marked not drawn (+632 0x400) before the delete.
+
+## 0.5.903: co-op: a replaced body no longer reaches the joining copy
+
+t902u (0.5.902, Saint-Lo, the user played the joining player): the weapons go both ways now
+(host: "the joining player's own copy has m1garand: his here too", he holds the Thompson
+and the Garand as his copy asks). The user's clip of the JOINING window: a white headless
+soldier in its bind pose, lying on its side, round his own eye wherever he goes. Join log:
+"puppet for the host's 288 / 279 (script_model, c_usinf1_lod2_multi3_3)": 288 and 279 are
+his OWN body's numbers on the host before each change of gun. A body that is replaced
+(0.5.896) is no longer "his body" while the scripts' delete takes its time, so it was sent.
+
+- Bodies replaced in the last 10 s are never sent to the joining copy (both players').
+- Not yet seen again: the host's T-pose on the joining copy, the flashing.
+
+## 0.5.902: co-op: weapons go both ways; a crouch is not a throw
+
+t901u (0.5.901, Saint-Lo's training, the user played the joining player): 0.5.901 took his
+guns away. The host's player starts the training with nothing, so the host's second player
+owned nothing, and the joining copy took "nothing" as the host's word (join log: "my count
+at +296 was 112, the host has 0 for me: taken"). The user: the other player flashes in and
+out, stands sideways with no head, the host T-poses; a crouch looks like a grenade throw.
+
+- The joining copy tells the host what it owns (R_INVMINE: at the start, at every pickup,
+  every 5 s); what the host's second player lacks of that he is given, with the copy's
+  counts. The joining copy takes a weapon the host has for him at once, and gives one up
+  only when the host has not had it for 2 s (and not within 2 s of telling the host).
+  ProtocolVersion 40007.
+- Button 0x4000 is held while crouched (0x2000 while prone); it was taken for the smoke
+  grenade's button, so every crouch was shown as a throw. A throw is button 0x2 or weapon
+  state 15.
+- NOT looked at yet: the flashing, the sideways headless body, the host's T-pose. The two
+  clips of t901u show the host's window; in them the joining player's body changes its
+  head (helmet to cap) around the time he crouches and moves. Saint-Lo's bodies are made
+  from actor_ally_stlo_amer_reg_thompson.
+
+## 0.5.901: co-op: the joining player is armed in the host's world
+
+t900a (0.5.900, hands off, Forest): the event probe heard four events in the whole run, all
+the host's player's and none from a shot, a throw or a reload: that road is not how the
+mission hears a player. What the logs did show (t900a, t899u): on the host the joining
+player's record never has a weapon (+132) while his commands ask for one (+1356 = 12, the
+Springfield): the host's second player owned NO weapon. Only the level's scripts hand out
+guns, and only to the host's player. So his shots and grenades were on his own screen only.
+
+- The host gives its second player the host's player's whole set (weapons owned, clips,
+  reserve rounds) whenever he owns nothing, and from then on whatever the host's player is
+  GIVEN (a new weapon, more rounds that are not a reload) he is given too.
+- What he has on the host goes to his copy (R_INV, ProtocolVersion 40006): what he owns at
+  once, a count once his own has differed from the host's for 0.6 s.
+- A player's record, from the code: reserve rounds +288 + 4 * (weapon +1460), clip rounds
+  +656 + 4 * (weapon +1468), weapons owned five words of bits at +1024, bolt bits +1044.
+  (+212 is the event counter and +216.. the events: not weapons, as the 0.5.895 probe's
+  lines made them look.)
+- The 0.5.900 event probe is out. New file CoD3Host/coop_inventory.cpp ("coop: inventory:").
+- Not done: a weapon the host's player swaps away stays with the joining player.
+
+## 0.5.900: co-op: a probe of what the scripts are told a player did
+
+t899a (0.5.899, hands off, Forest): the joining player walking alone set off 7
+trigger_multiples ("told to the scripts as the host's player's") and ten lines of speech
+(two before): the joining player's triggers WORK. t899u (the user played the joining player
+in Saint-Lo's training): three triggers fired for him (the friendly chain too); he picked up
+the gun and shot the helmets on his own screen, but his grenades "did not register": the
+host's log has no use and no damage trigger from him, and the objectives did not move. The
+training waits for the host's player.
+
+- Probe only: "coop: probe: event NAME for WHO: the host's player's scripts HANDLE / do not
+  handle it, the joining player's ...": every event the game sends a player's script object
+  (sub_8251BE50: object = entity +516, seven (name, handler) pairs from +8, parent at +64).
+
+## 0.5.899: co-op: the joining player's touches, the right entity table
+
+Probe test t898a: "queued: trigger_multiple (type 0) by the joining player": his touches
+ARE queued (so are the soldiers'); 0.5.897 did not know him because it read the handles in
+a table 0x200 before the real one (it took multiplayer's 0x82BD1FC0 to be the address its
+twin function loads; that one loads 0x82BD1DC0 and adds). The handles are read with the
+helpers the rest of the co-op code uses (FromRef / RefOf: EntityTable). Also learnt: a
+trigger's box is at +272 (least corner) and +288 (greatest), a handle is the entity's +500,
+both players have takedamage 1 and the same type; Forest has 26 triggers; the image's touch
+functions are in a table at 825F3848.. (825661A8 trigger_multiple's among them).
+The probe stays in for this build.
+
+## 0.5.898: co-op: a probe of the triggers
+
+Test t897c (0.5.897, hands off, the joining player walks the first path): not one "the
+joining player touched" line: no touch of client 1's is ever queued, so 0.5.897's rewrite
+has nothing to rewrite (it stays in: harmless). The queue's writer has no test of its own;
+the one touch function found that calls it (sub_825661A8) wants the toucher's takedamage
+(+624). So the touch is not asked for client 1 at all, or by another road.
+
+- Probe only: "coop: probe: queued: CLASS (type N) by WHO", "touch function 825661A8: ...",
+  every trigger of the level once with the words +272..+332 (its box) and +628, where the
+  image holds 825661A8 (the table of touch functions), and both players' type, takedamage,
+  +628 and +500.
+
+## 0.5.897: co-op: what the joining player touches is set off for both
+
+The user: the joining player must be able to use the world and fire its events, and finish
+the objectives as in single player. Measured first (hands-off tests t897a/b, Forest): the
+host walking up the first path got eight lines of speech from the level, the joining player
+walking the same way two. The level's scripts act for the host's player.
+
+- A touch of a trigger is queued by sub_825471D8 as (trigger, toucher, the +204 of each) at
+  0x82A4E790 + 3196 and told to the scripts each server frame by sub_825642A0 (the twins of
+  multiplayer's touch queue, found by matching the functions' shapes). There a touch by
+  client 1 is rewritten as the host's player's: "coop: host: the joining player touched
+  trigger_... : told to the scripts as the host's player's". COD3_COOP_TRIGGERS=0: off.
+  NOT TESTED when written. What a trigger gives or does to "the one who touched" goes to the
+  host's player (a hurt trigger too): to watch.
+- NOT in: the joining player's Use on doors, charges and mounted guns (not known whether a
+  use goes through this queue), and the cutscene camera for the joining player (Forest has
+  no scene after the intro to test with; the intro's own sequence must not be broken).
+- Also seen in t896d (hands off, only the host throws): the joining copy's screenshots show
+  the host's smoke cloud: the user's "cannot see the host's smoke" is not reproduced.
+
+## 0.5.896: co-op: the other player carries the gun he has
+
+Test t895a (0.5.895, scripted): "a body aims up (pitch -18): stand_aim_up set" and "aims
+down (pitch 30): stand_aim_down set" on both copies, crouched too: the aim's up and down is
+in (seen in the logs; not yet judged by eye). The probe: a weapon's world model is its text
++1432 (as in multiplayer); the host's record has his weapon's number at +132 (12
+springfield, steady, beside the weapon state +136); client 1's record on the host does not
+(his copy's does).
+
+- Each player's body carries his gun's world model on tag_weapon_right (it wore the
+  soldier's M1). The host's number is read from his record +132; the joining player's comes
+  in his commands (the top byte of K_CMD's flags: no change of the wire's shape). A grenade
+  in the hand, the mortar's round and bare hands leave the gun as it was.
+- A body that animates cannot change what it carries (its skeleton is sized for its first
+  models: v45e's crash), so when the gun has been another for 0.3 s the body is made again
+  with it and the old one deleted ("coop: host: X carries MODEL (weapon N NAME; was ...)").
+  The joining copy gets a new puppet for the host's new body: he is gone for a frame or
+  two at a change of gun. NOT TESTED when written.
+
+## 0.5.895: co-op: the other player aims up and down; a probe for the gun he carries
+
+The user: before the friend test, each must see the other aim up and down, see what gun
+the other carries and fires, and the joining player must be able to use the world, fire
+its events and be in its cutscenes. This build is the first of those and a probe for the
+second. NOT TESTED when written.
+
+- Aim up and down. The level's soldiers have an up and a down twin of four poses:
+  stand_aim_up/down, crouch_aim_up/down, stand_shoot_up/down, crouch_shoot_up/down (names read
+  from sp/anim.cod). A body that stands or crouches still and aims or fires gives a share of
+  its animation to the twin: the view's pitch over 45 degrees, moved at 4 a second (BodyTilt
+  sets the twin in the tree and keeps it going; TidyBodyTree weighs it: playing x (1 - share),
+  twin x share, and what it blends from keeps its own share). A still player who looks more
+  than 10 degrees up or down takes the aiming pose (he stood in his idle, rifle low). No up
+  and down while walking or running: the soldiers have no such animations.
+- The pitch: the joining player's is in his commands (view[0]); the host's rides in the first
+  angle of his body's snapshot (the body stands upright on both copies: the joining copy
+  takes the angle out before placing it). No change of the wire's shape.
+- Probe: "coop: probe: ... record's weapon numbers" (every word of a player's record that is
+  a number of the campaign's weapon list [0x82A2A2E0], with names, when the set changes),
+  "coop: probe: weapon N name: +20 ... +1432 ..." (its model texts), and what the bodies'
+  soldier carries on which tag. To read after the user switches and picks up guns.
+
+## 0.5.894: co-op: an empty clip's reload is not a grenade throw
+
+Test t893b (0.5.893, played by the user): the host under 10 fps for 9 of 272 s only, no gap
+in his snapshots of 1.5 s or more, his body made once and never with an empty tree: nothing
+vanished in the logs, and 0.5.893's fix was again not exercised.
+
+- The join log: "the host does 3 (was 2)" then "does 4 (was 3)" five times, each after
+  "weapon state 0 -> 14 -> 5": the clip run dry. Weapon state 14 is the start of the reload
+  (0 -> 14 -> 5); states 12 to 16 were all taken for the grenade throw, so the other player
+  threw a grenade for 1.3 s before every reload of an empty clip. The throw is the buttons
+  (0x2, 0x4000) and state 15 only; the reload is 5 to 9 and 14 (both copies).
+
+## 0.5.893: co-op: nothing let go while the host's snapshots are late
+
+Tests t892a (nobody played: both copies 60 fps for 320 s, no crash) and t892b (played and
+recorded by the user: "still it isn't fixed").
+
+- PROVEN in t892b: a throw is followed by no swing ("the host does 3 ... does 0").
+- THE OTHER PLAYER GONE AND BACK. t892b's join log: every puppet made again in one go, the
+  host's body (231) among them, its tree "0 nodes held" in 4 of 26 samples. The joining copy
+  let go of a thing not heard of for 3 s BY THE CLOCK. In the played tests the host's copy,
+  in the background beside the played one, fell to 0 to 1 frames a second for a minute or
+  more (t892b: 89 of 196 s under 10 fps, its drawing 746 ms a frame for the same draws that
+  take 9 ms; t891a: 114 of 317 s; t890a: 59 of 319 s; t892a, not played: 1 s). No snapshots
+  for 3 s, and everything was let go and made again when they came back. A thing is now let
+  go when the snapshots that DID come have not named it for 3 s; with none coming the world
+  stays as it was ("no snapshot from the host for N s: nothing let go" in the join log).
+- So the played two-copy tests on this PC show the other player through a host at a few
+  frames a second: his moves there are not what two PCs will show. WHY the background copy
+  starves when the user plays the other one (the window made large, the recording, the
+  graphics card shared, heat) is NOT known.
+
+## 0.5.892: co-op: throws, swings and reloads whole; the body never left with nothing playing
+
+Test t891a (0.5.891, played and recorded by the user): "the flickering is gone", but aiming
+and the grenade throw "aren't as smooth as they should look", and the other player
+"sometimes goes invisible and then pops back".
+
+- Every throw ended in a rifle-butt swing on the other player's screen ("the host does 5 (was
+  3)" after each throw in the join log). Weapon state 11 (the record's +136) follows the
+  swing (10) AND a grenade's throw (3 -> 11, weapon animation 2); it was taken for the swing.
+  11 counts as the swing only when it came from 10 (MeleeState, coop.h; both copies).
+- The smoke grenade's button (0x4000) starts the throw on the body as the frag's (0x2) does.
+- One throw, swing or reload is one animation from start to end: it no longer changes
+  between its standing and crouched kind in the middle (BodyMotion::Act), it starts at its
+  first frame, and at its end it is held, not begun again (OneShotMove: moves 26 and up).
+- The body with nothing playing. A change of move waited for room in the pose queue
+  (AnimJobRoom: under 140 jobs). The joining copy poses 140 to 150 models a frame in a fight
+  (t891a: "pose jobs: at most 150", "posed early 1139 times in 30 s"), so there was no room
+  for seconds; after the checkpoint reload the host's body had "0 nodes held" for 40 s.
+  0.5.889/890's TidyBodyTree made it worse: it blended the old animation out towards one that
+  was not in the tree yet. The bodies' changes no longer wait (a full queue is posed early
+  since v45v, so the array cannot overrun), and TidyBodyTree touches nothing while the
+  animation asked for has no slot. Whether this is all of "invisible" is NOT proven: the log
+  has no line for a body not drawn.
+
+## 0.5.891: co-op: the other player's way of moving steadied
+
+Test t890a (0.5.890, the user played it and recorded a second video).
+
+- PROVEN in t890a: real deaths go through the rule (0.5.887): "the host would have died here
+  (hit 100 ... by actor_axis_wehr_reg_gewehr43)", "is down: back in 10 s", "revived" (both
+  players, by the user), then both down = "back to the checkpoint" and the game's fail screen
+  only then. 46 "coop: shield:" lines. The smoke is fixed (the user; "missile 2: its puppet is
+  here"). The fail screen's line reads "YOU WERE KILLED BY A GRENADE" whatever killed: open.
+- The user: the other player "is still flashing or flickering when moving". The join log:
+  "plays move 18 stand_shoot_run_forward / 20 stand_shoot_run_left / 18 / 20 ..." in a row.
+  His way of moving was chosen every frame from the step since the frame before, and his
+  place comes in steps (a snapshot, then frames with none), so the direction and the speed
+  jumped. BodyMotion (coop.h, used by both copies): speed and direction over the last 0.3 s,
+  the axis (forward/back or sideways) kept unless the other is 1.5 times more, and a new way
+  of moving taken only after it has been wanted for 0.15 s.
+
+## 0.5.890: co-op: the other player's moves blend; smoke follows its grenade
+
+From the user's video of test t889a (0.5.889, the joining copy's window) and its logs.
+
+- The user: the T-pose is gone, but the other player "is still flickering". 0.5.889 changed a
+  move in one frame with no blend, and firing, aiming, reloading and walking change the move
+  all the time: every change was a jump from one pose to the next. A change is a blend again,
+  a fifth of a second, eased, made in one place for both copies (TidyBodyTree, coop_host.cpp):
+  the animation that played keeps exactly what the new one does not yet weigh, so the two add
+  up to one whole pose in every frame (the T-pose was a part of a pose), with the parent nodes
+  of both whole. The joining copy's own weight ramp and the host's "weight put back" are out.
+  "bare" in the body lines now means no weight at all (it was under 0.3).
+- The user: the smoke still stood in the air. t889a's join log: "an effect that follows a
+  missile (0052 012C): NO puppet" though the grenade's puppet (012C = the host's 300) had been
+  made: the effect names a second thing (0052) that has no puppet on the joining copy, and for
+  want of that one it followed nothing. It now waits for the missile's puppet only and follows
+  whichever of its two things is there (K_FX `wait`: bit 1 the first is the missile, bit 2 the
+  second; ProtocolVersion 40005).
+- A grenade that lands (type 3 become type 0, the same entity) keeps its puppet on the joining
+  copy: a new one was made, and what followed the old one was left where it was let go.
+- Not a bug: in t889a the other player threw when the user threw. Two copies on one PC both
+  read the one pad. On two PCs each has its own.
+- Still unproven: 0.5.887's grenade death (no "coop: shield:" line in t889a: the user's pad
+  moved both players and chose smoke grenades, so nothing hurt anyone).
+
+## 0.5.889: co-op: the T-pose's flicker; the smoke that stood in the air
+
+- The user: the other player "flickers from their normal position to a tpose in a fraction of
+  a second", very often. At a change of move the new animation came in from nothing over a
+  fifth of a second while TidyBodyTree put its parent nodes to full weight at once: a group at
+  full weight with next to nothing in it is the bind pose. Firing, aiming and reloading change
+  the move all the time. Now, every frame, exactly one animation weighs (whole, its own parent
+  nodes whole) and every other node the tree holds weighs nothing: a move changes in one frame,
+  with no blend (TidyBodyTree, coop_host.cpp; both screens use it).
+- The user: the joining player's smoke grenade "stays still in the air and never lands, a ball
+  of smoke hovering". An effect that follows a missile reached the joining copy before the
+  missile's puppet was made there and was played where it was made (the throw's place). The
+  host marks such effects (K_FX wait) and the joining copy holds them up to a second for the
+  puppet, then plays them on it ("an effect that follows a missile ... its puppet is here").
+- Both players need this build (K_FX is longer). Not tested when written: the PC shut down
+  (heat) 91 s into t888a, so 0.5.887's grenade death fix is still not proven either.
+
+---
+
+## 0.5.888: co-op: every shielded hit logged
+
+- t887a (0.5.887): the host threw five grenades at his feet and the mission did not fail (in
+  t885b the second one failed it), but no "would have died" line either. Each hit a player
+  takes behind the shield is logged now ("coop: shield: hit, means, by, took, left"), 120 lines.
+
+---
+
+## 0.5.887: co-op: a player never dies inside the game's damage (the grenade death)
+
+- The user's rule was passed by a real grenade (t884a, t885b: "MISSION FAILED, YOU WERE KILLED
+  BY A GRENADE", no down, no revive). The blast functions do call G_Damage (sub_82564888), but
+  the death made in there did not go through the player's die we hook (sub_8255F320) and the
+  call did not come back to our code after it. With two players, a player now takes every hit
+  of G_Damage behind a shield of health (his health + 1000000 for the call), what the hit took
+  is measured after, his health is put to what is left, and if nothing would be left the rule
+  is asked (down 10 s, revive, back in; both down = the checkpoint) and he is kept at 1. So no
+  death is made inside the game's damage at all, whatever way it would have taken.
+- Log: "would have died here (hit, took, means, by)". The health log of 0.5.886 only prints a
+  health of nothing or a change of type now (it filled its 300 lines with the record's +12).
+- Not tested when written.
+
+---
+
+## 0.5.886: co-op: the host's health as it changes (log only)
+
+- t885b (0.5.885): the host threw a grenade at his feet, "MISSION FAILED, YOU WERE KILLED BY A
+  GRENADE", and neither G_Damage (sub_82564888) nor the player's die (sub_8255F320) was called:
+  a grenade's blast reaches a player another way. A write watch on his health (t885d) stopped
+  the pad script, so: his health, type and flags are logged whenever they change ("coop:
+  health:"), and sub_8255EF30 and sub_8255F488 say who calls them. No change in play.
+
+---
+
+## 0.5.885: co-op: which way a player's death comes (log only)
+
+- t884a: the host was "killed by a grenade" and the mission failed with no line of the down
+  and revive rule in the log (the forced downs of the tests work). The rule is asked in the
+  player's die (sub_8255F320), reached from sub_8255F488 and sub_8256B060. Logged now, on the
+  host: every hit on a player that takes him to nothing or is 100 or more ("coop: damage:")
+  and every die call with what the rule is asked ("coop: die:"). No change in play.
+
+---
+
+## 0.5.884: co-op: the melee and the grenade the right way round, one action at a time
+
+- Test t883a (0.5.883): the joining player's reload shows on the host
+  ("the joining player's body: reload_stand_rifle"). The weapon-state log gave the rest:
+  +136 = 0 ready, 1 raising, 2 lowering, 3 firing, 5 reloading, 10 and 11 the MELEE (weapon
+  animation 8, with button 0x10), 15 the THROW (with button 0x2: lower the rifle, 15, raise).
+  So 0.5.882 played the grenade throw for the melee button and nothing for the grenade.
+- Now one action code per player (1 aim, 2 fire, 3 throw, 4 reload, 5 melee): firing is state
+  3 with the trigger (no shot shown on an empty click), the throw is button 2 or states
+  12..16, the melee is states 10/11 (melee_right2right_1, meleecrouch_right2right). The
+  joining player's in K_CMD flags (0x40000 fire, 0x80000 throw, 0x100000 aim, 0x200000
+  reload, 0x400000 melee), the host's in the high four bits of his body's snapshot byte.
+- Open from t883a: the joining copy showed 2 of the host's ~20 actions. Both sides now log
+  each change ("the host does N (was M) at T s" on the host and on the join) to see whether
+  the changes are sent, arrive, or are not played.
+
+---
+
+## 0.5.883: co-op: the other player reloads on his body (the weapon's own state)
+
+- Test t882a (0.5.882): every named move is in the list; the joiner's screenshot 001627 shows
+  the host with his rifle at his shoulder while his script fired; the logs show the throw and
+  the aim on both sides. (The log's caps were eaten by the aim lines: raised, aim left out.)
+- From t882a's "record after buttons" lines, the player's record: +136 the weapon's state
+  (0 ready, 3 firing, 4 working the bolt, 5 reloading), +668 the rounds in the clip (6 -> 2 over
+  four shots, 1 -> 0, then 0 -> 6 when +136 left 5), +672 a grenade count (3 -> 2), +1280 the
+  weapon's animation number with a toggle bit 0x200, +208 bit 0x200 with firing.
+- Reloading (+136 in 5..9) plays reload_stand_rifle / reload_crouch_rifle / reload_prone_rifle
+  on the body: the joining player's sent in K_CMD (flags 0x200000), the host's in his body's
+  snapshot byte (0x80). It is the game's state, so no reload shows when the clip is full.
+- Log for the next step (jump, melee, the grenade's real states): "coop: weapon state a -> b
+  (clip, weapon animation, buttons, velocity up)".
+
+---
+
+## 0.5.882: co-op: the other player fires, throws and aims on his body (true buttons)
+
+- The animations' NAMES are readable in the game's files (sp\anim.cod, the level's .cod) and
+  their hash is h*33 + lower-case letter: the old thirteen moves decode to stand_alertb_idle1,
+  patrolwalk_swagger, combatrun_back/left, stand_step_right (!), combatrun_forward_1,
+  hideLowWall_2 (!) as the crouch idle, crouchrun_loop_forward_1 ..., and
+  prone_shootfeet_straight45up (!) as the prone idle. The moves are now named in one table
+  (BodyMoveName, coop_host.cpp, used by both sides): crouch_alert_A_idle, prone_aim_idle,
+  prone_crawl, combatrun_right, stand_walk_combat_loop_01 and the rest.
+- What the player DOES, from his own buttons (his record's +1352: 1 fire, 0x10 grenade, 8 aim),
+  never guessed from how he moves: firing = stand/crouch/prone_shoot_straight, or
+  stand/crouch_shoot_run_forward/back/left/right while moving; the grenade button =
+  stand/crouch_grenade_throw for 1.3 s; aiming while still = stand/crouch_aim_straight.
+  The joining player's go to the host in K_CMD (flags 0x40000 / 0x80000 / 0x100000); the
+  host's go to the joining copy in his body's snapshot byte (0x10 / 0x20 / 0x40).
+- Not yet: reload, jump / in the air, melee, the aim's pitch, the weapon in his hands. For
+  those the record's words are logged for 2.5 s after each button change ("coop: record after
+  buttons ...": only words that changed 1 to 8 times), to map weapon state, ammunition and
+  on-the-ground.
+
+---
+
+## 0.5.881: co-op: the effects made by handle
+
+- The last effects not sent (28 in t876a, all from 820FBD70): sub_820FBD00 empties a list of
+  waiting effects at 8290B5D0 (64-byte entries, count at +4096, room for 64: +0 the effect's
+  record, +4 a time, +8 and +32 its place, +48 a number, +52 the id), making each by
+  sub_824245D8 and placing it by its handle. The host sends each waiting entry whole just
+  before its game plays it (K_FX, a 72-byte message); the joining copy checks the record and
+  the numbers, puts the entry into its own list and runs its own sub_820FBD00.
+- Log: host "N waiting effects (made by handle) sent", join "N of the host's waiting effects
+  played, M not".
+- Not in this build: effects that follow a player still play where they were made (a muzzle
+  flash is over before it matters); the other player's shots as seen on his body belong to
+  the next item (true inputs).
+
+---
+
+## 0.5.880: co-op: the other player's T-pose: empty parent nodes emptied
+
+- Found in t879a's dump (0.5.879). The animation list's entries are 28 bytes: +4 the count of
+  children (0 = an animation), +6 the parent's index. The body's tree while idle held the idle
+  (168) and its parents 6, 2, 1, 0 at weight 1, AND node 189 (a parent under 6) with its child
+  222 (a parent too) at weight 1 with no animation under them: what an earlier move left when
+  its animation ended. A parent node with nothing under it gives the bind pose, and node 6
+  blended the idle with it: the arms-half-out stance on both screens.
+- TidyBodyTree (coop_host.cpp, used by both sides each frame): the parents above the move
+  playing weigh 1; a parent node with no weighing animation anywhere under it weighs nothing.
+  The log says "N parent nodes with nothing under them emptied".
+- The dump stays, slower (every 10 s, 30 times).
+
+---
+
+## 0.5.879: co-op: the T-pose: a soldier's animation tree dumped beside the body's (a test build)
+
+- Test t878a (0.5.878): the body's idle and 12 parent nodes weigh 1 and the host's screenshot
+  still shows the T-pose. Two guesses missed, so this build only measures: every 3 s (50
+  times) the host's log holds every node of the joining player's body's tree and of the
+  soldier it was dressed as ("coop: dump body/soldier node ..." with the whole 52-byte record),
+  to be read against screenshots of the same seconds.
+- 0.5.877's early restart of a move is limited to small steps (it fired nearly every frame on
+  the walk, crouch and prone animations and held them on their first frame).
+
+---
+
+## 0.5.878: co-op: the other player's T-pose: the move's parent nodes
+
+- Test t877a (0.5.877, the user moving both players): the T-pose is on BOTH screens
+  (shots 231432 host, 231527 join: arms out, rifle hanging), while the logs say the idle
+  (animation 168) plays at weight 1 with its time running. So the animation's own node is
+  right and something above it is not: a node shows only as much as its parent nodes weigh,
+  and the bodies' moves were set on their own node alone (sub_82500A40).
+- Now each move is set with sub_82500B80 (the call the soldier puppets use, which goes through
+  the parents), on the host (DriveBody) and on the joining copy (DriveHostBody). The rate is
+  written into the node afterwards (+40). A guess from the code's shape, to be proved by the
+  next test's screenshots.
+- The 10 s body line also says how many nodes of the tree weigh something, animations and
+  parent nodes apart ("weighing: 1 animations, 0 parent nodes" would be the T-pose).
+- Seen in t877a too (open): on the joining copy the host's body flips between walk forward
+  and walk back every frame while he walks (direction from a noisy track).
+
+---
+
+## 0.5.877: co-op: the other player's T-pose when idle, measured and (one cause) closed
+
+- The user: "still seeing the other player in a tpose position as the idle stance" (not sure
+  on which screen). Both sides (DriveBody on the host, DriveHostBody on the joining copy) now
+  say every 10 s what the body plays: move, animation, slot, time, weight, and how many
+  seconds it has had NOTHING playing ("bare", the bind pose), with counts of restarts/replays.
+- One cause closed on both sides: an idle is started over when it passes 0.97 of its length,
+  but at a low frame rate it went past its end between two frames; the game let its slot go
+  and it was blended in again over 0.2 s from nothing. Now it is started over one frame's
+  step before its end, and a move set when nothing was playing comes in at once (no blend).
+- A test, not a promise: if "bare" still grows in the logs, the line says why (no tree, no
+  slot, or no weight).
+
+---
+
+## 0.5.876: co-op: the effects that were not sent
+
+- Read in the game's code (ppc_recomp.52.cpp): sub_82429238 (a place and three axes) and
+  sub_82429330 (a place) DO hand sub_82423F08 a whole matrix. Only the fourth number of each
+  row is whatever was on their stack, and the joining copy's "is this a matrix" check refused
+  them for that (t873a), as it did 24 of the event executor's own in t874a. The host sends
+  those four as 0 0 0 1 now, the joining copy sets them again, and both callers are sent
+  (about 500 effects a test were not).
+- sub_824245D8 alone makes its effect at 0 0 0 and hands back a handle that its caller moves
+  afterwards. Still not sent; the host's log counts them by caller ("effects made by handle
+  (sub_824245D8), by caller") to find who to hook. "effects sent, by caller" counts the rest.
+
+---
+
+## 0.5.875: co-op: a downed player can be revived, and has 10 s
+
+- The user's new rule: a downed player lies for 10 s (was 5; COD3_COOP_RESPAWN). The other
+  player standing beside him (80 units) and holding Use for 3 s revives him where he lies,
+  with full health and 3 s of safety. Not revived in time: back in beside the living player,
+  as before. Everyone down: the last checkpoint for both, as before. A revive under way holds
+  the 10 s clock, so one begun at 9 s still finishes.
+- Use is the pad's X (the keyboard's Use and Reload keys are X too). It is read from each
+  player's own pad, not from the game's record (+1352, where no Use bit was ever seen): the
+  host's directly, the joining player's sent in his commands (K_CMD flags 0x20000). The host's
+  log says "the joining player holds Use / lets go of Use".
+- HUD: "<name> is down: revive within n s", "Hold Use (X) to revive <name>" when beside him,
+  and for the downed player "Waiting for a revive: back in beside <name> in n s".
+- Tests: COD3_PAD can hold a button now ("200:x/6" holds X for 6 s).
+- ProtocolVersion 40003 (K_CMD and K_FX changed since 40002): mixed builds refuse each other.
+
+---
+
+## 0.5.874: co-op: only the effects that come with their place
+
+- Test t873a (0.5.873): no record refused by the narrowed check; 42 played, 57 refused for a
+  matrix that was not one. Effects made by sub_824245D8 and sub_82429238/82429330 are placed
+  by their callers afterwards: sent from sub_82423F08 they had no place (played at 0 0 0) or
+  no matrix. Only the event executor's (sub_82533208) and sub_8242F588's (an effect on a
+  thing) are sent now: weapon events, impacts, explosions. The others are counted in the
+  host's log; a refused matrix is printed with its caller.
+
+---
+
+## 0.5.873: co-op: the effect record's check narrowed
+
+- Test t872a (0.5.872): the effects reach the joining copy and play with no crash, but 57 of 67
+  were refused: the sum of the record's 48 words took in words that change as the game runs
+  (the same record played once and was refused later). The check is now the record's first four
+  words, its list (+80) and count (+84).
+
+---
+
+## 0.5.872: co-op: the host's effects on the joining copy
+
+- The joining player saw none of the host's world's effects (muzzle flashes, impacts, explosions,
+  the scripts' effects): never built (COOP-V40-DESIGN "Not done yet"). Every effect is made by
+  sub_82423F08; the host now sends each one (K_FX: the record's address and a sum of its words,
+  the id, the 64-byte matrix, the two things it follows as the host's entity numbers, the tag,
+  the flag) and the joining copy plays it by the same call once frozen, on its puppets for
+  those things. Test t871a: the effect records are at the same addresses on both copies (14 of
+  14); a record that does not add up the same there is not played and logged.
+- Not sent: effects that follow the joining player (his own copy draws his). Effects that
+  follow the host's player are played where they were made, not attached.
+- At most 150 a second sent, 48 a frame played. Both players need this build.
+- Not tested in play.
+
+---
+
+## 0.5.871: the effect records logged (co-op, log only)
+
+- COD3_COOP_FXLOG=1 also prints each effect record once (its words, texts they point at) and
+  each effect's place (the matrix at r5, its origin at +48), on the host and the joining copy,
+  to find what names an effect the same way on both. No change in play.
+- 0.5.870 tested (t870b, two copies, Forest): the 5 s respawn works for both players, and
+  each sees the other's crouch and prone.
+
+---
+
+## 0.5.870: co-op tests without button presses
+
+- COD3_SKIPFILMS=1 in co-op counts as the host's A on the mission film (it still waits for the
+  joining copy to load). The tests' scripted A presses landed on the main menu when the joiner
+  connected late and started multiplayer (test t869b). COD3_COOP_FXLOG=1 logs the first 400
+  effect calls ("p40: fx"), for the work on showing the host's effects to the joiner.
+- 0.5.869's rule and stance are still untested (t869a stalled in the film, t869b as above).
+
+---
+
+## 0.5.869: co-op campaign: back in after 5 s, the other player's crouch
+
+Campaign program (CoD3.exe) only; multiplayer is not touched. Both players need this build.
+- The death rule is the user's now (it was World at War's 30 s bleed-out and revive): a player
+  brought to nothing by anything (the enemy, a fall, a trigger, his friend) is down for 5 s
+  (COD3_COOP_RESPAWN), then comes back beside the other player with full health and 3 s of
+  safety. With both down, both go back to the last checkpoint (the host's player's own death:
+  the game's mission failed). No revive. The joining player comes in beside the host (the
+  host's trail); the host where the joining player stood a moment ago (his trail, new).
+  Tests: COD3_COOP_TESTDOWN=t (the joining player down), COD3_COOP_TESTDOWN0=t (the host).
+- The joining player's body on the host took its stance from client 1's record on the host,
+  which his copy moves and which does not follow his crouch. His copy now sends his own view
+  height with his stance flags (K_CMD flags bits 8..15, 0x10000) and the body uses them.
+  Crouched is also told by the view height (45 or less), both ways. Stance changes are logged
+  ("stance: view height").
+- Baseline before this build (base1, two copies on this PC, Forest): lobby, film, freeze and
+  ~95 puppets fine; the host's body never played a crouch move on the joining copy.
+- Not tested in play yet.
+
+---
+
+## 0.5.868: bots no longer cartwheel on a joiner's screen; the flare-match freeze
+
+- The friend, screen shared: a bot killed on his side launches off and cartwheels. The death he
+  plays for a bot (the host's C3BS message, sub_82587268) gave the routine the wrong arguments since
+  0.5.207: it takes the hit POINT in r9 and the push DIRECTION in r10, both pointers (its two callers
+  823FBF78 and 823FD118 build them on the stack; sub_82584188 pushes along r10's). We passed a vector
+  of about +-1 as the point, so the push landed at the world's origin, thousands of units from the
+  body, and a small number as the direction pointer. Host: the direction is now read from r10.
+  Joiner: r10 is the host's direction, r9 the body's middle; with no direction from the host, from
+  the killer to the victim, level. BOTH machines need 0.5.868 (the direction's wire bytes change
+  meaning; a mix gives a wrong push).
+- The user's Carentan match (867, 22 bots) froze 7 s after a thrown flare: the watchdog's main thread
+  in sub_8243E2B8 -> sub_82433B88, the scene model list's walk (as 0.5.350 and 0.5.416), with no
+  killcam playing, where the loop check did not run. The check is now on every frame (a two-speed
+  walk; only a loop found runs the old check that cuts it and logs "the scene's model list loops").
+- The same log's game heap count: 600 -> 3364 -> 1552 -> 3970 of 608 MB, starting before the flare was
+  thrown. Each step fits a guest pointer read as a block's size: something not a block was freed,
+  which breaks the heap's free lists and can feed the freeze above. A free whose size word is bigger
+  than the heap is now refused and logged ("heapguard: free refused ... guest call chain"; resizes
+  logged only). What frees it is NOT found yet: the next log's chain names it. Not tested in play.
+
+---
+
+## 0.5.867: who moves a person's tank (a write watch, watch_tank.txt)
+
+- tankdrive866 and the user ("they still arent driving tanks"): 0.5.866's pad reads answer "held" for a
+  bot's tank ("its physics let run") but it still stands. The physics routine reads no pad; the
+  routine that moves a tank is not found by reading. With watch_tank.txt beside the game, the first
+  tank a person drives has its place (+336) under a hardware write watch: the first 40 writes' guest
+  call chains go to the log ("watchpoint: guest address ... guest call chain"). Then that routine is
+  run for the bots.
+
+---
+
+## 0.5.866: bots' tanks drive at speed (the tank physics' pad gate)
+
+- The user drove the Seelow Panzer at 1737 3443 (logs-backup 20261108-094641-user-tank-drive): ~160
+  units/s, its place changing every 2.5 s sample; a bot in the same tank (tankdrive865_1): ~5/s, in
+  jumps every ~5 s, with the same command clock (+1936 ~2508 per 2.5 s) and his moves 127 40 in his
+  state. Cause: the tank's physics (sub_8258F7A8) runs only while the vehicle info's +506 is set, and
+  sub_82591450 and sub_82582280 set it from the driver's PAD (his controller port at 0x82C7A270 +
+  3208 * client + 180: sub_824829C0, the input bound to action 4, over 50; sub_820F9E50, binding 13,
+  the accelerator: +506 also drives the engine's running/idle timers). A bot has no pad. While either
+  runs for a vehicle a bot drives, those two reads answer 100 (thread-local t_botDrives).
+
+---
+
+## 0.5.865: the extra gun's roll from a real generator
+
+- botmix864 (Seelow, 12 bots, 8 min, 0.5.864): ran clean (109 fps median, no crash); bots in tanks
+  twice, 4 tank shells fired, 120 shots held for a mate in the line. But no bot got a random extra
+  gun: 0 of the 6 that could (slots 7-12, added in one moment: the tick-based roll). Now a seeded
+  std::mt19937; each roll logged ("bots: extra gun roll for slot N: R of 100 ...").
+- Clean-up (overnight, the user: "clearing up the leftover junk"): sent to the Recycle Bin (not
+  deleted; restore from it, or empty it to free the space): old friend/source zips 0.5.193-0.5.671
+  and the co-op test zips (D: top), the nested old repo copy CoD3Recomp\ and
+  CoD3Host\_backup_before_controller_fix\ (source), seelow-work coll_b/coll_r (tonight's
+  intermediates), the install's screenshots\*-draws.bin frame dumps and build-backups\before-0.5.2xx
+  (October 17 exe backups): ~15.6 GB. List: docs/CLEANUP-2026-11-08.md.
+
+---
+
+## 0.5.864: the bots' tanks move (slowly); a person's tank logged for comparison
+
+- tankdrive863 (Seelow, the Panzer at 1737 3443) and tankdrive863_merv (Merville): with the vehicle
+  think's move-locks clear (0.5.861) a bot's tank MOVES for the first time: his moves 127 40 reach
+  his state, the tank turns (yaw 240 -> 225) and goes ~200 units in 100 s; but only ~5 units a
+  second, its place changing every other 2.5 s sample (0, 12, 0, 7 ... on Seelow; 0, 27, 0, 26 ...
+  on Merville: not Seelow's ground). Every lock read in the vehicle code (sub_8257FAF0, 82582280,
+  82590FC8, 82591450: all inside the think now) is covered; what holds the speed is not found yet.
+- Logged for comparison when a person drives (60 lines): "vehicle think, a person driving: vehicle at
+  ..., his moves ..., +1936" (and +1936 in the drive test's lines): the user's own tank's speed and
+  command times against a bot's.
+
+---
+
+## 0.5.863: a tank drive test (tank_fire + COD3_TANK_DRIVE_TEST=1)
+
+- botveh862: no bot got into a tank (they do by chance). The tank_fire bot ("tank_fire [s] [crew]") with
+  COD3_TANK_DRIVE_TEST=1 also holds forward (and a little right) once in, and logs every 2.5 s the
+  tank's place and yaw, his, his moves +1960..+1962, +1940, his lock byte, +44, +240.
+
+---
+
+## 0.5.862: a bot driver's own state logged
+
+- botveh861: still "drove 0" (Panzer at 3043 -1553, yaw 135 throughout) with the whole vehicle think's
+  move-locks clear. Logged with each drive check now: his state's moves +1960..+1962 (what the
+  vehicle's driving reads), +1940 buttons, +1936 command time, his lock byte, +44 and +240.
+
+---
+
+## 0.5.861: the whole vehicle think with the bots' move-locks clear
+
+- botveh860b: "vehicle think for slot 4's: +603 2, kind 3 +32 2 +540 109": a tank's kind has +540
+  set, so the think takes the tanks' way (sub_82589C98, then sub_82591450 and sub_82590FC8, both
+  reading the driver's move-lock byte), never sub_8257FAF0. The whole think (sub_82591B40) now runs
+  with the bots' bytes clear (BotLocksClear), as their own thinks do.
+
+---
+
+## 0.5.860: the vehicle think watched (log only)
+
+- botveh859: no "vehicle driving" line at all: the driving (sub_8257FAF0) is never called for the
+  bots' tanks. Its one caller, the vehicle think (sub_82591B40), calls it only when the vehicle's
+  +603 is 2, its kind's +32 is not 5 and its kind's +540 is 0. Logged for a bot's tank (60 lines).
+
+---
+
+## 0.5.859: the tanks' driving watched (log only)
+
+- botveh858: still "drove 0" (yaw unchanged) with the bytes clear for sub_8257FAF0. Logged now: its
+  calls (every 3000th: vehicle, driver, a bot or not) and, for a bot driver every 2.5 s (60 lines), his
+  state's moves +1960..+1962, +240, +44, +2784, +1300 and his lock byte: the checks it makes first.
+
+---
+
+## 0.5.858: bots' tanks move (the driving's move-lock)
+
+- botveh857 (Seelow, 4 bots, 5 min): the extra gun stays in hand (one "takes his springfield", no
+  flip-flop). The tank: "drove 0 in 2.5 s (forward 70, steer 127)" every check, yaw unchanged, the
+  bot in it. The vehicle's driving (sub_8257FAF0) reads its driver's forward/right/up (his state
+  +1960..+1962) and zeroes them when his move-lock byte (0x82C73024 + his +2804) is set: set for
+  every bot (0.5.798 cleared it only around the vehicle's update, sub_82582280, for the gun). Both
+  calls now run with the bots' bytes clear (BotLocksClear). No bot had ever driven a tank: the
+  earlier "drove" was read from "is out after N s".
+
+---
+
+## 0.5.857: the extra gun stays in hand; why the bots' tanks do not move (log)
+
+- botmix856 (Seelow, 8 bots, 6 min, 0.5.856): 27 bots given an extra gun; tank routes found (34
+  spots, "cells 727 -> 1187 of 4204 known"); one tank shell by a bot ("fires his mp_shermanTank at an
+  enemy 1264 away"). But "takes his thompson" x59: the commands' weapon word put his main gun back
+  2.5 s after each switch (slot 9 holding weapon 4, 6, 4, 6 ...). The extra gun is now kept in that
+  word (g_wantGun, as Rusher 2's Bren), cleared when he goes back to his main gun and each life.
+- Every tank stint ended at 16 s (6 back-ups at 2.5 s each, then out): botveh8's 24 "backs up" were
+  4 stints x 6, the tanks never moving, not walls. Logged now, every check (80 lines): "bots:
+  vehicle: slot N drove D in 2.5 s (forward F, steer S), tank at ..., he at ..., aim ...".
+
+---
+
+## 0.5.856: bots fire the tanks they drive; a random extra gun for bots (our added guns too)
+
+- The user (2026-11-08): bots should "learn to drive in the tanks and shoot too". No bot had fired
+  a tank in normal play (botveh854: Sherman events 45/46/36 only, no shot): the driving code clears
+  the fire button every frame and points the view (the turret) the way it drives. Now a driving
+  bot that sees an enemy 250-3000 off turns the turret onto him (the view, as tank_fire aims) while
+  the hull keeps to its route, and fires a shell when within 4 degrees of him with no mate within
+  350 of him, one every 3.5 s (fire held 0.3 s). Log: "bots: vehicle: slot N fires his <tank> at an
+  enemy D away". Gunners (seat 1) keep Think's aim and fire.
+- The user: bots should "always have a random secondary weapon ... a flame thrower or a webley or
+  dual colts or two snipers or a rifle ... use all of our added weapons ... epic battles". A kit
+  with no second gun of its own (not anti-armor: his pistol is his close-range gun) gets one at
+  random for ~6 bots in 10 (COD3_BOT_EXTRA_GUN=0..100 the share): flamethrower, webley, colt_dual,
+  mosin_scoped, kar98_sniper, lee_enfield_sniper, springfield, m1garand, kar98, mp44, thompson,
+  mp40, bren, sten, gewehr43, fg42, shotgun, in the pistol's place (as the kits' secondary). Using
+  it: the flamethrower out for an enemy in sight within 450, away past 800; any other is his main
+  gun in about a third of his lives (out 3 s after he spawns). Logs: "bots: loadout ... second X",
+  "bots: slot N takes his X (his extra gun / his main gun again ...)".
+- (A build at 01:10 held all of this but was stamped 0.5.855: the notes still said 855.)
+
+---
+
+## 0.5.855: grenades as before; bots hold fire for a mate in the line a little wider; tank routes found
+
+- The user (2026-11-08, about 0.5.852's team-kill guards): grenades hurting friendly bots is fine;
+  what matters is a bot not shooting while a friendly is in view on the line to its enemy, and
+  moving until the shot is clear. Grenades: back to 0.5.851's (no mate within 320 of the target;
+  0.5.852's 450 and throw-line check out). Bullets (MateInLine, then the sidestep): a mate within
+  34 + 4% of the distance of the line holds the shot (was 30 + 3%). Kept from 0.5.852: a bot in a
+  tank and the rusher's artillery spare mates near the target.
+- Tests on 0.5.854 (overnight): mosinscope854 (COD3_ADS_TEST "10 40", Mosin primary): scoped in,
+  the Kar98's scope view with fully black sides, CoD2's Mosin at the hip ("mosin: scoped in ...
+  view 47.3 of 90"). botveh854 (Seelow, 4 bots, 6 min) against botveh8 (0.5.851): entries 4 / 4,
+  "took too long" 4 / 9, "backs up" 24 / 24: every tank route came back empty ("0 spots"): Path's
+  start is looked for within 300 of the tank, and tanks stand off the walked ways. Now the start and
+  goal cells within 900 (log "(cells A -> B of N known)"). Log 5.6 MB against 7.1 MB, same 6 min.
+
+---
+
+## 0.5.854: bots drive tanks along known routes; far tanks get more time; quieter bot log
+
+- Bots driving: along the learnt map's route to where they drive (the first spot of the route 250 or
+  more from the tank is steered at; the route again every 6 s and after each back-up; straight when
+  no way is known), not straight at the place: botveh8 had ~24 "is stuck: backs up" a match. Log:
+  "bots: vehicle: slot N's route to X Y: K spots".
+- Getting to a tank: the time allowed grows with how far it was when chosen (45 s + 1 s per 150
+  units, at most +20 s; Demolitionist 60 s +): botveh8's ~9 "took too long" a match.
+- Log: the bots' busiest diagnostics (muzzle 7199 lines in 4.6 min, Pmove/after Pmove ~8000, throw
+  trace 3237, the per-second record/fire gate/weapon dump ~2400, tactics, model updates, capsule
+  traces, replication) each stop after a number of lines a run (the record dump: every second for
+  its first 120, then every 15 s). COD3_BOT_DIAG=1 keeps them all. A printf and flush each: less
+  log, less time on the game's thread.
+
+---
+
+## 0.5.853: a test can aim down the sights (COD3_ADS_TEST)
+
+- Overnight (2026-11-08, the user asleep): COD3_ADS_TEST="20 40" holds the left trigger from 20 s to
+  40 s after the view is first drawn (Input::HoldAim), for scope tests: COD3_PAD's lt holds kept the
+  test at SIDE SELECTION (mosinscope852). Log: "test: sights up/down at N s".
+- Flare HUD (the user: "it shows all 3 grenade symbols instead of just the flare"): not seen in
+  flarehud852/852b (class 1: 4 grenades, special the flare): one grenade icon with its count, x4,
+  x3 after a test flare throw (the count went down for the FLARE, the icon a frag's), "SIGNAL
+  FLARE" over it while the special is up. Asked the user where and when the three show.
+
+---
+
+## 0.5.852: the friend sees the bots die (kill feed, death), bots spare teammates, Mosin scope
+
+- The user and friend's 0.5.851 match (friend's log: Downloads\CoD3MP.log, kept in
+  logs-backup\20261107-224620-mptest): on the joiner, 245 bot copies went "health 100 -> 0", but not
+  one "dies here as on the host": the game's own updates had already zeroed their health, so the
+  host's state message (C3BS) found them "not alive here" and played nothing. His kill feed had only
+  the two humans' deaths (13 lines), never a bot's: nothing made one for them.
+  - Joiner: a copy the host says died is killed here when in the game (state 3) even at health 0,
+    unless the game's own death routine ran for that slot in the last 2 s; then the kill feed line
+    is made the way the no-session death makes it (the obituary callback *(0x82BCBF64)+3300 with
+    the victim's and killer's handles). Log: "dies here as on the host ... health A -> B ... kill
+    feed line made".
+  - Host: the bots' states go out at once after a bot dies (were up to 250 ms later): the freeze
+    before they drop.
+- Bots and teammates (friendly fire on): bullets already held fire for a mate in the line. The three
+  team kills in the logs were splash: a grenade (means 4), a tank shell (10), artillery (18).
+  Grenades: no mate within 450 of the target (was 320) nor near the last 60% of the throw's line.
+  A bot in a vehicle holds fire with a mate within 350 of his target (as the launchers do). The
+  rusher's artillery is not called (and is called off) with a mate within 750 of the spot.
+- Scoped Mosin: through the scope the user saw the scope's sides. CoD2's mesh is drawn in the
+  Kar98's place with the Kar98's scope parts hidden; once the view has zoomed past 55% of the
+  player's field of view the Kar98's own scoped view is drawn (same scope). Log: "mosin: scoped in".
+  COD3_MOSIN_SCOPE_OWN=1: the old way.
+- Tank machine gun with a human gunner: the user tested it, works.
+- Map data (install only, no rebuild; backups in logs-backup\packs-before-*-852):
+  - **War captures on Carentan and Seelow (and Seelow Night).** The level's mp_rouen.dcgb holds the
+    brush models of every objective trigger (*2..*21: War, Dom, HQ, single-flag CTF), as world-space
+    boxes at Rouen's places (112-byte records: bounds, radius, model number at +0x68; then cgb-style
+    volumes). scene.py gave the moved triggers an origin (new - old); CoD3 places these brushes as
+    stored, so the triggers stayed at Rouen's spots (Carentan: holder 53377998 0 for 20 min of War).
+    Seelow's install had also dropped the .dcgb from the directory. New tools/carentan/triggers.py:
+    each objective box moved onto its objective (centred on it, on its ground), origin back to 0;
+    --seelow puts the .dcgb back in the directory and sinks Rouen's other brush models (doors,
+    breakables) 60000 under. Runs in runvariant.sh and seelow_install.sh. Tests: carentan-war852
+    and seelow-backstop852: the game itself took flags (holder -1.0 / +1.0) and moved play on.
+  - **Seelow: no more falling under the map.** The user's three falls (2959 2624, 2856 1537, 1643
+    1722) were on whole, rightly wound ground (no gap on a 2-unit grid): CoD3 lets a player through a
+    big one-sided WaW triangle, with nothing solid under it to -352. seelow_clipmap.py backstops():
+    a 16-thick slab brush under each world ground triangle (13247; props' hulls none). The user
+    walked the falls after: "its fixed". First with its top 2 under the ground: then the user stood
+    frozen "in the ground" on the same hill (2950 2606, 0.6 into the mesh, held by the slab), so
+    the slab's top is now the ground itself (SEELOW_BACKSTOP_GAP 0, coll_s): a solid brush at the
+    surface (within 0.05 at every spot checked), never above it (0 of 2205 points). The user walked
+    the hill and the tracks after: fixed (2026-11-08).
+  - **Seelow: the railway crossed without catching.** The rails' upright metal faces over the
+    hilltop by the middle flag and the western stretch (RAILS: 105 triangles) are out of the
+    collision; floors and rail tops stay (the bed is metal too in places), rails get no slab.
+  - The collision files grew (each 1.1-1.4 MB); zone 2 is 3 blocks (manifest set). Game heap on
+    Seelow peaked 604 of 608 MB (was 601-602), Seelow Night 600: no trouble in the tests.
+  - The friend needs these packs too (Carentan, Seelow, Seelow Night) when the next zip is made.
 
 ---
 

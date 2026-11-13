@@ -10,7 +10,7 @@
 # seelow_cells.py with SEELOW_NIGHT), and Longyard's night sky (its dome painting,
 # clouds and fog ramp from the Bravo pack) painted into the sky textures
 # (seelow_sky.py --night) in place of WaW's day sky.
-# usage: seelow_install.sh            (env: CELLS=cells2m (static models, LOD materials fixed; cells1m before; cells1 without), COLL=coll_m (with the models' collision; coll without), DROP_GRASS=1, ONE_CELL_BSP=1, NIGHT=0)
+# usage: seelow_install.sh            (env: CELLS=cells2m (static models, LOD materials fixed; cells1m before; cells1 without), COLL=coll_s (models' collision, ground backstops, rail edges out: 0.5.852; coll_m before), DROP_GRASS=1, ONE_CELL_BSP=1, NIGHT=0)
 W="D:/Call of Duty 3 (USA, Europe)/seelow-work"
 G="D:/Call of Duty 3 (USA, Europe)/CoD3-PC-Port-0.4.0/game/mp/rouen"
 C="D:/Call of Duty 3 (USA, Europe)/CoD3-PC-Port-0.4.0/saves/content/00000002"
@@ -31,9 +31,9 @@ if [ ! -f "$P/$F.cod" ]; then
 fi
 [ -f "$I/seelow.cod.orig" ] || cp "$P/$F.cod" "$I/seelow.cod.orig"
 cd "$T/kapf" || exit 1
-python -I merge_zone.py "$G/zn01.cod" "$I/zn01.cod" mp_rouen_zone01 "$W/$CELLS/cells.pkl" "$W/${COLL:-coll_m}/seelow_zn01.cgb" 1,2,3,4,5,6,8,9,10,11 --textures --drop-assets | tail -1 | cut -c1-200
-python -I merge_zone.py "$G/zn02.cod" "$I/zn02.cod" mp_rouen_zone02 "$W/$CELLS/cells.pkl" "$W/${COLL:-coll_m}/seelow_zn02.cgb" 7 --drop-assets | tail -1 | cut -c1-200
-python -I merge_zone.py "$G/zn03.cod" "$I/zn03.cod" mp_rouen_zone03 "$W/$CELLS/cells.pkl" "$W/${COLL:-coll_m}/seelow_zn03.cgb" 0 --drop-assets | tail -1 | cut -c1-200
+python -I merge_zone.py "$G/zn01.cod" "$I/zn01.cod" mp_rouen_zone01 "$W/$CELLS/cells.pkl" "$W/${COLL:-coll_s}/seelow_zn01.cgb" 1,2,3,4,5,6,8,9,10,11 --textures --drop-assets | tail -1 | cut -c1-200
+python -I merge_zone.py "$G/zn02.cod" "$I/zn02.cod" mp_rouen_zone02 "$W/$CELLS/cells.pkl" "$W/${COLL:-coll_s}/seelow_zn02.cgb" 7 --drop-assets | tail -1 | cut -c1-200
+python -I merge_zone.py "$G/zn03.cod" "$I/zn03.cod" mp_rouen_zone03 "$W/$CELLS/cells.pkl" "$W/${COLL:-coll_s}/seelow_zn03.cgb" 0 --drop-assets | tail -1 | cut -c1-200
 cd "$T/carentan" || exit 1
 # CoD3's own burning-vehicle fire (Rouen's vfire_panzerIV, its zone 1 scene's effect records) at
 # WaW's five burning cars (its createfx mp_fire_medium spots, 2026-11-03): SCENE_FIRES="" for none.
@@ -46,7 +46,7 @@ cd "$T/carentan" || exit 1
 # the point) start at the ground under the car. (Was origin - 15: -314 -333 -132 -123 -65.)
 SCENE_FIRES="${SCENE_FIRES-3240 1177 -339|2805 -1866 -358|374 2060 -157|1953 4754 -148|4079 4723 -90}" \
     python -I scene.py zone "$I/zn01.cod" "$I/zn02.cod" "$I/zn03.cod" | cut -c1-160
-SCENE_CGB="$W/${COLL:-coll_m}/seelow_zn01.cgb|$W/${COLL:-coll_m}/seelow_zn02.cgb|$W/${COLL:-coll_m}/seelow_zn03.cgb" SCENE_GROUND="-450,300" SCENE_REACH=900 \
+SCENE_CGB="$W/${COLL:-coll_s}/seelow_zn01.cgb|$W/${COLL:-coll_s}/seelow_zn02.cgb|$W/${COLL:-coll_s}/seelow_zn03.cgb" SCENE_GROUND="-450,300" SCENE_REACH=900 \
     python -I scene.py level "$I/seelow.cod.orig" "$I/seelow.cod" "$W/mp_seelow.ents" | tail -25
 [ "${ONE_CELL_BSP:-1}" = 1 ] && python -I scene.py onecell "$I/seelow.cod" | tail -1
 [ "${DROP_GRASS:-1}" = 1 ] && python -I scene.py drop "$I/seelow.cod" .bgib | tail -1
@@ -58,8 +58,13 @@ SCENE_CGB="$W/${COLL:-coll_m}/seelow_zn01.cgb|$W/${COLL:-coll_m}/seelow_zn02.cgb
 # Rouen's dynamic collision (.dcgb: its doors' and breakables' brushes, as text, at Rouen's places:
 # invisible walls in Seelow, the user 2026-11-02) out of every directory: DROP_DCGB=0 keeps them
 if [ "${DROP_DCGB:-1}" = 1 ]; then
-    for f in seelow zn01 zn02 zn03; do python -I scene.py drop "$I/$f.cod" .dcgb | tail -1; done
+    for f in zn01 zn02 zn03; do python -I scene.py drop "$I/$f.cod" .dcgb | tail -1; done
 fi
+# 2026-11-07 (0.5.852): the level's .dcgb holds the brush models of War's, Domination's and HQ's
+# triggers (the user: War's flag "wouldn't actually start capturing"): kept, its objective trigger
+# boxes moved to Seelow's flags (origin 0, as Rouen's), every other brush model (Rouen's doors and
+# breakables: the invisible walls) sunk 60000 under the map
+python -I triggers.py "$I/seelow.cod" --seelow | tail -3
 # Seelow's own WaW sky (dome painting resampled into CoD3's sky dome, clouds swapped): SKY=0 keeps
 # Rouen's. Not at night: Longyard's sky is grafted in below.
 [ "${SKY:-1}" = 1 ] && [ "${NIGHT:-0}" != 1 ] && (cd "$T/waw" && python -I seelow_sky.py "$I/seelow.cod" "D:/Steam/steamapps/common/Call of Duty World at War/main" | tail -1)
@@ -97,7 +102,7 @@ if [ "${REPACK:-1}" = 1 ]; then
     # index bytes each, full at 186000 with props in boxes) as the level's own unzoned.cgb,
     # read as Merville's whole collision is from its level archive (mp_merville.cgb)
     UNZONED=()
-    [ -f "$W/${COLL:-coll_m}/seelow_zn04.cgb" ] && UNZONED=(--replace "unzoned.cgb=$W/${COLL:-coll_m}/seelow_zn04.cgb")
+    [ -f "$W/${COLL:-coll_s}/seelow_zn04.cgb" ] && UNZONED=(--replace "unzoned.cgb=$W/${COLL:-coll_s}/seelow_zn04.cgb")
     (cd "$T/kapf" && python -I repack.py "$I/seelow.cod" "$I/seelow.repacked.cod" \
         --keep "^(c_|hc_|cg_|ng_|w_|p_mp_|pfx_|v_|sky|stand\.|radio)" --keep-tex "^fogramp$" --fli "mp\\$F\\$F.cod" \
         --fli-also "mp\\$F\\zn01.cod=$I/zn01.cod|mp\\$F\\zn02.cod=$I/zn02.cod|mp\\$F\\zn03.cod=$I/zn03.cod" \

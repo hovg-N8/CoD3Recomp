@@ -11,8 +11,10 @@
 
 #include "coop.h"
 #include "overlay.h"
+#include "input.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <deque>
@@ -26,6 +28,8 @@
 #include <chrono>
 
 extern "C" PPC_FUNC(__imp__sub_82513628);
+
+bool CoopCommitted(const void* p, size_t n);   // coop_memscan.cpp (0.5.987)
 
 namespace Coop
 {
@@ -67,13 +71,16 @@ namespace Coop
         volatile uint32_t g_joinFrames = 0;   // (v46) frames of ours, for the reload's watchdog
         bool g_reloading = false;   // (v45) loading again for the host's checkpoint: no intro of ours waited for
         double g_inSince = -1, g_frozenAt = -1, g_firstSnapAt = -1;
+        double g_lastSnapAt = -1;   // (0.5.893) when the host's last snapshot came
         uint32_t g_seq = 0;
         int32_t g_health = -1, g_maxHealth = -1;
         uint32_t g_hostFlags = 0, g_hostAllow = 0;
         int32_t g_hostHealth = 0, g_hostMaxHealth = 0, g_hostBodyIndex = -1;   // the host's player (K_PS)
         float g_hostPos[3] = {};
+        bool g_catchUpHost = false;   // (0.5.964) put my player where the host stands, once (riding one of our vehicles at the freeze)
         float g_stable[3] = {}; double g_stableAt = -1;   // (v45u) where my player last stood still on firm ground
         float g_hostYaw = 0;
+        uint32_t g_hostHint[3] = {}; double g_hostHintAt = -1;   // (0.5.919) my prompt as the host's world has it (record +1156..+1164)
         std::vector<std::tuple<std::string, std::string, uint32_t>> g_dvarPending;   // the host's scripts' dvars, to set here
         bool g_havePs = false;
         double g_psAt = -1;
@@ -290,7 +297,7 @@ namespace Coop
         // (v43g) the host's body: animated here by how it moves and his stance, as the host animates the
         // joining player's (coop_host.cpp DriveBody), not from the host's tree: that body lives below his
         // world there, where its animations were not kept moving, and here it stood in its bind pose
-        struct LocalBody { int32_t anim = -1, prev = -1; double blendAt = -1; int move = -1; float last[3] = {}; double at = -1; float speed = 0; uint32_t tree = 0; };
+        struct LocalBody { int32_t anim = -1, prev = -1; double blendAt = -1; int move = -1; float last[3] = {}; double at = -1; float speed = 0; uint32_t tree = 0; float lastT = 0; double bare = 0, bareAt = -1, toldAt = 0; uint32_t restarts = 0, replays = 0; };
         LocalBody g_lb;
         void DriveHostBody(PPCContext& ctx, uint8_t* base, Remote& r)
         {
@@ -316,6 +323,8 @@ namespace Coop
                 if (!Valid(tree)) return;
             }
             if (tree != g_lb.tree) { g_lb = LocalBody{}; g_lb.tree = tree; }
+            // (0.5.880) no parent node left weighing with nothing under it (the T-pose; see TidyBodyTree)
+            // (0.5.895: TidyBodyTree is called once, after this, with the aim's up and down)
             const uint32_t list = Guest::Read32(base, tree + 8);
             auto index = [&](uint32_t hash) -> int32_t {
                 const uint32_t count = std::min<uint32_t>(Guest::Read32(base, list + 4), 4096), entries = Guest::Read32(base, list + 8);
@@ -323,15 +332,28 @@ namespace Coop
                 return -1;
             };
             const double now = Now();
+            // (0.5.877) how long the host's body has had nothing playing here (the T-pose), said every 10 s
+            {
+                bool bare = g_lb.anim < 0; float t = -1, w = -1, goal = -1; uint16_t slot = 0;
+                if (!bare) { slot = Guest::Read16(base, tree + 24 + 2 * uint32_t(g_lb.anim)); if (!slot) bare = true; else { const uint32_t rc = InfoPool + 52u * slot; t = F(base, rc + 16); w = F(base, rc + 36); goal = F(base, rc + 32); if (!(w > 0.0f)) bare = true; } }
+                if (bare && g_lb.bareAt >= 0) g_lb.bare += std::min(now - g_lb.bareAt, 1.0);
+                g_lb.bareAt = now;
+                if (now - g_lb.toldAt > 10.0)
+                {
+                    const uint32_t count = std::min<uint32_t>(Guest::Read32(base, list + 4), 4096), entries = Guest::Read32(base, list + 8);
+                    int leaves = 0, parents = 0, held = 0;
+                    for (uint32_t k = 0; k < count; k++) { const uint16_t sl = Guest::Read16(base, tree + 24 + 2 * k); if (!sl) continue; held++; if (!(F(base, InfoPool + 52u * sl + 36) > 0.3f)) continue; if (Guest::Read16(base, entries + 28 * k + 4)) parents++; else leaves++; }
+                    printf("coop: join: the host's body's tree: %d nodes held, weighing: %d animations, %d parent nodes\n", held, leaves, parents);
+                }
+                if (now - g_lb.toldAt > 10.0) { g_lb.toldAt = now; printf("coop: join: the host's body: move %d, animation %d, slot %u, time %.2f, weight %.2f (to %.2f); bare %.1f s so far, %u restarts, %u replays\n", g_lb.move, g_lb.anim, slot, t, w, goal, g_lb.bare, g_lb.restarts, g_lb.replays); fflush(stdout); }
+            }
             if (r.track.empty()) return;
             const float* o = r.track.back().o;
-            if (g_lb.at >= 0 && now > g_lb.at)
-            {
-                const float dt = float(now - g_lb.at);
-                const float v = sqrtf((o[0] - g_lb.last[0]) * (o[0] - g_lb.last[0]) + (o[1] - g_lb.last[1]) * (o[1] - g_lb.last[1])) / std::max(dt, 0.001f);
-                g_lb.speed += (std::min(v, 600.0f) - g_lb.speed) * std::min(1.0f, dt * 8.0f);
-            }
-            const float vx = o[0] - g_lb.last[0], vy = o[1] - g_lb.last[1];
+            static BodyMotion mo;   // (0.5.891: see coop.h)
+            if (g_lb.at < 0) mo = BodyMotion{};
+            mo.Feed(now, o[0], o[1]);
+            g_lb.speed = mo.speed;
+            const float vx = mo.vx, vy = mo.vy;
             memcpy(g_lb.last, o, 12); g_lb.at = now;
             const bool prone = (r.extra & 8) != 0, crouch = !prone && (r.extra & 4);
             const float yaw = r.track.back().a[1] * 0.0174533f;
@@ -341,11 +363,14 @@ namespace Coop
             else if (prone) move = PRONE_CRAWL;
             else
             {
-                const bool f = fabsf(fwd) >= fabsf(side);
+                const bool f = mo.ForwardAxis(fwd, side);
                 if (crouch) move = f ? (fwd >= 0 ? CROUCH_WALK_F : CROUCH_WALK_B) : (side > 0 ? CROUCH_WALK_L : CROUCH_WALK_R);
                 else if (f && fwd >= 0) move = g_lb.speed > 170.0f ? STAND_RUN_F : STAND_WALK_F;
                 else move = f ? STAND_WALK_B : (side > 0 ? STAND_WALK_L : STAND_WALK_R);
             }
+            move = mo.Settle(now, move);   // (0.5.891)
+            { static uint8_t was = 0; static int told = 0; if ((r.extra >> 4) != was && (r.extra >> 4) != 1 && was != 1 && told < 300) { told++; printf("coop: join: the host does %u (was %u) at %.1f s\n", r.extra >> 4, was, Now()); fflush(stdout); } was = r.extra >> 4; }
+            { uint32_t act = uint32_t(r.extra) >> 4; if (act == 0 && fabsf(Pitch180(r.track.back().a[0])) > AimPitchMin) act = 1; move = mo.Act(act, BodyAct(move, act)); }   // (0.5.882; 0.5.895: looking up or down, he aims) what the host does: 0x10 firing, 0x20 throwing, 0x40 aiming
             // the move playing kept playing (near its end it starts over, its weight put back)
             // (v45u) the weights moved on here, a fifth of a second to blend: the frozen world does not do it
             {
@@ -358,8 +383,8 @@ namespace Coop
                     if (!std::isfinite(w)) w = to;
                     SetF(base, rc + 36, w); SetF(base, rc + 32, to);
                 };
-                if (g_lb.prev >= 0 && g_lb.prev != g_lb.anim) ramp(g_lb.prev, 0.0f);
-                ramp(g_lb.anim, 1.0f);
+                // (0.5.890) the blend is TidyBodyTree's now (coop_host.cpp), the same on both copies
+                (void)ramp;
             }
             if (move == g_lb.move && g_lb.anim >= 0)
             {
@@ -367,20 +392,34 @@ namespace Coop
                 if (slot)
                 {
                     const uint32_t rec = InfoPool + 52u * slot;
-                    if (F(base, rec + 16) >= 0.97f) { SetF(base, rec + 16, 0.0f); SetF(base, rec + 20, 0.0f); }
-                    if (F(base, rec + 32) < 0.99f) SetF(base, rec + 32, 1.0f);
+                    // (0.5.877) started over one frame's step before its end (see the host's DriveBody)
+                    const float t = F(base, rec + 16), step = std::clamp(t - g_lb.lastT, 0.0f, 0.5f);
+                    const bool end = t >= 0.97f || (step > 0.0f && step < 0.1f && t + 1.5f * step >= 1.0f);
+                    if (end && OneShotMove(move)) { SetF(base, rec + 40, 0.0f); g_lb.lastT = t; }   // (0.5.892: held at its end)
+                    else if (end) { SetF(base, rec + 16, 0.0f); SetF(base, rec + 20, 0.0f); g_lb.lastT = 0; g_lb.restarts++; }
+                    else g_lb.lastT = t;
                     return;
                 }
                 g_lb.anim = -1;
             }
-            int32_t anim = index(MoveHash[move]);
-            if (anim < 0) anim = index(MoveHash[STAND_IDLE]);
+            int32_t anim = index(BodyMoveHash(move));
+            if (anim < 0) { static int toldM = 0; if (toldM++ < 12) { printf("coop: join: the move %d (%s) is not in the host's body's list\n", move, BodyMoveText(move)); fflush(stdout); } anim = index(BodyMoveHash(STAND_IDLE)); }
             if (anim < 0) { static int told2 = 0; if (told2++ < 3) { printf("coop: join: the host's body: none of the moves in its list\n"); fflush(stdout); } if (r.haveAnim && r.list) SetAnims(ctx, base, r); return; }
-            if (anim != g_lb.anim && AnimJobRoom(base))
+            if (anim != g_lb.anim)   // (0.5.892: no waiting for room in the pose queue: in a fight there was none for seconds, and the host's body stood with nothing playing)
             {
                 PPCContext c = CallCtx(ctx);
-                c.r3.u64 = tree; c.r4.u64 = uint32_t(anim); c.f1.f64 = 1.0; c.f2.f64 = 0.2; c.f3.f64 = move == STAND_RUN_F ? 1.15 : 1.0; c.r8.u64 = 0; c.r10.u64 = 0;
-                CallGuest(c, base, 0x82500A40);   // set anim
+                const bool nothing = g_lb.anim < 0;   // (0.5.877) nothing was playing: in at once, not blended from the bind pose
+                if (nothing) g_lb.replays++;
+                g_lb.lastT = 0;
+                // (0.5.878) THE T-POSE: the move was set on its own node only (sub_82500A40), and a node shows only as
+                // much as its parent nodes weigh. The parents of a move never set before came in weighing nothing, so
+                // the body stood in its bind pose with its idle "playing" at full weight (t877a: both screens). The
+                // move is set with the scripts' own call that weighs the parents too (sub_82500B80), as the soldier
+                // puppets' are; the rate, which that call does not take, is written after.
+                c.r3.u64 = tree; c.r4.u64 = uint32_t(anim); c.f1.f64 = 1.0; c.f2.f64 = nothing ? 0.0 : 0.2;
+                CallGuest(c, base, 0x82500B80);   // set anim, the parents too
+                if (const uint16_t sl = Guest::Read16(base, tree + 24 + 2 * uint32_t(anim))) { SetF(base, InfoPool + 52u * sl + 40, move == STAND_RUN_F ? 1.15f : 1.0f); if (OneShotMove(move)) { SetF(base, InfoPool + 52u * sl + 16, 0.0f); SetF(base, InfoPool + 52u * sl + 20, 0.0f); } }
+                if (nothing) { const uint16_t sl = Guest::Read16(base, tree + 24 + 2 * uint32_t(anim)); if (sl) { SetF(base, InfoPool + 52u * sl + 36, 1.0f); SetF(base, InfoPool + 52u * sl + 32, 1.0f); } }
                 if (g_lb.anim >= 0)
                 {
                     c = CallCtx(ctx);
@@ -389,17 +428,35 @@ namespace Coop
                 }
                 if (g_lb.prev >= 0 && g_lb.prev != anim && g_lb.prev != g_lb.anim) { const uint16_t sl = Guest::Read16(base, tree + 24 + 2 * uint32_t(g_lb.prev)); if (sl) { SetF(base, InfoPool + 52u * sl + 36, 0.0f); SetF(base, InfoPool + 52u * sl + 32, 0.0f); } }
                 g_lb.prev = g_lb.anim;
-                static int told = 0;
-                if (told++ < 6) { printf("coop: join: the host's body plays move %d (animation %d of %u)\n", move, anim, Guest::Read32(base, list + 4)); fflush(stdout); }
+                static int told = 0, toldAct = 0;
+                if (move > 14 ? toldAct++ < 200 : told++ < 40) { printf("coop: join: the host's body plays move %d %s (animation %d of %u)\n", move, BodyMoveText(move), anim, Guest::Read32(base, list + 4)); fflush(stdout); }
             }
             g_lb.anim = anim; g_lb.move = move;
         }
         // one of ours for the host's entity: the same map entity, or a puppet
+        // (0.5.942) our own stationary machine guns are kept (not deleted at the freeze): the host's of the same number and
+        // model is drawn by ours, so the joining player's own Use takes it here as it does there (t941a: on the host he was
+        // on the MG42, on his copy he still held his rifle in front of a puppet of it)
+        bool KeptGun(const uint8_t* base, uint32_t e) { return e && base[e] == 10 && BrocText(base, e + 564) == "misc_mg42"; }
         bool Bind(PPCContext& ctx, uint8_t* base, uint16_t idx, Remote& r)
         {
             const std::string* cls = Name(r.cls);
+            // (0.5.995) a probe: each missile of the host's (type 3) as it is drawn here (t994a: German grenades landed
+            // by the joining player, his copy's test never saw one)
+            if (r.type == 3) { static int told = 0; static std::set<uint32_t> once; if (told < 60 && once.insert((uint32_t(idx) << 16) | r.gen).second) { told++; const std::string* m0 = r.models[0] ? Name(r.models[0]) : nullptr; printf("coop: join: the host's missile %u: class %s, model %s, place %s\n", idx, cls ? cls->c_str() : "?", m0 ? m0->c_str() : (r.models[0] ? "(name not known)" : "-"), r.havePlace ? "yes" : "no"); fflush(stdout); } }
             if (!cls || !r.havePlace) return false;
-            if (const uint32_t mine = EntityAt(base, idx); mine && !g_puppets.count(mine) && !g_retired.count(mine) && !(Guest::Read32(base, mine + 632) & 0x400u) && !(Guest::Read32(base, mine + 16) & 0x100000u) && base[mine] == r.type && r.type != 11 && r.type != 1 && r.type != 10 && r.type != 2 && r.type != 3 && BrocText(base, mine + 564) == *cls)
+            // (0.5.935) ours is taken for the host's only when it wears the same model too. t934b: the host made bodies
+            // in slots it had freed (the joining player's new body in 244, the Garand's; the host's in 130 and 282),
+            // and the joining copy took its own thing of that number (a Garand, a soldier without the host's tree)
+            // for them: the host's body drawn as something else, in its own pose, sideways, flashing. Never ours
+            // for the host's body either.
+            const bool sameModel = [&]() {
+                if (!r.models[0]) return true;
+                const std::string* m = Name(r.models[0]);
+                const uint32_t mine = EntityAt(base, idx);
+                return m && mine && ResName(base, ModelSlot(base, mine, 0)) == *m;
+            }();
+            if (const uint32_t mine = EntityAt(base, idx); mine && sameModel && int32_t(idx) != g_hostBodyIndex && !g_puppets.count(mine) && !g_retired.count(mine) && !(Guest::Read32(base, mine + 632) & 0x400u) && !(Guest::Read32(base, mine + 16) & 0x100000u) && base[mine] == r.type && r.type != 11 && r.type != 1 && (r.type != 10 || KeptGun(base, mine)) && r.type != 2 && r.type != 3 && BrocText(base, mine + 564) == *cls)
             {
                 r.local = mine; r.localIndex = idx; r.puppet = false; r.localGen = GenAt(base, idx);
                 // (v44n) ours, hidden while the host had none (or before his checkpoint): shown again. Hidden ones
@@ -533,7 +590,13 @@ namespace Coop
                 if (me && Guest::Read32(base, me + 916)) { PPCContext c = CallCtx(ctx); c.r3.u64 = me; CallGuest(c, base, 0x82540D78); }
                 int vehicles = 0;
                 for (uint32_t i = 2; i < 4096; i++)
-                    if (const uint32_t e = EntityAt(base, i); e && base[e] == 10 && !g_puppets.count(e)) { Guest::Write32(base, e + 632, Guest::Read32(base, e + 632) | 0x400u); DeleteEntity(ctx, base, i); vehicles++; }
+                    if (const uint32_t e = EntityAt(base, i); e && base[e] == 10 && !g_puppets.count(e) && !KeptGun(base, e))
+                    {
+                        // (0.5.964) riding it (Falaise's intro jeep, t963a): left where it was, in its place, while the host's
+                        // jeep went on: put where the host stands
+                        if (me) { const float dx = F(base, e + 336) - F(base, me + 336), dy = F(base, e + 340) - F(base, me + 340), dz = F(base, e + 344) - F(base, me + 344); if (dx * dx + dy * dy + dz * dz < 250.0f * 250.0f) g_catchUpHost = true; }
+                        Guest::Write32(base, e + 632, Guest::Read32(base, e + 632) | 0x400u); DeleteEntity(ctx, base, i); vehicles++;
+                    }
                 if (vehicles) { printf("coop: join: %d of our vehicles deleted\n", vehicles); fflush(stdout); }
             }
             // (v45r) our drones (script_models with a tree) are deleted for good too, now, once: only hidden, each
@@ -546,7 +609,7 @@ namespace Coop
                 if (drones) { printf("coop: join: %d of our drones deleted\n", drones); fflush(stdout); }
             }
             for (uint32_t i = 2; i < 4096; i++)
-                if (const uint32_t e = EntityAt(base, i); e && (base[e] == 11 || base[e] == 10 || (base[e] == 7 && Valid(Guest::Read32(base, e + 552)))) && !g_puppets.count(e)) { Remove(ctx, base, i); deleted++; }
+                if (const uint32_t e = EntityAt(base, i); e && (base[e] == 11 || (base[e] == 10 && !KeptGun(base, e)) || (base[e] == 7 && Valid(Guest::Read32(base, e + 552)))) && !g_puppets.count(e)) { Remove(ctx, base, i); deleted++; }
             // (v43g) a census of what is left of our own world, by type: what still simulates here
             {
                 int count[16] = {};
@@ -602,7 +665,7 @@ namespace Coop
     void JoinMissionStart(const std::string& name)
     {
         g_remote.clear(); g_puppets.clear(); g_pool.clear(); g_retired.clear(); g_sweepHidden.clear(); g_stableAt = -1; g_threadFlags.clear();   // (the names: cleared by the host's R_MAPSTART, in order with his new ones)
-        g_frozen = false; g_inSince = -1; g_frozenAt = -1; g_firstSnapAt = -1;
+        g_frozen = false; g_inSince = -1; g_frozenAt = -1; g_firstSnapAt = -1; g_lastSnapAt = -1;
         g_health = g_maxHealth = -1; g_psAt = -1;
         g_ownLetterbox = g_ownIntroScreen = false;
         for (bool& h : g_hudHave) h = false;
@@ -612,6 +675,7 @@ namespace Coop
     void JoinReceive(PPCContext& ctx, uint8_t* base, Kind kind, const uint8_t* data, size_t size)
     {
         (void)ctx;
+        if (kind == K_FX) { if (g_frozen) FxReceive(data, size); return; }   // (0.5.872)
         if (g_vmHold) return;   // (v46) reloading in this process: the host's new world waits for our new level
                                  // (taken into the old one, every new thing of his became a puppet: hundreds, out of memory, Mayenne)
         if (kind == K_PS && size >= 20)
@@ -624,10 +688,13 @@ namespace Coop
                 g_hostHealth = h[0]; g_hostMaxHealth = h[1]; g_hostBodyIndex = h[2];
             }
             if (size >= 48) memcpy(&g_hostYaw, data + 44, 4);
+            if (size >= 60) { memcpy(g_hostHint, data + 48, 12); g_hostHintAt = Now(); }   // (0.5.919)
             return;
         }
         if (kind != K_SNAP || size < 16 || !InMission(base)) return;
         const double t = PacketTime();   // the host's time this was sent at
+        { const double gap = g_lastSnapAt >= 0 ? Now() - g_lastSnapAt : 0; static int told = 0; if (gap > 1.5 && told++ < 40) { printf("coop: join: no snapshot from the host for %.1f s (his copy stood still, or the line did): nothing let go\n", gap); fflush(stdout); } }
+        g_lastSnapAt = Now();
         size_t at = 16;
         if (g_firstSnapAt < 0) { g_firstSnapAt = Now(); printf("coop: join: the host's snapshots are coming\n"); fflush(stdout); }
         while (at + 6 <= size)
@@ -642,6 +709,9 @@ namespace Coop
                 continue;
             }
             Remote& r = g_remote[idx];
+            // (0.5.890) a grenade that lands (a missile, type 3, become a thing, type 0) keeps its puppet: a new one
+            // was made for it, and the smoke that followed the old one was left where that one was let go
+            if (r.gen == gen && r.type == 3 && type == 0 && r.local && r.puppet) r.type = type;
             if (r.gen != gen || r.type != type) { if (r.local) Unbind(ctx, base, r); r = Remote{}; r.gen = gen; r.type = type; }
             r.heard = Now();
             if (mask & M_ORIGIN || mask & M_ANGLES)
@@ -765,6 +835,7 @@ namespace Coop
     }
     void JoinReceiveReliable(PPCContext& ctx, uint8_t* base, RelKind kind, const uint8_t* data, size_t size)
     {
+        if (kind == R_INV) { InventoryJoinReceive(data, size); return; }   // (0.5.901)
         if (kind == R_EVENT && size >= 2 && data[0] == E_CALL) { EventsReceive(data, size); return; }
         if (kind == R_EVENT && size >= 7 && data[0] == E_DVAR)
         {
@@ -833,6 +904,311 @@ namespace Coop
         (void)ctx;
     }
 
+    // (0.5.972) a test: COD3_COOP_TESTLIVE=1 (or a pad mask in hex, default 4000: X, Use): when a grenade (a missile,
+    // type 3) has lain still within 90 units of this copy's player for a moment, the buttons are held for 1.2 s, once
+    // per grenade: whether a live grenade can be picked up (either copy; the joining copy's Use goes to the host).
+    // (0.5.983) a probe: COD3_COOP_VIEWSCAN="t1 t2 t3 ...": at t1 the game's image (0x82000000..0x82C30000) is searched
+    // for three floats that are this copy's eye (x, y within 2 units of the player, z 20..80 above his feet): the
+    // client game's view (refdef origin) among them; at each later time those places are read again (a scripted
+    // cutscene's camera shows as a place far from the player). For the joining player's cutscene camera.
+    void TestViewScan(uint8_t* base, uint32_t me)
+    {
+        static std::vector<double> times; static bool parsed = false; static size_t next = 0; static std::vector<uint32_t> found;
+        if (!parsed)
+        {
+            parsed = true;
+            if (const char* t = getenv("COD3_COOP_VIEWSCAN")) { std::string s(t); size_t at = 0; while (at < s.size()) { const size_t sp = s.find(' ', at); times.push_back(atof(s.substr(at, sp == std::string::npos ? std::string::npos : sp - at).c_str())); if (sp == std::string::npos) break; at = sp + 1; } }
+        }
+        if (next >= times.size() || !me || Now() < times[next]) return;
+        const float o[3] = { F(base, me + 336), F(base, me + 340), F(base, me + 344) };
+        if (next == 0)
+        {
+            // (0.5.987) t986e: nothing in the image (0x82000000..): the heaps too (virtual 0x40000000.., physical
+            // 0xA0000000..), 64 KB at a time, what is committed only; the eye 0..90 above the feet
+            const std::pair<uint32_t, uint32_t> ranges[] = { { 0x82000000u, 0x83000000u }, { 0x40000000u, 0x80000000u }, { 0xA0000000u, 0xC0000000u } };
+            // (0.5.989) and how much was searched, and how many places hold my FEET (the entity's own origin must be one:
+            // t988a found nothing at all)
+            uint32_t chunks = 0, feet = 0, firstFeet = 0;
+            for (const auto& [from, to] : ranges)
+                for (uint32_t chunk = from; chunk < to && found.size() < 200; chunk += 0x10000u)
+                {
+                    if (!CoopCommitted(base + chunk, 0x10000)) continue;
+                    chunks++;
+                    for (uint32_t a = chunk; a + 12 <= chunk + 0x10000u && found.size() < 200; a += 4)
+                    {
+                        const float x = F(base, a), y = F(base, a + 4);
+                        if (!(fabsf(x - o[0]) < 2.0f && fabsf(y - o[1]) < 2.0f)) continue;   // NaN fails too (t987a: 64 NaN places)
+                        const float z = F(base, a + 8);
+                        if (z - o[2] > 10.0f && z - o[2] < 90.0f) found.push_back(a);
+                        else if (fabsf(z - o[2]) < 1.0f) { if (!feet) firstFeet = a; feet++; }
+                    }
+                }
+            printf("coop: view scan at %.0f s: me at %.0f %.0f %.0f (entity %08X), %zu places hold my eye; %u committed 64 KB blocks searched, %u places hold my feet (first %08X)\n", Now(), o[0], o[1], o[2], me, found.size(), chunks, feet, firstFeet);
+        }
+        else printf("coop: view scan at %.0f s: me at %.0f %.0f %.0f\n", Now(), o[0], o[1], o[2]);
+        for (const uint32_t a : found)
+        {
+            std::string v; for (int k = -3; k < 12; k++) { char b[24]; snprintf(b, sizeof b, " %.2f", F(base, a + 4 * k)); v += b; }
+            printf("coop: view scan:   %08X:%s\n", a, v.c_str());
+        }
+        fflush(stdout);
+        next++;
+    }
+
+    void TestLive(uint8_t* base, uint32_t me)
+    {
+        static const uint16_t mask = []() -> uint16_t { const char* t = getenv("COD3_COOP_TESTLIVE"); if (!t || !t[0]) return 0; const unsigned long v = strtoul(t, nullptr, 16); return uint16_t(v > 1 ? v : 0x4000); }();
+        if (!mask || !me) return;
+        // (0.5.998) after a pick-up, the throw back: the grenade button held 1 s (the game throws on its release)
+        static double throwAt = -1;
+        if (throwAt > 0 && Now() >= throwAt) { throwAt = -1; Input::HoldButtons(0x0200, 1000); printf("coop: test: the picked-up grenade thrown back (grenade button held 1 s)\n"); fflush(stdout); }
+        struct Seen { float p[3]; double stillSince; bool done; uint32_t gen; };
+        static std::map<uint32_t, Seen> seen;
+        const double now = Now();
+        std::set<uint32_t> alive;
+        std::set<uint32_t> hisNades;
+        if (g_frozen) for (const auto& [hi, r] : g_remote) if (r.local && (r.type == 3 || (r.type == 0 && Name(r.cls) && *Name(r.cls) == "grenade"))) hisNades.insert(r.local);
+        // (0.5.997) every slot (t996a: the joining copy's puppets for the host's grenades lie past 1024: never seen)
+        for (uint32_t i = 1; i < 4096; i++)
+        {
+            const uint32_t e = EntityAt(base, i);
+            if (!e || e == me) continue;
+            // (0.5.994) on the joining copy the host's grenades are puppets (other types): known by their model's name
+            bool isNade = base[e] == 3 || (base[e] == 0 && BrocText(base, e + 564) == "grenade");
+            // (0.5.996) or by the host's own word: what stands here for a missile of his (t995a: his German grenades
+            // were drawn here, the model's name did not find them)
+            if (!isNade && hisNades.count(e)) isNade = true;
+            if (!isNade && g_frozen && ModelSlot(base, e, 0))
+            {
+                std::string m = ResName(base, ModelSlot(base, e, 0));
+                for (char& c : m) c = char(tolower(uint8_t(c)));
+                isNade = m.find("nade_world") != std::string::npos;
+            }
+            if (!isNade) continue;
+            const float p[3] = { F(base, e + 336), F(base, e + 340), F(base, e + 344) };
+            const float dx = p[0] - F(base, me + 336), dy = p[1] - F(base, me + 340), dz = p[2] - F(base, me + 344);
+            {
+                static std::map<uint32_t, uint32_t> told; static int lines = 0;
+                // (0.5.992) told by generation + 1: a first-generation grenade (0) was never told (t990g: none of 37 seen)
+                if (told[i] != GenAt(base, i) + 1 && lines < 60) { told[i] = GenAt(base, i) + 1; lines++; printf("coop: test: a grenade (%u, %s) %.0f from me (height %.0f)\n", i, ResName(base, ModelSlot(base, e, 0)).c_str(), sqrtf(dx * dx + dy * dy), dz); fflush(stdout); }
+            }
+            if (dx * dx + dy * dy > 90.0f * 90.0f || fabsf(dz) > 80.0f) continue;
+            alive.insert(i);
+            auto it = seen.find(i);
+            if (it == seen.end() || it->second.gen != GenAt(base, i)) { seen[i] = { { p[0], p[1], p[2] }, -1, false, GenAt(base, i) }; continue; }
+            Seen& s = it->second;
+            const float mx = p[0] - s.p[0], my = p[1] - s.p[1], mz = p[2] - s.p[2];
+            memcpy(s.p, p, 12);
+            if (mx * mx + my * my + mz * mz > 1.0f) { s.stillSince = -1; continue; }
+            if (s.stillSince < 0) s.stillSince = now;
+            if (!s.done && now - s.stillSince > 0.15)
+            {
+                s.done = true;
+                Input::HoldButtons(mask, 1200);
+                throwAt = now + 1.5;
+                printf("coop: test: grenade %u lies %.0f from me: buttons %04X held 1.2 s\n", i, sqrtf(dx * dx + dy * dy), mask); fflush(stdout);
+            }
+        }
+        for (auto it = seen.begin(); it != seen.end();) { if (alive.count(it->first)) ++it; else it = seen.erase(it); }
+    }
+
+    // (0.5.907) a test: COD3_COOP_TESTGO="170:x,y,z 200:x,y,z,d": at that many seconds of this process this copy's player
+    // is put there (feet), or (four numbers) d units short of the point x,y along his own heading, at height z:
+    // facing it. Hands-off tests of Use prompts and damage triggers (either copy).
+    void TestGo(PPCContext& ctx, uint8_t* base, uint32_t me, uint32_t rec)
+    {
+        const double now = Now();
+            struct Go { double at; float v[6]; int n; bool done; };
+            static std::vector<Go> gos; static bool parsed = false;
+            if (!parsed)
+            {
+                parsed = true;
+                if (const char* t = getenv("COD3_COOP_TESTGO"))
+                {
+                    std::string all(t); size_t at = 0;
+                    while (at < all.size())
+                    {
+                        size_t end = all.find(' ', at); if (end == std::string::npos) end = all.size();
+                        const std::string item = all.substr(at, end - at); at = end + 1;
+                        Go g{}; g.n = sscanf(item.c_str(), "%lf:%f,%f,%f,%f,%f,%f", &g.at, &g.v[0], &g.v[1], &g.v[2], &g.v[3], &g.v[4], &g.v[5]) - 1;
+                        if (g.n >= 3) gos.push_back(g);
+                    }
+                }
+            }
+            // (0.5.954) COD3_COOP_TESTGUN="t:d": at t, d short of the newest gun dropped near the joining player (the
+            // host's item watch writes it to coop-testgun.txt), on the line from here, looking at it (tests of pickups)
+            {
+                static double gunAt = -1, gunD = 40; static bool gunParsed = false, gunDone = false;
+                if (!gunParsed) { gunParsed = true; if (const char* t = getenv("COD3_COOP_TESTGUN")) { double d = 40; if (sscanf(t, "%lf:%lf", &gunAt, &d) >= 1) gunD = d; else gunAt = -1; } }
+                if (gunAt >= 0 && !gunDone && now >= gunAt)
+                {
+                    gunDone = true;
+                    float gx = 0, gy = 0, gz = 0;
+                    FILE* f = fopen("coop-testgun.txt", "r");
+                    if (f && fscanf(f, "%f %f %f", &gx, &gy, &gz) == 3)
+                    {
+                        const float yaw = atan2f(gy - F(base, rec + 4), gx - F(base, rec + 0)) * 57.29578f;
+                        Go g{}; g.at = now; g.n = 6; g.v[0] = gx; g.v[1] = gy; g.v[2] = gz; g.v[3] = float(gunD); g.v[4] = gz; g.v[5] = yaw;
+                        gos.push_back(g);
+                        printf("coop: %s: test: the newest gun near the joining player is at %.0f %.0f %.0f\n", IsHost() ? "host" : "join", gx, gy, gz); fflush(stdout);
+                    }
+                    else { printf("coop: %s: test: no gun written to coop-testgun.txt\n", IsHost() ? "host" : "join"); fflush(stdout); }
+                    if (f) fclose(f);
+                }
+            }
+            for (Go& g : gos)
+            {
+                if (g.done || now < g.at) continue;
+                g.done = true;
+                float p[3] = { g.v[0], g.v[1], g.v[2] };
+                float aim[3] = {}; bool aimed = false;
+                if (g.n >= 5)
+                {
+                    // (0.5.913) five numbers: x,y,z the point to look at, d how far short of it, the last the feet's
+                    // height there: put d units short along my heading, and turned to look straight at the point
+                    // (the game's own setplayerangles, sub_82540168)
+                    // (0.5.932) a sixth number: the heading to stand along (else my own)
+                    const float yaw = (g.n >= 6 ? g.v[5] : F(base, rec + 176)) * 0.0174533f;
+                    p[0] = g.v[0] - g.v[3] * cosf(yaw); p[1] = g.v[1] - g.v[3] * sinf(yaw); p[2] = g.v[4];
+                    const float dx = g.v[0] - p[0], dy = g.v[1] - p[1], dz = g.v[2] - (p[2] + 60.0f);
+                    aim[0] = -atan2f(dz, sqrtf(dx * dx + dy * dy)) * 57.29578f; aim[1] = atan2f(dy, dx) * 57.29578f; aimed = true;
+                }
+                else if (g.n >= 4)
+                {
+                    const float yaw = F(base, rec + 176) * 0.0174533f;
+                    p[0] -= g.v[3] * cosf(yaw); p[1] -= g.v[3] * sinf(yaw);
+                }
+                for (int k = 0; k < 3; k++) { SetF(base, rec + 4 * k, p[k]); SetF(base, rec + 16 + 4 * k, 0.0f); SetF(base, me + 32 + 4 * k, p[k]); SetF(base, me + 336 + 4 * k, p[k]); }
+                if (aimed)
+                {
+                    const uint32_t s = Scratch(base);
+                    for (int k = 0; k < 3; k++) SetF(base, s + 4 * k, aim[k]);
+                    PPCContext c = CallCtx(ctx);
+                    c.r3.u64 = me; c.r4.u64 = s;
+                    CallGuest(c, base, 0x82540168u);
+                }
+                printf("coop: %s: test: put at %.0f %.0f %.0f (yaw %.0f%s, pitch %.0f)\n", IsHost() ? "host" : "join", p[0], p[1], p[2], F(base, rec + 176), aimed ? " set" : "", aim[0]); fflush(stdout);
+            }
+    }
+
+    // (0.5.977) a test: COD3_COOP_TESTAIMMODEL="230-256:helmet_us_objctv": in those seconds my player is turned four times a
+    // second to the nearest thing (within 3000) whose model's name holds the text; one aimed at for 2 s is taken as done
+    // and the next nearest follows (Saint-Lo's training helmets: they move when the step begins, t976a).
+    void TestAimModel(PPCContext& ctx, uint8_t* base, uint32_t me)
+    {
+        (void)ctx;
+        static double from = -1, to = -1; static std::string want; static bool parsed = false;
+        if (!parsed)
+        {
+            parsed = true;
+            if (const char* t = getenv("COD3_COOP_TESTAIMMODEL")) { char w[128] = {}; if (sscanf(t, "%lf-%lf:%127s", &from, &to, w) == 3) want = w; }
+        }
+        const double now = Now();
+        if (want.empty() || now < from || now > to || !me) return;
+        const uint32_t rec = Record(base, me);
+        if (!rec) return;
+        // (0.5.979) STEERED LIKE A PLAYER: the right stick, from the error between the angles wanted and the record's own
+        // view (+172 pitch, +176 yaw), sights down the whole time, a shot only when settled within 0.4 degrees. The game's
+        // setplayerangles (0.5.977) moved the record's angles but not the host's drawn view (t978b: the view never turned).
+        static std::set<uint32_t> done;
+        static uint32_t target = 0; static double targetSince = 0, lastShot = 0; static int settled = 0, shots = 0;
+        const float eye[3] = { F(base, me + 336), F(base, me + 340), F(base, me + 344) + 60.0f };
+        auto isOne = [&](uint32_t e) { return e && !(Guest::Read32(base, e + 632) & 0x400u) && ResName(base, ModelSlot(base, e, 0)).find(want) != std::string::npos; };
+        if (target && (!isOne(target) || now - targetSince > 6.0))
+        {
+            printf("coop: test: done with %08X after %d shots (%s)\n", target, shots, isOne(target) ? "timed out" : "its model changed: hit"); fflush(stdout);
+            done.insert(target); target = 0;
+        }
+        if (!target)
+        {
+            float bestD = 3000.0f;
+            for (uint32_t i = 1; i < 4096; i++)
+            {
+                const uint32_t e = EntityAt(base, i);
+                if (!e || e == me || done.count(e) || !isOne(e)) continue;
+                const float dx = F(base, e + 336) - eye[0], dy = F(base, e + 340) - eye[1], dz = F(base, e + 344) - eye[2];
+                const float d = sqrtf(dx * dx + dy * dy + dz * dz);
+                if (d < bestD) { bestD = d; target = e; }
+            }
+            if (!target) return;
+            targetSince = now; settled = 0; shots = 0;
+            printf("coop: test: aiming at %08X (%s) %.0f away, at %.0f %.0f %.0f\n", target, want.c_str(), bestD, F(base, target + 336), F(base, target + 340), F(base, target + 344)); fflush(stdout);
+        }
+        const float dx = F(base, target + 336) - eye[0], dy = F(base, target + 340) - eye[1], dz = F(base, target + 344) + 4.0f - eye[2];
+        const float wantPitch = -atan2f(dz, sqrtf(dx * dx + dy * dy)) * 57.29578f, wantYaw = atan2f(dy, dx) * 57.29578f;
+        float ey = wantYaw - F(base, rec + 176); while (ey > 180.0f) ey -= 360.0f; while (ey < -180.0f) ey += 360.0f;
+        const float ep = wantPitch - F(base, rec + 172);
+        auto stick = [](float err) { float v = -err / 6.0f; if (fabsf(err) > 0.4f && fabsf(v) < 0.3f) v = v < 0 ? -0.3f : 0.3f; if (fabsf(err) <= 0.4f) v = 0;   /* 0.2 is inside the game's dead zone (t980a) */ return std::clamp(v, -1.0f, 1.0f); };
+        Input::SetLook(stick(ey), stick(ep), 60);   // stick up looks up (pitch falls): t979a went down with the sign flipped
+        Input::PullTriggers(300, 0);
+        settled = (fabsf(ey) < 0.6f && fabsf(ep) < 0.6f) ? settled + 1 : 0;
+        if (settled >= 3 && now - lastShot > 0.6)
+        {
+            Input::PullTriggers(0, 90); lastShot = now; shots++;
+            // (0.5.982) COD3_COOP_TESTHITMODEL=1: each settled shot also hits the target through the game's own G_Damage
+            // (sub_82564888: target, inflictor, attacker, dir, point, damage, flags, means; 2 = MOD_RIFLE_BULLET), my
+            // player the attacker. t981a: 44 settled shots at Saint-Lo's helmets and none fell (the record's angles are
+            // not exactly the drawn view); this lets a hands-off run past the training's one shooting step.
+            static const bool hit = getenv("COD3_COOP_TESTHITMODEL") != nullptr;
+            if (hit)
+            {
+                PPCContext c = CallCtx(ctx);
+                c.r3.u64 = target; c.r4.u64 = me; c.r5.u64 = me; c.r6.u64 = 0; c.r7.u64 = 0; c.r8.u64 = 50; c.r9.u64 = 0; c.r10.u64 = 2;
+                CallGuest(c, base, 0x82564888u);
+                static int toldHit = 0;
+                if (toldHit++ < 30) { printf("coop: test: %08X hit through G_Damage (50, rifle bullet)\n", target); fflush(stdout); }
+            }
+        }
+        static int toldAngles = 0;
+        if (toldAngles++ % 30 == 0 && toldAngles < 900) { printf("coop: test: aim error yaw %.1f pitch %.1f (view %.1f %.1f)\n", ey, ep, F(base, rec + 176), F(base, rec + 172)); fflush(stdout); }
+    }
+
+    // (0.5.923) a test: COD3_COOP_TESTAIM="150-200": in those seconds of this process my player is turned four times a
+    // second to look at the nearest enemy soldier drawn here (an axis soldier of the host's, within 2500 units), at
+    // his chest. Hands-off tests of the joining player's shots on the host's soldiers (with COD3_PAD's trigger).
+    void TestAim(PPCContext& ctx, uint8_t* base, uint32_t me, uint32_t rec)
+    {
+        static double from = -1, to = -1; static bool parsed = false;
+        if (!parsed) { parsed = true; if (const char* t = getenv("COD3_COOP_TESTAIM")) sscanf(t, "%lf-%lf", &from, &to); }
+        const double now = Now();
+        if (from < 0 || now < from || now > to) return;
+        static double at = 0;
+        if (now - at < 0.25) return;
+        at = now;
+        const float eye[3] = { F(base, me + 336), F(base, me + 340), F(base, me + 344) + 60.0f };
+        uint32_t best = 0; float bestD = 6000.0f; uint16_t bestIdx = 0;
+        for (const auto& [idx, r] : g_remote)
+        {
+            if (!r.local || r.type != 11) continue;
+            const std::string* cls = r.cls ? Name(r.cls) : nullptr;
+            if (!cls || cls->find("axis") == std::string::npos) continue;
+            if (Guest::Read32(base, r.local + 632) & 0x400u) continue;
+            const float dx = F(base, r.local + 336) - eye[0], dy = F(base, r.local + 340) - eye[1];
+            const float d = sqrtf(dx * dx + dy * dy);
+            if (d < bestD) { bestD = d; best = r.local; bestIdx = idx; }
+        }
+        if (!best)
+        {
+            static int toldNone = 0;
+            if (toldNone++ < 3)
+            {
+                std::string w; int n = 0;
+                for (const auto& [idx, r] : g_remote) { if (r.type != 11 || n++ >= 12) continue; const std::string* c = r.cls ? Name(r.cls) : nullptr; char b[160]; snprintf(b, sizeof b, " %u(%s, local %08X%s)", idx, c ? c->c_str() : "?", r.local, r.local && (Guest::Read32(base, r.local + 632) & 0x400u) ? " hidden" : ""); w += b; }
+                printf("coop: join: test: no enemy to aim at; the host's soldiers heard (%d):%s\n", n, w.c_str()); fflush(stdout);
+            }
+            return;
+        }
+        const float dx = F(base, best + 336) - eye[0], dy = F(base, best + 340) - eye[1], dz = F(base, best + 344) + 45.0f - eye[2];
+        const uint32_t s = Scratch(base);
+        SetF(base, s, -atan2f(dz, sqrtf(dx * dx + dy * dy)) * 57.29578f); SetF(base, s + 4, atan2f(dy, dx) * 57.29578f); SetF(base, s + 8, 0.0f);
+        PPCContext c = CallCtx(ctx);
+        c.r3.u64 = me; c.r4.u64 = s;
+        CallGuest(c, base, 0x82540168u);
+        static uint16_t toldFor = 0xFFFF; static int told = 0;
+        if (bestIdx != toldFor && told++ < 40) { toldFor = bestIdx; printf("coop: join: test: aiming at the host's soldier %u, %.0f away\n", bestIdx, bestD); fflush(stdout); }
+        (void)rec;
+    }
+
     void JoinFrame(PPCContext& ctx, uint8_t* base)
     {
         g_joinFrames = g_joinFrames + 1;
@@ -861,6 +1237,7 @@ namespace Coop
         const uint32_t rec = Record(base, me);
         if (!me || !rec) { g_inSince = -1; return; }
         if (g_inSince < 0) { g_inSince = now; printf("coop: join: in the mission %s\n", MyMap().c_str()); fflush(stdout); }
+        if (g_frozen) { TestGo(ctx, base, me, rec); TestAim(ctx, base, me, rec); TestLive(base, me); TestAimModel(ctx, base, me); TestViewScan(base, me); }
         // my command, view and place, each frame
         {
             struct { uint32_t seq; uint8_t cmd[48]; float view[3]; float origin[3]; float velocity[3]; uint32_t stance; uint32_t flags; char map[32]; } m{};
@@ -868,7 +1245,20 @@ namespace Coop
             memcpy(m.cmd, base + CommandSlot(base), 48);
             for (int k = 0; k < 3; k++) { m.view[k] = F(base, rec + 172 + 4 * k); m.origin[k] = F(base, rec + 4 * k); m.velocity[k] = F(base, rec + 16 + 4 * k); }
             m.stance = Guest::Read32(base, rec + 208);
-            m.flags = 1 | (g_frozen ? 2 : 0);
+            // (0.5.869) bits 8..15 my view height (60 standing, 40 crouched, 11 prone), 0x10000: it is there
+            m.flags = 1 | (g_frozen ? 2 : 0) | 0x10000u | (uint32_t(std::clamp(int32_t(Guest::Read32(base, rec + 184)), 0, 255)) << 8);
+            { const uint32_t w = Guest::Read32(base, rec + 132); if (w >= 1 && w <= 160) m.flags |= w << 24; }   // (0.5.896) the gun I carry: its number in the weapon list
+            // (0.5.875) 0x20000: my Use is held (pad X; the keyboard's Use and Reload are X too): the revive
+            if (Input::Buttons() & 0x4000) m.flags |= 0x20000u;
+            // (0.5.882) what I do, from my own record's buttons: 0x40000 firing, 0x80000 the grenade button, 0x100000 aiming
+            // (0.5.884) from my record: firing (state 3 with the trigger), the throw (button 2 or states 12..16), aiming,
+            // reloading (5..9), the melee (10, 11)
+            { const uint32_t b = Guest::Read32(base, rec + 1352), ws = Guest::Read32(base, rec + 136); if (ws == 3 && (b & 1)) m.flags |= 0x40000u; if ((b & ThrowButtons) || ws == 15) m.flags |= 0x80000u; if (b & 8) m.flags |= 0x100000u; if ((ws >= 5 && ws <= 9) || ws == 14) m.flags |= 0x200000u;   /* (0.5.894) 14 is the reload's start, not a throw */ static uint32_t before = 0; if (MeleeState(ws, before)) m.flags |= 0x400000u; }
+            {
+                static int32_t wasH = -1; static uint32_t wasF = 0; static int told = 0;
+                const int32_t hh = int32_t(Guest::Read32(base, rec + 184));
+                if ((abs(hh - wasH) > 8 || ((m.stance ^ wasF) & 0x20)) && told < 60) { told++; printf("coop: join: my stance: view height %d, flags %08X\n", hh, m.stance); fflush(stdout); wasH = hh; wasF = m.stance; }
+            }
             strncpy(m.map, MyMap().c_str(), 31);
             SendUnreliable(K_CMD, &m, sizeof m);
         }
@@ -901,6 +1291,7 @@ namespace Coop
             PPCContext c = CallCtx(ctx); c.r3.u64 = me; CallGuest(c, base, 0x82540D78);   // G_EntUnlink
             printf("coop: join: my player was linked to our stopped world: freed\n"); fflush(stdout);
         }
+        if (g_frozen && rec) InventoryJoinFrame(base, rec);   // (0.5.901) my weapons and rounds are the host's word
         // (v45u) where I last stood on firm ground (still for a second, not falling): fallen out of the world
         // from there (300 below it), I am put back
         if (g_frozen && rec)
@@ -950,19 +1341,134 @@ namespace Coop
                 fflush(stdout);
             }
         }
-        // (v45j) riding beside the host (his player carried by the scripts: Falaise's jeep), mine passes
-        // through things (the record's +1452, the game's own noclip): set down each frame beside him inside
-        // the vehicle's own model, his movement was pushed out of it again and again and the frame never ended
+        // (0.5.961) the host's travel: speed and heading from his place's changes (one per host message), smoothed
+        static float rideVel[2] = {}; static float travel = 0; static bool haveTravel = false; static double fastSince = -1, slowSince = -1, stillSince = -1; static float stopPos[3] = {}; static bool stopped = false;
+        {
+            static float lastPos[3] = {}; static double lastAt = -1;
+            if (g_havePs && g_psAt != lastAt)
+            {
+                if (lastAt > 0 && g_psAt - lastAt > 0.001 && g_psAt - lastAt < 0.5)
+                {
+                    const float dt = float(g_psAt - lastAt);
+                    const float vx = (g_hostPos[0] - lastPos[0]) / dt, vy = (g_hostPos[1] - lastPos[1]) / dt;
+                    const float raw = sqrtf(vx * vx + vy * vy);
+                    if (raw > 3000.0f) { rideVel[0] = rideVel[1] = 0; fastSince = -1; }   // a jump (a checkpoint, a comeback): no travel
+                    else
+                    {
+                        rideVel[0] = 0.6f * rideVel[0] + 0.4f * vx; rideVel[1] = 0.6f * rideVel[1] + 0.4f * vy;
+                        // (0.5.990) fast = the smoothed speed too, not one reading: the readings' times are when the host's
+                        // messages ARRIVED, and two that come close together make a sprinting host (~285) or a stumble
+                        // read over 300 once. One such reading used to start a ride that held until he stood still.
+                        const float smooth = sqrtf(rideVel[0] * rideVel[0] + rideVel[1] * rideVel[1]);
+                        if (raw > 300.0f && smooth > 300.0f) { if (fastSince < 0) fastSince = now; slowSince = -1; stopped = false; stillSince = -1; }
+                        else
+                        {
+                            // not fast for the whole first second: no ride (a ride under way is ended by the stop below)
+                            if (fastSince >= 0 && now - fastSince <= 1.0) fastSince = -1;
+                            if (slowSince < 0) slowSince = now;
+                            // the stop's place: where he was when he last rolled, fixed once still for 0.5 s
+                            if (!stopped) { if (raw > 30.0f) { memcpy(stopPos, g_hostPos, 12); stillSince = -1; } else { if (stillSince < 0) stillSince = now; if (now - stillSince > 0.5) stopped = true; } }
+                        }
+                        if (rideVel[0] * rideVel[0] + rideVel[1] * rideVel[1] > 40.0f * 40.0f)
+                        {
+                            const float want = atan2f(rideVel[1], rideVel[0]);
+                            if (!haveTravel) { travel = want; haveTravel = true; }
+                            float d = want - travel; while (d > 3.14159f) d -= 6.28318f; while (d < -3.14159f) d += 6.28318f;
+                            travel += 0.2f * d;
+                        }
+                    }
+                }
+                else { rideVel[0] = rideVel[1] = 0; }
+                memcpy(lastPos, g_hostPos, 12); lastAt = g_psAt;
+            }
+        }
+        if (g_catchUpHost && g_frozen && g_havePs && now - g_psAt < 1.0)
+        {
+            g_catchUpHost = false;
+            const float o[3] = { g_hostPos[0], g_hostPos[1], g_hostPos[2] + 2.0f };
+            for (int k = 0; k < 3; k++) { SetF(base, rec + 4 * k, o[k]); SetF(base, rec + 16 + 4 * k, 0.0f); SetF(base, me + 336 + 4 * k, o[k]); SetF(base, me + 32 + 4 * k, o[k]); }
+            LinkEntity(ctx, base, me);
+            printf("coop: join: I rode one of our vehicles at the freeze: put where the host stands (%.0f %.0f %.0f)\n", o[0], o[1], o[2]); fflush(stdout);
+        }
+        // riding: the host carried by the scripts (a truck ride), or (0.5.961) moving at a vehicle's speed (over 300 a
+        // second, faster than any run) for a second: t961a, Falaise's jeep with the host on its gun, the joining player
+        // was left at the start
+        const bool hostCarried = (g_hostFlags & 2) && g_havePs && now - g_psAt < 1.0;
+        // (0.5.963) a driven ride ends only when the host has stepped 64 away from where the vehicle stopped (off its gun,
+        // out of it): before, it ended 2 s after the stop, with him (and so the joining player) still in the vehicle
+        if (fastSince >= 0 && stopped)
+        {
+            const float sx = g_hostPos[0] - stopPos[0], sy = g_hostPos[1] - stopPos[1];
+            if (sx * sx + sy * sy > 64.0f * 64.0f) { fastSince = -1; slowSince = -1; stopped = false; stillSince = -1; }
+        }
+        const bool hostDriven = fastSince >= 0 && now - fastSince > 1.0 && g_havePs && now - g_psAt < 1.0;
+        const bool rideNow = hostCarried || hostDriven;
+        // (v45j) riding beside the host, mine passes through things (the record's +1452, the game's own noclip): set
+        // down each frame beside him inside the vehicle's own model, his movement was pushed out of it again and again
         {
             static bool ours = false;
-            const bool riding = (g_hostFlags & 2) && g_havePs && now - g_psAt < 1.0;
-            if (riding && !ours) { ours = true; Guest::Write32(base, rec + 1452, 1); printf("coop: join: riding beside the host: through things\n"); fflush(stdout); }
-            else if (!riding && ours) { ours = false; Guest::Write32(base, rec + 1452, 0); }
+            if (rideNow && !ours) { ours = true; Guest::Write32(base, rec + 1452, 1); printf("coop: join: riding beside the host (%s): through things\n", hostCarried ? "carried by the scripts" : "at a vehicle's speed"); fflush(stdout); }
+            else if (!rideNow && ours)
+            {
+                // (0.5.963) off the ride on the HOST's own spot (the user: at the vehicle's stop "the joiner is stuck in
+                // the vehicle"): set down beside him inside the vehicle's model, he was left in it with his collision back.
+                // The host stands where the scripts put him off it; the two players do not block each other.
+                ours = false;
+                if (g_havePs && now - g_psAt < 1.0)
+                {
+                    const float o[3] = { g_hostPos[0], g_hostPos[1], g_hostPos[2] + 2.0f };
+                    for (int k = 0; k < 3; k++) { SetF(base, rec + 4 * k, o[k]); SetF(base, rec + 16 + 4 * k, 0.0f); SetF(base, me + 336 + 4 * k, o[k]); SetF(base, me + 32 + 4 * k, o[k]); }
+                    LinkEntity(ctx, base, me);
+                    printf("coop: join: off the ride: put where the host stands (%.0f %.0f %.0f)\n", o[0], o[1], o[2]); fflush(stdout);
+                }
+                Guest::Write32(base, rec + 1452, 0);
+            }
         }
-        if ((g_hostFlags & 2) && g_havePs && now - g_psAt < 1.0)
+        // (0.5.971) after a scripted passage of the host's (Saint-Lo's wall hop and the struggle behind it, t959u): the
+        // scripts carried HIM over the wall and the joining player stayed behind it, with no way across (the hop is a
+        // scripted action, only the host's machine's own player can play it). When the host's scene ends (K_PS flag 1
+        // down for a second) having moved him 150 or more, and I am 80 or more from him, I am put beside him.
+        // (0.5.991: was 350. t990a/d/e: put on the host's spot MID-hop (on the wall), the joining player dropped back
+        // on the field side, 171 from him with the wall between: never caught up. The user saw him stuck there.)
         {
-            const float yaw = g_hostYaw * 0.0174533f;
-            const float o[3] = { g_hostPos[0] + 36.0f * sinf(yaw), g_hostPos[1] - 36.0f * cosf(yaw), g_hostPos[2] };
+            static bool inScene = false; static float sceneFrom[3] = {}; static double offSince = -1;
+            const bool fresh = g_havePs && now - g_psAt < 1.0;
+            const bool sceneNow = fresh && (g_hostFlags & 1);
+            if (sceneNow) { if (!inScene) { inScene = true; memcpy(sceneFrom, g_hostPos, 12); } offSince = -1; }
+            else if (inScene && fresh)
+            {
+                if (offSince < 0) offSince = now;
+                else if (now - offSince > 1.0)
+                {
+                    inScene = false; offSince = -1;
+                    const float mx = g_hostPos[0] - sceneFrom[0], my = g_hostPos[1] - sceneFrom[1], mz = g_hostPos[2] - sceneFrom[2];
+                    const float jx = F(base, me + 336) - g_hostPos[0], jy = F(base, me + 340) - g_hostPos[1], jz = F(base, me + 344) - g_hostPos[2];
+                    const float moved = sqrtf(mx * mx + my * my + mz * mz), apart = sqrtf(jx * jx + jy * jy + jz * jz);
+                    static int told = 0;
+                    if (told++ < 40) { printf("coop: join: the host's scene ended: it moved him %.0f, I am %.0f from him\n", moved, apart); fflush(stdout); }
+                    if (g_frozen && !rideNow && moved >= 150.0f && apart >= 80.0f && Guest::Read32(base, rec + 1452) == 0)
+                    {
+                        // on his own spot, as off a ride (0.5.963): beside it could be inside the wall just crossed; the two
+                        // players do not block each other
+                        const float o[3] = { g_hostPos[0], g_hostPos[1], g_hostPos[2] + 2.0f };
+                        for (int k = 0; k < 3; k++) { SetF(base, rec + 4 * k, o[k]); SetF(base, rec + 16 + 4 * k, 0.0f); SetF(base, me + 336 + 4 * k, o[k]); SetF(base, me + 32 + 4 * k, o[k]); }
+                        LinkEntity(ctx, base, me);
+                        printf("coop: join: left behind by the host's scripted passage: put beside him (%.0f %.0f %.0f)\n", o[0], o[1], o[2]); fflush(stdout);
+                    }
+                }
+            }
+        }
+        if (rideNow)
+        {
+            // (0.5.961) a SEAT, not an orbit. The user (t959u): in the truck the joining player "is bouncing around and
+            // hasn't taken a proper seat". The side was taken from the host's VIEW yaw (every look round swung him about
+            // the host) and the host's place came in steps. Now: the side of the way the host TRAVELS (smoothed; kept
+            // while stopped), and the host's place carried on between his words by his speed (0.15 s at most).
+            const float ahead = float(std::min(0.15, now - g_psAt));
+            const float hx = g_hostPos[0] + rideVel[0] * ahead, hy = g_hostPos[1] + rideVel[1] * ahead;
+            const float yaw = haveTravel ? travel : g_hostYaw * 0.0174533f;
+            // right of the way of travel: (sin, -cos) of the heading, as before
+            const float o[3] = { hx + 36.0f * sinf(yaw), hy - 36.0f * cosf(yaw), g_hostPos[2] };
             for (int k = 0; k < 3; k++) { SetF(base, rec + 4 * k, o[k]); SetF(base, rec + 16 + 4 * k, 0.0f); SetF(base, me + 336 + 4 * k, o[k]); SetF(base, me + 32 + 4 * k, o[k]); }
             LinkEntity(ctx, base, me);
             static bool told = false;
@@ -1023,7 +1529,7 @@ namespace Coop
                 const uint32_t e = EntityAt(base, i);
                 if (!e || e == me || g_puppets.count(e)) continue;
                 if ((base[e] == 3 || base[e] == 10) && (Guest::Read32(base, e + 632) & 0x400u)) continue;
-                if (base[e] == 3 || (soldiers && (base[e] == 11 || base[e] == 10))) Remove(ctx, base, i);
+                if (base[e] == 3 || (soldiers && (base[e] == 11 || (base[e] == 10 && !KeptGun(base, e))))) Remove(ctx, base, i);
                 // (v43m) our own items (weapons, pickups) are left to the game, only hidden: deleted, their own
                 // think went on linking them as they were freed and the world's links broke (v43l)
                 else if (base[e] == 2 && !(Guest::Read32(base, e + 632) & 0x400u)) Guest::Write32(base, e + 632, Guest::Read32(base, e + 632) | 0x400u);
@@ -1035,7 +1541,12 @@ namespace Coop
         for (auto it = g_remote.begin(); it != g_remote.end();)
         {
             Remote& r = it->second;
-            if (now - r.heard > 3.0) { Unbind(ctx, base, r); it = g_remote.erase(it); continue; }
+            // (0.5.893) THE OTHER PLAYER GONE AND BACK (the user: he "goes invisible and then pops back"). A thing not
+            // heard of for 3 s was let go, by the clock: when the host's copy stood still for 3 s (tests t891a and
+            // t892b: his copy at 0 to 1 frames a second for a minute beside the played one) EVERYTHING was let go,
+            // the host's body with it, and made again when he came back. A thing is let go when the snapshots that
+            // DID come have not named it for 3 s; with no snapshots at all the world stays as it was.
+            if (g_lastSnapAt - r.heard > 3.0) { Unbind(ctx, base, r); it = g_remote.erase(it); continue; }
             if (r.local && (EntityAt(base, uint32_t(r.localIndex)) != r.local || GenAt(base, uint32_t(r.localIndex)) != r.localGen || base[r.local] == 0)) { if (r.puppet) g_puppets.erase(r.local); r.local = 0; r.localIndex = -1; r.shownModels.clear(); r.shownAttach.clear(); }
             if (!r.local && !Bind(ctx, base, it->first, r)) { ++it; continue; }
             if (!r.puppet) adopted.insert(r.local);
@@ -1064,13 +1575,93 @@ namespace Coop
                     }
                 }
             }
-            if (int32_t(it->first) == g_hostBodyIndex) DriveHostBody(ctx, base, r);
+            // (0.5.970) THE HOST'S CHANGE OF BODY WITHOUT A FLICKER. The user: seen from the joining player the host's body
+            // does "that flicker and tpose animation really fast". A change of gun gives the host another body (231 / 233);
+            // t969a (0.5.969's probe, 12 changes): the new one was DRAWN here with nothing on it (pose weight 0.00, a
+            // T-pose) on its first frame in 3 of them, and the old one was hidden by the host in the same snapshot (the
+            // host gone meanwhile). Now the new body is held hidden till its pose weighs, from the moment the snapshot
+            // puts it here, and the old one stays drawn (in its last pose) till then, a second at most.
+            {
+                static int32_t was = -1, before = -1; static double changedAt = -1; static bool newPosed = true; static int told = 0;
+                if (g_hostBodyIndex != was) { before = was; was = g_hostBodyIndex; changedAt = Now(); newPosed = false; }
+                if (r.local && (int32_t(it->first) == was || int32_t(it->first) == before))
+                {
+                    const uint32_t tr = Guest::Read32(base, r.local + 552);
+                    float sum = 0;
+                    if (Valid(tr)) { const uint32_t lst = Guest::Read32(base, tr + 8); const uint32_t cnt = Valid(lst) ? std::min<uint32_t>(Guest::Read32(base, lst + 4), 4096) : 0, ent = Valid(lst) ? Guest::Read32(base, lst + 8) : 0; for (uint32_t k = 0; k < cnt; k++) { const uint16_t sl = Guest::Read16(base, tr + 24 + 2 * k); if (sl && !Guest::Read16(base, ent + 28 * k + 4)) sum += F(base, InfoPool + 52u * sl + 36); } }
+                    const uint32_t f = Guest::Read32(base, r.local + 632);
+                    if (int32_t(it->first) == was)
+                    {
+                        if (sum >= 0.5f) newPosed = true;
+                        else if (!(f & 0x400u)) { Guest::Write32(base, r.local + 632, f | 0x400u); if (told < 30) { told++; printf("coop: join: the host's new body %u held hidden: no pose on it yet (+%.3f s)\n", unsigned(it->first), Now() - changedAt); fflush(stdout); } }
+                    }
+                    else if (!newPosed && Now() - changedAt < 1.0 && sum >= 0.5f && (f & 0x400u))
+                    {
+                        Guest::Write32(base, r.local + 632, f & ~0x400u);
+                        if (told < 30) { told++; printf("coop: join: the host's old body %u kept drawn till the new one has a pose (+%.3f s)\n", unsigned(it->first), Now() - changedAt); fflush(stdout); }
+                    }
+                }
+            }
+            if (int32_t(it->first) == g_hostBodyIndex)
+            {
+                DriveHostBody(ctx, base, r);
+                // (0.5.936) a body of the host's is not drawn till an animation of his plays on it: a new one (a change
+                // of gun makes one, t935b: "move -1, animation -1") stood a frame or more in its bind pose, arms out
+                if (r.local)
+                {
+                    const uint32_t tr = Guest::Read32(base, r.local + 552);
+                    bool bare = !Valid(tr) || g_lb.anim < 0 || !Guest::Read16(base, tr + 24 + 2 * uint32_t(g_lb.anim));
+                    // (0.5.970) and nothing weighing on it yet (an animation set but at 0: its first frame, a T-pose)
+                    if (!bare)
+                    {
+                        const uint32_t lst = Guest::Read32(base, tr + 8); const uint32_t cnt = Valid(lst) ? std::min<uint32_t>(Guest::Read32(base, lst + 4), 4096) : 0, ent = Valid(lst) ? Guest::Read32(base, lst + 8) : 0;
+                        float sum = 0; for (uint32_t k = 0; k < cnt; k++) { const uint16_t sl = Guest::Read16(base, tr + 24 + 2 * k); if (sl && !Guest::Read16(base, ent + 28 * k + 4)) sum += F(base, InfoPool + 52u * sl + 36); }
+                        if (sum < 0.5f) bare = true;
+                    }
+                    const bool hostHides = (r.flags & 0x400u) || (r.extra & 2);
+                    const uint32_t f = Guest::Read32(base, r.local + 632);
+                    const uint32_t want = (bare || hostHides) ? (f | 0x400u) : (f & ~0x400u);
+                    if (want != f) { Guest::Write32(base, r.local + 632, want); static int told = 0; if (told++ < 20) { printf("coop: join: the host's body %s\n", bare ? "held hidden: no animation of his on it yet" : "drawn: his animation plays"); fflush(stdout); } }
+                }
+                if (r.local)
+                {
+                    // (0.5.895) the host's aim up and down: his pitch comes in his body's first angle
+                    const uint32_t tree = Guest::Read32(base, r.local + 552);
+                    float share = 0.0f;
+                    const int32_t tiltAnim = r.track.empty() ? -1 : BodyTilt(ctx, base, tree, g_lb.move, r.track.back().a[0], share);
+                    TidyBodyTree(base, tree, g_lb.anim, tiltAnim, share);
+                    // (0.5.968) A PROBE: the user sees the host's body "flicker and tpose really fast" now and then. A frame
+                    // whose playing animations do not add up to a whole pose (a T-pose share) is logged with what played.
+                    if (Valid(tree))
+                    {
+                        const uint32_t lst = Guest::Read32(base, tree + 8);
+                        const uint32_t cnt = Valid(lst) ? std::min<uint32_t>(Guest::Read32(base, lst + 4), 4096) : 0, ent = Valid(lst) ? Guest::Read32(base, lst + 8) : 0;
+                        float sum = 0; int leaves = 0; std::string what;
+                        for (uint32_t k = 0; k < cnt; k++)
+                        {
+                            const uint16_t sl = Guest::Read16(base, tree + 24 + 2 * k); if (!sl) continue;
+                            if (Guest::Read16(base, ent + 28 * k + 4) != 0) continue;   // a parent node
+                            const float w = F(base, InfoPool + 52u * sl + 36);
+                            if (w > 0.001f) { sum += w; leaves++; if (what.size() < 120) { char b[40]; snprintf(b, sizeof b, " %u:%.2f", k, w); what += b; } }
+                        }
+                        static int bad = 0, told = 0; static double windowAt = -1;
+                        const bool hidden = (Guest::Read32(base, r.local + 632) & 0x400u) != 0;
+                        if (!hidden && sum < 0.9f)
+                        {
+                            bad++;
+                            if (told < 60) { told++; printf("coop: join: THE HOST'S BODY SHORT OF A POSE: %.2f (%d playing:%s), move %d anim %d tilt %d share %.2f\n", sum, leaves, what.c_str(), g_lb.move, g_lb.anim, tiltAnim, share); fflush(stdout); }
+                        }
+                        if (Now() - windowAt > 30.0) { if (windowAt >= 0 && bad) { printf("coop: join: the host's body short of a pose in %d frames in 30 s\n", bad); fflush(stdout); } bad = 0; windowAt = Now(); }
+                    }
+                }
+            }   // (0.5.890: the blend, after a change of move too)
             else if (r.haveAnim && r.list) SetAnims(ctx, base, r);
             if (!r.local) { ++it; continue; }   // (let go for a fresh puppet)
             if (r.havePlace && !r.track.empty())
             {
                 float o[3], a[3];
                 Place(r, show, o, a);
+                if (int32_t(it->first) == g_hostBodyIndex) a[0] = 0.0f;   // (0.5.895: his pitch, not the body's: it stands upright)
                 // (v43l) never linked: an entity the game is freeing (its +16 0x100000), one gone, or a place
                 // that is not a number or off the world (the world's area tree walked for ever: v43k, after a restart)
                 bool sane = base[r.local] != 0 && !(Guest::Read32(base, r.local + 16) & 0x100000u);
@@ -1156,6 +1747,58 @@ namespace Coop
             fflush(stdout);
         }
     }
+}
+
+// (0.5.919) THE JOINING PLAYER'S PROMPTS. sub_82553BB0 (the player's hints: "Press and hold to pick up the M1 Garand")
+// finds what this copy's player looks at in THIS copy's world, which is frozen: a prompt here could be for a thing
+// the host's world no longer has (the Garand already taken) or miss a new one. Once frozen, the prompt shown is the
+// one the host's world has for him (his record +1156, +1160, +1164 there, sent with K_PS), as long as it is fresh.
+// COD3_COOP_HOSTHINTS=0: as before.
+extern "C" PPC_FUNC(__imp__sub_82553BB0);
+PPC_FUNC(sub_82553BB0)
+{
+    using namespace Coop;
+    const uint32_t e = ctx.r3.u32;
+    __imp__sub_82553BB0(ctx, base);
+    static const bool off = []() { const char* t = getenv("COD3_COOP_HOSTHINTS"); return t && t[0] == '0'; }();
+    if (off || !IsJoin() || !g_frozen || !e || e != Me(base) || g_hostHintAt < 0 || Now() - g_hostHintAt > 1.0) return;
+    const uint32_t rec = Record(base, e);
+    if (!rec) return;
+    static uint32_t was[3] = { 1, 1, 1 }; static int told = 0;
+    for (int k = 0; k < 3; k++) Guest::Write32(base, rec + 1156 + 4 * k, g_hostHint[k]);
+    if (memcmp(was, g_hostHint, sizeof was) != 0 && told < 60) { told++; memcpy(was, g_hostHint, sizeof was); printf("coop: join: my prompt from the host's world: %08X %08X %08X\n", g_hostHint[0], g_hostHint[1], g_hostHint[2]); fflush(stdout); }
+}
+
+// (0.5.953) THE NAME OF A GUN ON THE GROUND IN HIS PROMPT. The user (t952u): "swap for null". sub_824ED5A8 builds
+// the prompt from the hint (+1156): 12..139 = a gun on the ground, weapon h - 11, "swap <held> for <name>" with the
+// name from the client's weapon info 0x82A9A460 + 196 * w, +140, filled when the client registers that weapon
+// (sub_82448C78, which the same builder calls itself for 140..267, ammunition). This copy's world froze before it ever
+// saw (say) a Gewehr 43, so its entry was empty. A gun the host's hint names is registered here first, once.
+extern "C" PPC_FUNC(__imp__sub_824ED5A8);
+PPC_FUNC(sub_824ED5A8)
+{
+    using namespace Coop;
+    if (IsJoin() && g_frozen && g_hostHintAt >= 0 && Now() - g_hostHintAt <= 1.0)
+    {
+        const uint32_t h = g_hostHint[0];
+        if (h >= 12 && h <= 139)
+        {
+            const uint32_t w = h - 11;
+            static bool tried[160] = {};
+            const uint32_t list = Guest::Read32(base, 0x82A2A2E0u);   // this copy's weapon definitions: w must be one
+            if (w < 160 && !tried[w] && Valid(list) && Valid(Guest::Read32(base, list + 4 * w)) && Guest::Read32(base, 0x82A9A460u + 196 * w + 140) == 0)
+            {
+                tried[w] = true;
+                const uint32_t saved = ctx.r3.u32;
+                PPCContext c = CallCtx(ctx); c.r3.u64 = w;
+                CallGuest(c, base, 0x82448C78u);
+                printf("coop: join: weapon %u named in the host's prompt was not known here: registered (its name now %s)\n", w, Valid(Guest::Read32(base, 0x82A9A460u + 196 * w + 140)) ? "there" : "still missing");
+                fflush(stdout);
+                ctx.r3.u64 = saved;
+            }
+        }
+    }
+    __imp__sub_824ED5A8(ctx, base);
 }
 
 // the script VM's frame (r3 the VM, 0x82A90128). On the joining copy, once frozen, nothing of its own

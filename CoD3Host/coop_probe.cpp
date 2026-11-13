@@ -572,12 +572,24 @@ PPC_FUNC(sub_82535788) { SoundLog("5788", ctx, base); __imp__sub_82535788(ctx, b
 PPC_FUNC(sub_82535568) { SoundLog("5568", ctx, base); __imp__sub_82535568(ctx, base); }
 PPC_FUNC(sub_82535460) { SoundLog("5460", ctx, base); __imp__sub_82535460(ctx, base); }
 
+// (0.5.881) the effects made by handle: the list of waiting ones, about to be played
+extern "C" PPC_FUNC(__imp__sub_820FBD00);
+namespace Coop { void FxQueueForward(PPCContext& ctx, uint8_t* base); }
+PPC_FUNC(sub_820FBD00)
+{
+    Coop::FxQueueForward(ctx, base);
+    __imp__sub_820FBD00(ctx, base);
+}
+
 // 8. the effects (FX_PlayFX, sub_82423F08: r3 an id or -1, r4 the effect, r5.. where)
 extern "C" PPC_FUNC(__imp__sub_82423F08);
+namespace Coop { void FxForward(PPCContext& ctx, uint8_t* base); }
 PPC_FUNC(sub_82423F08)
 {
+    Coop::FxForward(ctx, base);   // (0.5.872: the host's effects, for the joining copy)
     static int told = 0;
-    if (On() && told < 300)
+    static const bool fxLog = getenv("COD3_COOP_FXLOG") != nullptr;   // (0.5.870: the fx calls alone)
+    if ((On() || fxLog) && told < 400)
     {
         told++;
         const uint32_t e = ctx.r4.u32;
@@ -592,6 +604,28 @@ PPC_FUNC(sub_82423F08)
         }
         auto vec = [&](uint32_t a) { char t[64]; if (Valid(a) || (a >= 0x82000000u && a < 0x83000000u)) snprintf(t, sizeof t, "(%.0f %.0f %.0f)", F(base, a), F(base, a + 4), F(base, a + 8)); else snprintf(t, sizeof t, "%08X", a); return std::string(t); };
         printf("p40: fx from %08X: r3 %08X r5 %s r6 %s r7 %s r8 %08X r9 %08X f1 %g%s\n", uint32_t(ctx.lr), ctx.r3.u32, vec(ctx.r5.u32).c_str(), vec(ctx.r6.u32).c_str(), vec(ctx.r7.u32).c_str(), ctx.r8.u32, ctx.r9.u32, ctx.f1.f64, fx.c_str());
+        // (0.5.871) each effect record once: its first 48 words, any text its words point at, and where (r5 + 48)
+        static std::set<uint32_t> seen;
+        if (fxLog && (Valid(e) || (e >= 0x82000000u && e < 0x83000000u)) && seen.size() < 40 && seen.insert(e).second)
+        {
+            std::string w, t;
+            for (int k = 0; k < 48; k++)
+            {
+                const uint32_t v = Guest::Read32(base, e + 4 * k);
+                char b[12]; snprintf(b, sizeof b, " %08X", v); w += b;
+                if ((Valid(v) || (v >= 0x82000000u && v < 0x83000000u)) && !(v & 1))
+                {
+                    const std::string s = Text(base, v, 40);
+                    bool ok = s.size() >= 4; for (char c : s) if (c < 32 || c > 126) ok = false;
+                    if (ok) { char h[64]; snprintf(h, sizeof h, " +%d'%s'", 4 * k, s.c_str()); t += h; }
+                }
+            }
+            // (words before the record: a resource header may hold its name)
+            std::string pre;
+            for (int k = -12; k < 0; k++) { char b[12]; snprintf(b, sizeof b, " %08X", Guest::Read32(base, e + 4 * k)); pre += b; }
+            printf("p40: fxdef %08X:%s\np40: fxdef %08X texts:%s | before:%s\n", e, w.c_str(), e, t.c_str(), pre.c_str());
+        }
+        if (fxLog && Valid(ctx.r5.u32)) printf("p40: fx place %.0f %.0f %.0f\n", F(base, ctx.r5.u32 + 48), F(base, ctx.r5.u32 + 52), F(base, ctx.r5.u32 + 56));
         fflush(stdout);
     }
     __imp__sub_82423F08(ctx, base);

@@ -9,6 +9,8 @@
 
 #include "kernel.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -71,6 +73,7 @@ namespace Coop
         K_CMD = 5,        // joining -> host: his command, view and place
         K_REL = 6,        // reliable messages
         K_FILM = 7,       // the mission's film (ready / over)
+        K_FX = 8,         // (0.5.872) host -> joining: an effect played there (coop_events.cpp)
     };
     enum RelKind : uint8_t
     {
@@ -84,9 +87,11 @@ namespace Coop
         R_MISSION = 8,        // u8 what (1 failed, 2 restarted, 3 ended), text
         R_HIT = 9,            // host -> joining: he was hit (damage, from where)
         R_DOWN = 10,          // joining -> host: a request (revive held, give up)
+        R_INV = 12,           // (0.5.901) host -> joining: the weapons and rounds he has there (coop_inventory.cpp)
+        R_INVMINE = 13,       // (0.5.902) joining -> host: what his own copy owns (a pickup there is his on the host too)
         R_SELFHIT = 11,       // joining -> host: his own game hurt him (a fall, a trigger): i32 damage, i32 means
     };
-    constexpr uint32_t ProtocolVersion = 40002;
+    constexpr uint32_t ProtocolVersion = 40007;
     bool NetOpen();
     int NetPort();               // the host's UDP port (28970; the joining copy's is one more, the lobby's search two more)
     void SetMode(Mode mode, const std::string& hostAddress = std::string());   // the lobby's choice (game thread, outside a mission)
@@ -130,6 +135,63 @@ namespace Coop
     void HostMissionStart(const std::string& name);
     void HostNewPeer();   // (v45b) a new joining process: names, config strings and dvars again when it comes in
     void HostClientThink(PPCContext& ctx, uint8_t* base);       // after client 0's think
+    void HostRespawn(PPCContext& ctx, uint8_t* base, int who);   // (0.5.869) a downed player (0 the host, 1 the joining player) back in beside the other
+    uint32_t BodyMoveHash(int move);     // (0.5.882) the bodies' moves by name (coop_host.cpp)
+    const char* BodyMoveText(int move);
+    int BodyAct(int move, uint32_t act); // a way of moving (0..12) with what he does (1 firing, 2 throwing, 4 aiming)
+    uint32_t HostActBits(const uint8_t* base, int who);
+    // (0.5.891) how a body moves, steadied. Test t890a: the other player "flickers when moving": his way of
+    // moving was chosen every frame from the step since the frame before, and his place comes in steps (a
+    // snapshot, then frames with no step): forward, left, forward, left, ten times a second. The speed and the
+    // direction are now taken over the last 0.3 s, the axis (forward/back or sideways) is kept unless the other
+    // is clearly more, and a new way of moving must be wanted for 0.15 s before it is taken.
+    struct BodyMotion
+    {
+        struct S { double t; float x, y; };
+        S q[64] = {}; int n = 0;
+        float vx = 0, vy = 0, speed = 0; bool forwardAxis = true;
+        int base = -1, cand = -1; double candAt = 0;
+        void Feed(double now, float x, float y)
+        {
+            if (n && (fabsf(x - q[n - 1].x) > 300.0f || fabsf(y - q[n - 1].y) > 300.0f)) n = 0;   // (put somewhere else: not a move)
+            int drop = 0; while (drop < n - 1 && now - q[drop].t > 0.3) drop++;
+            if (n == 64 && !drop) drop = 1;
+            if (drop) { memmove(q, q + drop, sizeof(S) * size_t(n - drop)); n -= drop; }
+            q[n++] = S{ now, x, y };
+            const double dt = now - q[0].t;
+            if (dt >= 0.1) { vx = float((x - q[0].x) / dt); vy = float((y - q[0].y) / dt); speed = std::min(sqrtf(vx * vx + vy * vy), 600.0f); }
+            else if (n == 1) { vx = vy = speed = 0; }
+        }
+        bool ForwardAxis(float fwd, float side) { forwardAxis = forwardAxis ? fabsf(fwd) * 1.5f >= fabsf(side) : fabsf(fwd) > fabsf(side) * 1.5f; return forwardAxis; }
+        // (0.5.892) one throw, swing or reload is one animation from its start to its end: it changed between
+        // its standing and its crouched kind in the middle (t891a: "crouch_grenade_throw / stand_grenade_throw")
+        int actMove = -1; uint32_t actWas = 0;
+        int Act(uint32_t act, int moved) { if (act >= 3 && act == actWas && actMove >= 0) return actMove; actWas = act; actMove = act >= 3 ? moved : -1; return moved; }
+        int Settle(double now, int want)
+        {
+            if (base < 0 || want == base) { base = want; cand = -1; return base; }
+            if (want != cand) { cand = want; candAt = now; }
+            if (now - candAt >= 0.15) { base = want; cand = -1; }
+            return base;
+        }
+    };
+    // (0.5.892) the rifle butt, from the weapon state (the record's +136): 10 is the swing, 11 what follows it,
+    // but 11 follows a grenade's throw too (t891a: 3 -> 11 with weapon animation 2): every throw ended in a
+    // swing of the rifle butt on the other player's screen. 11 counts only when it came from 10.
+    inline bool MeleeState(uint32_t ws, uint32_t& before) { if (ws != 11) before = ws; return ws == 10 || (ws == 11 && before == 10); }
+    // the button that throws (the record's +1352): 0x2. (0.5.902) 0x4000 is NOT a throw: it is held while crouched
+    // (t901u: 0x4000 comes and goes with view height 40; 0x2000 with prone), so every crouch looked like a throw
+    constexpr uint32_t ThrowButtons = 0x2u;
+    inline bool OneShotMove(int move) { return move >= 26; }   // throws, reloads, swings: played once, held at their end
+    int TidyBodyTree(uint8_t* base, uint32_t tree, int32_t anim, int32_t tiltAnim = -1, float tilt = 0.0f);
+    // (0.5.895) the aim up and down: the aim-up or aim-down animation of a still, aiming or firing body, set in its
+    // tree and kept going; returns its number (or -1) and how much of it shows (0..1, the pitch over 45 degrees)
+    int BodyTilt(PPCContext& ctx, uint8_t* base, uint32_t tree, int move, float pitch, float& share);
+    inline float Pitch180(float p) { while (p > 180.0f) p -= 360.0f; while (p < -180.0f) p += 360.0f; return p; }
+    constexpr float AimPitchMin = 10.0f;   // looking this far up or down, a still body takes its aiming pose
+    //   // (0.5.880) a body's tree: no parent node weighing with nothing under it
+    bool NearHisBlast(const float p[3]);   // (0.5.916) the host: an effect here is the blast of the joining player's own missile
+    bool JoinerUseHeld();        // (0.5.875) the host: the joining player holds Use (his pad's X)
     uint32_t SecondPlayer();     // the host: client 1's entity (0 when none)
     uint32_t SecondBody();       // the host: the entity drawn for the joining player
     uint32_t HostBody();         // the host: the entity drawn for the host (hidden here)
@@ -138,6 +200,9 @@ namespace Coop
     enum EventKind : uint8_t { E_DVAR = 1, E_CALL = 2 };   // R_EVENT's first byte
     // coop_events.cpp: the host's sounds, speech, music and earthquakes, played on the joining copy too
     void EventsReceive(const uint8_t* data, size_t size);
+    void FxForward(PPCContext& ctx, uint8_t* base);          // (0.5.872) the host: an effect being played (sub_82423F08)
+    void FxQueueForward(PPCContext& ctx, uint8_t* base);    // (0.5.881) the host: the waiting effects about to be played (sub_820FBD00)
+    void FxReceive(const uint8_t* data, size_t size);        // the joining copy: one of the host's
     void EventsFrame(PPCContext& ctx, uint8_t* base, bool frozen);
 
     // ---- the joining copy's side (coop_join.cpp) ------------------------
@@ -146,6 +211,15 @@ namespace Coop
     void JoinReceiveReliable(PPCContext& ctx, uint8_t* base, RelKind kind, const uint8_t* data, size_t size);
     void JoinMissionStart(const std::string& name);
     void JoinMissionLoaded(uint8_t* base);   // (v46) after SV_SpawnServer: a reload in this process is done
+    // (0.5.901) coop_inventory.cpp: the joining player's weapons and rounds, kept by the host
+    void TestGo(PPCContext& ctx, uint8_t* base, uint32_t me, uint32_t rec);
+    void TestLive(uint8_t* base, uint32_t me);
+    void TestViewScan(uint8_t* base, uint32_t me);   // (0.5.983) COD3_COOP_VIEWSCAN: where the client game keeps its view
+    void TestAimModel(PPCContext& ctx, uint8_t* base, uint32_t me);   // (0.5.977) COD3_COOP_TESTAIMMODEL: turned to things of a model   // (0.5.972) COD3_COOP_TESTLIVE: Use held by a grenade lying near this copy's player   // (0.5.907) COD3_COOP_TESTGO: a test puts this copy's player somewhere
+    void InventoryHostFrame(uint8_t* base, uint32_t hostRec, uint32_t secondRec);
+    void InventoryJoinReceive(const uint8_t* data, size_t size);
+    void InventoryHostReceive(const uint8_t* data, size_t size);   // (0.5.902)
+    void InventoryJoinFrame(uint8_t* base, uint32_t rec);
     bool JoinFrozen();           // the joining copy's world is the host's now
     bool JoinIsPuppet(const uint8_t* base, uint32_t e);
     void JoinOwnScriptDvar(const std::string& name, const std::string& value);   // our own scripts' setdvar (before the freeze)

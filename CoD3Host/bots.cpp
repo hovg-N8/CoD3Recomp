@@ -25,6 +25,7 @@
 #ifdef COD3_MP
 
 #include <algorithm>
+#include <random>   // 0.5.865: the bots' extra gun roll
 #include "player_capacity.h"
 #include <atomic>
 #include <cstdio>
@@ -47,6 +48,12 @@ static std::atomic<bool> g_botLocal{false};   // 0.5.145: off (local places are 
 // 0.5.163: the bot's own machine object marked "not on this machine" (+0x38 = 0)
 // as 0.5.135-0.5.162 did; off: marked local as the host's.
 static std::atomic<bool> g_botRemoteFlag{false};
+// 0.5.853: the bots' busiest diagnostic lines (muzzle, Pmove, throw trace, the per-second
+// record dump, tactics, model updates, capsule traces, replication) were ~120 lines a second
+// with 30 bots (a 25+ MB log, a printf and flush each): each now stops after a number of lines
+// a run. COD3_BOT_DIAG=1 keeps them all.
+static bool BotDiagAll() { static const bool on = getenv("COD3_BOT_DIAG") != nullptr; return on; }
+static bool BotDiagLine(int& count, int cap) { return BotDiagAll() || count++ < cap; }
 void BotsLocal(int enabled) { g_botLocal.store(enabled != 0); printf("bots: local places for new bots %s\n", enabled ? "on" : "off"); fflush(stdout); }   // 0.5.136: off (Justin: a remote bot is invisible again)
 void BotsRemote(int enabled) { g_botRemote.store(enabled != 0); printf("bots: own machine object for new bots %s\n", enabled ? "on" : "off"); fflush(stdout); }
 void BotsAutoSession(int enabled) { g_botAutoSession.store(enabled != 0); printf("bots: automatic session players %s\n", enabled ? "on" : "off"); fflush(stdout); }
@@ -134,8 +141,14 @@ namespace
     // 0.5.207: each bot's lives (counted at each spawn) and how his last
     // death went, for the other machines (SendBotStates / ApplyMirrorStates).
     uint8_t g_botLife[MaxClients] = {};
+    bool g_botExtraGun[MaxClients] = {};   // 0.5.856: his kit's second gun was given at random (BotExtraGun)
     struct BotDeathInfo { uint32_t attacker = 0, inflictor = 0; int32_t damage = 0, means = 0, weapon = 0, hitLoc = 0, timeOffset = 0; float dir[3] = {}; bool haveDir = false; };
     BotDeathInfo g_botDeath[MaxClients];
+    // 0.5.852: the host sends the bots' states at once after a bot dies (not
+    // up to 250 ms later); a joiner keeps when the game's death routine last
+    // ran for each slot here, so a mirror's death is not played twice.
+    std::atomic<bool> g_sendStatesNow{false};
+    uint32_t g_slotDiedAt[MaxClients] = {};
     BotDeathDrop::State g_deathDrop[MaxClients];
     thread_local uint32_t g_deathDropEntity=0,g_deathDropCreated=0;
     // 0.5.139: each bot's local place (its byte's address) and his session
@@ -967,6 +980,29 @@ namespace
             const unsigned choice=BotKits::Select(kits,teamCounts,totalCounts);
             g_botLoadout[slot]=uint8_t(choice);g_botLoadoutAssigned[slot]=true;
             g_botKit[slot]=kits[choice];
+            // 0.5.856 (the user: bots "can also use all of our added weapons ... some epic
+            // battles"): a kit with no second gun of its own gets one at random for about 6
+            // bots in 10, any of the guns, ours too (BotExtraGun picks when he uses it).
+            // COD3_BOT_EXTRA_GUN=0 none; =100 every such bot.
+            {
+                static const int share=[](){const char* t=getenv("COD3_BOT_EXTRA_GUN");return t?atoi(t):60;}();
+                static const char* const pool[]={"flamethrower","webley","colt_dual","mosin_scoped","kar98_sniper","lee_enfield_sniper",
+                    "springfield","m1garand","kar98","mp44","thompson","mp40","bren","sten","gewehr43","fg42","shotgun"};
+                // 0.5.865: a real generator (botmix864: 0 of 6 bots added in the same moment
+                // got one: the tick-based roll was not random enough)
+                static std::mt19937 rng(uint32_t(GetTickCount()) ^ uint32_t(reinterpret_cast<uintptr_t>(&rng)));
+                const uint32_t roll=uint32_t(rng());
+                printf("bots: extra gun roll for slot %u: %u of 100 (share %d)%s\n",slot,roll%100u,share,
+                       g_botKit[slot].secondary[0]?" (his kit has its own)":g_botKit[slot].base==5?" (anti-armor: none)":"");
+                // (not the anti-armor class: his pistol is what he draws up close with a launcher)
+                if(!g_botKit[slot].secondary[0] && g_botKit[slot].base!=5 && int(roll%100u)<share) {
+                    const char* pick=pool[(roll/100u)%(sizeof(pool)/sizeof(pool[0]))];
+                    if(strcmp(pick,g_botKit[slot].primary)==0) pick=pool[((roll/100u)+1)%(sizeof(pool)/sizeof(pool[0]))];
+                    strncpy(g_botKit[slot].secondary,pick,sizeof(g_botKit[slot].secondary)-1);
+                    g_botExtraGun[slot]=true;
+                }
+                else g_botExtraGun[slot]=false;
+            }
             const uint16_t kit=g_botKit[slot].base;
             printf("bots: loadout slot %u side %u kit %u: %s, %s, %d frags, %d smokes%s%s%s\n",slot,side,choice,
                 g_botKit[slot].label[0]?g_botKit[slot].label:BotKits::ClassNames()[kit%7],
@@ -1521,6 +1557,7 @@ struct BotOrders { int8_t forward, right; uint32_t buttons; bool wantsFire; int8
 // 0.5.170: how far the enemy he can see is (flat), for the melee; set by
 // Think each frame, a long way when he sees no one.
 static float g_seeDist[MaxClients] = {};
+static float g_seeAt[MaxClients][3] = {};   // 0.5.852: where that enemy was (the artillery's no-teammates check)
 // 0.5.197: how far his view is off what he wants to look at (yaw, degrees):
 // on a mounted gun whose arc cannot reach, it stays large.
 static float g_aimOff[MaxClients] = {};
@@ -1888,7 +1925,8 @@ static BotNavigation::Hit BotTraceTimed(PPCContext& ctx, uint8_t* base, uint32_t
         const uint32_t index=Guest::Read32(base,ignored+484)&0x3FFFu;
         const uint32_t slot=index?index-1:MaxClients;
         static uint32_t lastTrace[MaxClients]={};
-        if(slot<MaxClients && GetTickCount()-lastTrace[slot]>=3000) {
+        static int capsuleLines=0;   // 0.5.853: capped
+        if(slot<MaxClients && GetTickCount()-lastTrace[slot]>=3000 && BotDiagLine(capsuleLines,200)) {
             lastTrace[slot]=GetTickCount();
             printf("bots: completed capsule trace slot %u from %.1f %.1f %.1f to %.1f %.1f %.1f fraction %.4f flags %u %u normal %.3f %.3f %.3f hit %08X\n",
                 slot,from.x,from.y,from.z,to.x,to.y,to.z,hit.fraction,
@@ -4068,7 +4106,8 @@ static void TacticalMove(PPCContext& ctx,uint8_t* base,uint32_t self,uint32_t th
             orders.right=int8_t(std::clamp(orders.right-std::sin(rel)*m,-127.0f,127.0f));
         }
     }
-    if (now-state.logged>3000) {
+    static int tacticsLines = 0;
+    if (now-state.logged>3000 && BotDiagLine(tacticsLines, 300)) {
         state.logged=now;
         printf("bots: tactics slot %u route %.0f %.0f, visibility %d, cover %d\n",slot,state.step.x,state.step.y,state.visible,shelter);fflush(stdout);
     }
@@ -4134,7 +4173,9 @@ static bool MateInLine(uint8_t* base, uint32_t self, uint32_t mySide, const floa
         if (t <= 0.02f || t >= 1.02f) return;
         const float px = me[0] + sx * t - x, py = me[1] + sy * t - y, pz = me[2] + sz * t - z;
         const float along = sqrtf(len2) * t;
-        if (px * px + py * py + pz * pz * 0.5f < powf(30.0f + along * 0.03f, 2.0f)) { blocked = true; who = o; }
+        // 0.5.854: 34 + 4% of the way (was 30 + 3%): the user: a mate in view while aiming,
+        // "just dont shoot or re adjust some until the shot is clear" (sidestep below)
+        if (px * px + py * py + pz * pz * 0.5f < powf(34.0f + along * 0.04f, 2.0f)) { blocked = true; who = o; }
     });
     return blocked;
 }
@@ -4146,6 +4187,23 @@ static bool MateNear(uint8_t* base, uint32_t self, uint32_t mySide, const float 
     });
     return near_;
 }
+// 0.5.852: a teammate near where a thrown grenade may come down short: the
+// last 60% of the throw's line, 220 units each side.
+[[maybe_unused]] static bool NadeLineHasMate(   // (0.5.854: not used: grenades as before 0.5.852)
+uint8_t* base, uint32_t self, uint32_t mySide, const float me[3], const float target[3])
+{
+    const float sx = target[0] - me[0], sy = target[1] - me[1];
+    const float len2 = sx * sx + sy * sy;
+    if (len2 < 1.0f) return false;
+    bool hit = false;
+    ForEachMate(base, self, mySide, [&](uint32_t, float x, float y, float z) {
+        const float t = ((x - me[0]) * sx + (y - me[1]) * sy) / len2;
+        if (t < 0.4f || t > 1.0f || fabsf(z - target[2]) > 200.0f) return;
+        if (hypotf(me[0] + sx * t - x, me[1] + sy * t - y) < 220.0f) hit = true;
+    });
+    return hit;
+}
+static uint32_t InVehicle(uint8_t* base, uint32_t entity, int32_t* seat = nullptr);
 static uint32_t g_nextRocket[MaxClients] = {}, g_sidestepUntil[MaxClients] = {};
 static int8_t g_sidestepDir[MaxClients] = {};
 // 0.5.326 (Justin: bots should use their equipment, rifle grenades too):
@@ -4452,7 +4510,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     float enemyAt[3] = {};
     memcpy(enemyAt, target, 12);
     // 0.5.170: for the melee, smoke (BotExtras).
-    if (found && visible) { const float ex = target[0] - me[0], ey = target[1] - me[1]; g_seeDist[slot] = sqrtf(ex * ex + ey * ey); }
+    if (found && visible) { const float ex = target[0] - me[0], ey = target[1] - me[1]; g_seeDist[slot] = sqrtf(ex * ex + ey * ey); memcpy(g_seeAt[slot], target, 12); }
 
     // His view: +204 pitch, +208 yaw (what the server's fire shoots along,
     // sub_8256E978).
@@ -5769,6 +5827,52 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
             }
         }
     }
+    // 0.5.856: his random second gun (g_botExtraGun, the kit's "secondary"): the
+    // flamethrower comes out for an enemy in sight within 450 and goes away past
+    // 800; any other in about a third of his lives is the gun he fights with (out
+    // 3 s after he spawns). His main gun is the one he held at the start of the life.
+    if (record && g_botExtraGun[slot] && g_botKit[slot].secondary[0] && !throwing && !launcher)
+    {
+        static uint8_t lifeSeen[MaxClients] = {};
+        static uint32_t lifeAt[MaxClients] = {}, nextExtra[MaxClients] = {};
+        static char mainGun[MaxClients][32] = {};
+        auto heldName = [&](char* out) {
+            out[0] = 0;
+            const uint32_t def = HeldDef(base, record);
+            if (def < 0x40000000u || def >= 0xC0000000u) return;
+            const uint32_t text = Guest::Read32(base, def + 8);
+            if (text < 0x40000000u || text >= 0xC0000000u) return;
+            for (int c = 0; c < 31; c++) { const char ch = char(Guest::Read8(base, text + c)); out[c] = ch; if (!ch) break; }
+            out[31] = 0;
+        };
+        const char* extra = g_botKit[slot].secondary;
+        char now_[32];
+        heldName(now_);
+        if (lifeSeen[slot] != uint8_t(g_botLife[slot] + 1))
+        {
+            lifeSeen[slot] = uint8_t(g_botLife[slot] + 1); lifeAt[slot] = now; mainGun[slot][0] = 0;
+            g_wantGun[slot] = 0;
+        }
+        if (!mainGun[slot][0] && now_[0] && strcmp(now_, extra) != 0) strncpy(mainGun[slot], now_, 31);
+        const bool flame = strcmp(extra, "flamethrower") == 0;
+        const bool prefers = !flame && ((slot * 7u + g_botLife[slot] * 13u) % 3u) == 0;
+        const bool holdingExtra = strcmp(now_, extra) == 0;
+        if (now >= nextExtra[slot])
+        {
+            const char* want = nullptr;
+            if (flame) want = (found && visible && flat < 450.0f) ? extra : (holdingExtra && (!found || flat > 800.0f) ? mainGun[slot] : nullptr);
+            else if (prefers && !holdingExtra && now - lifeAt[slot] > 3000) want = extra;
+            if (want && want[0] && strcmp(want, now_) != 0 && BotOwnsLoaded(base, record, want) && BotSwitch(ctx, base, self, want))
+            {
+                nextExtra[slot] = now + 3000;
+                // 0.5.857: kept in his commands' weapon word (botmix856: the commands put
+                // his main gun back 2.5 s after each switch: "takes his thompson" x59)
+                g_wantGun[slot] = want == extra ? WeaponNumber(base, extra) : 0;
+                static int told = 0;
+                if (told++ < 80) { printf("bots: slot %u takes his %s (%s, enemy %.0f away)\n", slot, want, want == extra ? "his extra gun" : "his main gun again", found ? flat : -1.0f); fflush(stdout); }
+            }
+        }
+    }
     uint32_t blocker = 0xFFFFFFFFu;
     const bool aimed = !throwing && reacted && fabsf(yawError) < 6.0f && fabsf(pitchError) < 6.0f && (flat < 1600.0f || (riflenade && flat < 2300.0f));
     // 0.5.202: aim down the sights (button 0x8, the game's +speed: what the
@@ -5787,7 +5891,10 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     bool mateBlocks = false;
     if (aimed)
     {
-        mateBlocks = MateInLine(base, self, mySide, me, target, blocker) || (launcher && MateNear(base, self, mySide, target, 300.0f));
+        // 0.5.852: in a vehicle (a tank's shell splashes: one killed a mate
+        // on the user's 0.5.851 match, means 10) as with a launcher
+        const bool splash = launcher || InVehicle(base, self, nullptr) != 0;
+        mateBlocks = MateInLine(base, self, mySide, me, target, blocker) || (splash && MateNear(base, self, mySide, target, 350.0f));
         if (mateBlocks)
         {
             if (now >= g_sidestepUntil[slot] + 1500) { g_sidestepUntil[slot] = now + 600; g_sidestepDir[slot] = ((now / 600) + slot) % 2 ? 1 : -1; }
@@ -5828,7 +5935,7 @@ static BotOrders Think(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t n
     for (int k = 0; k < 3; k++)
         if (nearSlot[k] < MaxClients && nearSlot[k] != targetSlot && hypotf(nearAt[k][0] - target[0], nearAt[k][1] - target[1]) < 300.0f) bunched++;
     if (!throwing && now - g_lastThrowAt[slot % 32] >= ThrowGapMs && SideThrowFree(mySide, me[0], me[1], now) && (visible || hidingNear) && now >= g_nextNade[slot] && flat > (visible ? (bunched ? 300.0f : 350.0f) : 250.0f) && flat < 1500.0f && fabsf(yawError) < 12.0f &&
-        !MateNear(base, self, mySide, target, 320.0f))   // 0.5.201: not onto teammates
+        !MateNear(base, self, mySide, target, 320.0f))   // 0.5.201: not onto teammates (0.5.854: 0.5.852's wider check taken back: the user is fine with grenades hurting mates)
     {
         const uint32_t ammo = BotNadeAmmo(base, Guest::Read32(base, self + 512), false);
         g_nextNade[slot] = now + (BotIsDemolitionist(slot) ? 5000 + (phase % 3000) : 9000 + (phase % 5000));   // 0.5.326: the Demolitionist's sticky bombs more often
@@ -6119,7 +6226,7 @@ static BotVehicleInfo g_vehicles[24];
 static int g_vehicleCount = 0;
 static uint32_t g_vehiclesAt = 0;
 // The vehicle a player's entity is in (0: none) and his seat.
-static uint32_t InVehicle(uint8_t* base, uint32_t entity, int32_t* seat = nullptr)
+static uint32_t InVehicle(uint8_t* base, uint32_t entity, int32_t* seat)
 {
     const uint32_t link = entity ? Guest::Read32(base, entity + 900) : 0;
     const uint32_t vehicle = link ? Guest::Read32(base, link) : 0;
@@ -6195,9 +6302,13 @@ struct BotSeat {
     uint32_t vehicle = 0;          // the one he is crew for (0: none)
     bool driver = false, inside = false;
     uint32_t claimedAt = 0, enterTries = 0, nextEnter = 0, boardedAt = 0, cooldown = 0;
+    float claimDistance = 0.0f;   // 0.5.853: how far the vehicle was when he chose it
     uint32_t moveCheck = 0, reverseUntil = 0, leaveTries = 0, nextLeave = 0;
     BotNavigation::Point lastVehicleAt{}, driveTo{};
     bool haveDriveTo = false;
+    // 0.5.853: the learnt map's route to driveTo (DriveStep), worked out again every 6 s
+    std::vector<BotNavigation::Point> route;
+    uint32_t routeAt = 0;
 };
 static BotSeat g_seat[MaxClients];
 
@@ -6237,27 +6348,184 @@ static bool IsTankKind(const char* kind)
 // cannon (796's tankfire2: in a Panzer, fire held 41 times, no tank event;
 // tankfire1's turret events were the HOST's, "host buttons 00000001"). While a
 // vehicle is updated the bots' bytes are clear, as for their thinks.
+// The bots' move-lock bytes cleared for one call, put back after (0.5.857: shared).
+struct BotLocksClear
+{
+    uint8_t* base; uint32_t bytes[MaxClients * 2]; uint8_t was[MaxClients * 2]; int n = 0;
+    explicit BotLocksClear(uint8_t* b) : base(b)
+    {
+        const uint32_t entities = Guest::Read32(base, EntityList);
+        for (uint32_t slot = FirstBotSlot(); entities && slot < ActiveSlots() && slot < MaxClients; slot++)
+        {
+            if (!g_bot[slot]) continue;
+            const uint32_t e = Guest::Read32(base, entities + 4 * (slot + 1));
+            const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
+            uint32_t index[2] = { slot, r ? Guest::Read32(base, r + 2804) : 0xFFFFFFFFu };
+            for (uint32_t i : index)
+            {
+                if (i >= 64) continue;
+                bool dup = false; for (int k = 0; k < n; k++) if (bytes[k] == MoveLocked + i) dup = true;
+                if (dup || n >= int(MaxClients * 2)) continue;
+                bytes[n] = MoveLocked + i; was[n] = Guest::Read8(base, bytes[n]); Guest::Write8(base, bytes[n], 0); n++;
+            }
+        }
+    }
+    ~BotLocksClear() { for (int k = n - 1; k >= 0; k--) Guest::Write8(base, bytes[k], was[k]); }
+};
+// 0.5.866: THE BOTS' TANKS CRAWLED (~5 units/s; the user's own drive of the same
+// Panzer, 2026-11-08: ~160/s). The tank's physics (sub_8258F7A8) runs only while
+// the vehicle info's +506 is set, and both sub_82591450 and the update
+// sub_82582280 set +506 from the driver's PAD: his controller port (the per-client
+// record 0x82C7A270 + 3208 * client + 180), sub_824829C0 (the value of the input
+// bound to action 4, > 50) and sub_820F9E50 (binding 13). A bot has no pad there.
+// While either runs for a vehicle a bot drives, those two reads answer "held"
+// (100), so the physics runs every frame and takes his command's moves.
+static thread_local bool t_botDrives = false;
+static bool BotDrivesVehicle(uint8_t* base, uint32_t vehicle)
+{
+    if (!vehicle) return false;
+    const uint32_t handle = Guest::Read32(base, vehicle + 432), index = handle & 0x3FFF;
+    if (index >= 4096 || (handle >> 14) != Guest::Read32(base, 0x82BD1FC0 + 8 * index + 4)) return false;
+    const uint32_t driver = Guest::Read32(base, 0x82BD1FC0 + 8 * index);
+    return driver && BotSlot(base, driver) < MaxClients;
+}
+extern "C" PPC_FUNC(__imp__sub_824829C0);
+PPC_FUNC(sub_824829C0)
+{
+    if (t_botDrives) { ctx.r3.u64 = 100; return; }
+    __imp__sub_824829C0(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_820F9E50);
+PPC_FUNC(sub_820F9E50)
+{
+    if (t_botDrives) { ctx.r3.u64 = 100; return; }
+    __imp__sub_820F9E50(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_82591450);
+PPC_FUNC(sub_82591450)
+{
+    const bool was = t_botDrives;
+    t_botDrives = BotDrivesVehicle(base, ctx.r3.u32);
+    static int told = 0;
+    if (t_botDrives && told < 5) { told++; printf("bots: vehicle: a bot's tank input: its physics let run (pad reads answer held)\n"); fflush(stdout); }
+    __imp__sub_82591450(ctx, base);
+    t_botDrives = was;
+}
 extern "C" PPC_FUNC(__imp__sub_82582280);
 PPC_FUNC(sub_82582280)
 {
-    uint32_t bytes[MaxClients * 2]; uint8_t was[MaxClients * 2]; int n = 0;
-    const uint32_t entities = Guest::Read32(base, EntityList);
-    for (uint32_t slot = FirstBotSlot(); entities && slot < ActiveSlots() && slot < MaxClients; slot++)
+    BotLocksClear clear(base);
+    const bool was = t_botDrives;
+    t_botDrives = BotDrivesVehicle(base, ctx.r3.u32);
+    __imp__sub_82582280(ctx, base);
+    t_botDrives = was;
+}
+// 0.5.860: the vehicle think (sub_82591B40, the vehicle r3) runs the driving
+// (sub_8257FAF0) only when the vehicle's +603 is 2, its kind's +32 is not 5
+// and its kind's +540 is 0 (botveh859: the driving was never called): logged for
+// a bot's tank, every 2.5 s (60 lines).
+extern "C" PPC_FUNC(__imp__sub_82591B40);
+PPC_FUNC(sub_82591B40)
+{
+    const uint32_t vehicle = ctx.r3.u32;
+    if (vehicle)
     {
-        if (!g_bot[slot]) continue;
-        const uint32_t e = Guest::Read32(base, entities + 4 * (slot + 1));
-        const uint32_t r = e ? Guest::Read32(base, e + 512) : 0;
-        uint32_t index[2] = { slot, r ? Guest::Read32(base, r + 2804) : 0xFFFFFFFFu };
-        for (uint32_t i : index)
+        const uint32_t handle = Guest::Read32(base, vehicle + 432), index = handle & 0x3FFF;
+        const uint32_t driver = index < 4096 && (handle >> 14) == Guest::Read32(base, 0x82BD1FC0 + 8 * index + 4) ? Guest::Read32(base, 0x82BD1FC0 + 8 * index) : 0;
+        const uint32_t slot = driver ? BotSlot(base, driver) : MaxClients;
+        static int told = 0;
+        static uint32_t last = 0;
+        // 0.5.864: a person's tank too (the speed to compare: the bots' tanks crawl,
+        // ~5 units a second, tankdrive863 on Seelow and Merville): its place and his moves
+        if (driver && slot >= MaxClients)
         {
-            if (i >= 64) continue;
-            bool dup = false; for (int k = 0; k < n; k++) if (bytes[k] == MoveLocked + i) dup = true;
-            if (dup || n >= int(MaxClients * 2)) continue;
-            bytes[n] = MoveLocked + i; was[n] = Guest::Read8(base, bytes[n]); Guest::Write8(base, bytes[n], 0); n++;
+            static int toldHuman = 0;
+            static uint32_t lastHuman = 0;
+            const uint32_t hr = Guest::Read32(base, driver + 512);
+            // 0.5.867: watch_tank.txt beside the game: the first tank a person drives has
+            // its place (+336) watched; the watch logs the game's call chain of its first
+            // 40 writes (who moves a person's tank, to run it for the bots)
+            {
+                static int armed = -1;
+                if (armed < 0)
+                {
+                    char path[MAX_PATH] = {};
+                    GetModuleFileNameA(nullptr, path, MAX_PATH);
+                    std::string p = path; p = p.substr(0, p.find_last_of("\\/") + 1) + "watch_tank.txt";
+                    armed = GetFileAttributesA(p.c_str()) != INVALID_FILE_ATTRIBUTES ? 0 : 1;
+                }
+                if (armed == 0)
+                {
+                    armed = 1;
+                    Kernel::WatchWrite(vehicle + 336, false);
+                    const HANDLE helper = CreateThread(nullptr, 0, [](void*) -> DWORD { Kernel::ArmWatchpoints(); return 0; }, nullptr, 0, nullptr);
+                    if (helper) CloseHandle(helper);
+                    printf("bots: vehicle: a person's tank's place watched (watch_tank.txt)\n"); fflush(stdout);
+                }
+            }
+            if (hr && toldHuman < 60 && GetTickCount() - lastHuman > 2500)
+            {
+                lastHuman = GetTickCount(); toldHuman++;
+                printf("bots: vehicle think, a person driving: vehicle at %.1f %.1f %.1f yaw %.1f, his moves %d %d %d, +1936 %u\n",
+                       ReadFloat(base, vehicle + 336), ReadFloat(base, vehicle + 340), ReadFloat(base, vehicle + 344), ReadFloat(base, vehicle + 356),
+                       int8_t(Guest::Read8(base, hr + 1960)), int8_t(Guest::Read8(base, hr + 1961)), int8_t(Guest::Read8(base, hr + 1962)), Guest::Read32(base, hr + 1936));
+                fflush(stdout);
+            }
+        }
+        if (slot < MaxClients && told < 60 && GetTickCount() - last > 2500)
+        {
+            last = GetTickCount(); told++;
+            const uint32_t info = Guest::Read32(base, vehicle + 524);
+            const int kindNo = info ? int(int16_t(Guest::Read16(base, info + 376))) : -1;
+            const uint32_t kind = kindNo >= 0 && kindNo < 64 ? Guest::Read32(base, 0x82B2DC90 + 4 * uint32_t(kindNo)) : 0;
+            printf("bots: vehicle think for slot %u's: +603 %u, kind %d +32 %u +540 %u, the game's flag %08X\n", slot, Guest::Read8(base, vehicle + 603), kindNo,
+                   kind ? Guest::Read16(base, kind + 32) : 0xFFFFu, kind ? Guest::Read8(base, kind + 540) : 255u, Guest::Read32(base, 0x82BCBDB0));
+            fflush(stdout);
         }
     }
-    __imp__sub_82582280(ctx, base);
-    for (int k = n - 1; k >= 0; k--) Guest::Write8(base, bytes[k], was[k]);
+    // 0.5.861: botveh860b: a tank's kind has +540 set (109), so the think takes the
+    // tanks' way (sub_82589C98, then sub_82591450 / sub_82590FC8, which read the
+    // driver's lock byte too), never sub_8257FAF0: the whole think with the bots'
+    // bytes clear, as their own thinks run.
+    BotLocksClear clear(base);
+    __imp__sub_82591B40(ctx, base);
+}
+// 0.5.857: the vehicle's driving (sub_8257FAF0, the vehicle r3): it takes its
+// driver's forward, right and up moves (his state +1960..+1962) and zeroes them
+// when his move-lock byte (0x82C73024 + his +2804) is set: set for every bot, so
+// a bot's tank never moved (botveh857: "drove 0 in 2.5 s (forward 70, steer 127)"
+// every check, yaw unchanged). The bytes clear for it, as for the vehicle's update.
+extern "C" PPC_FUNC(__imp__sub_8257FAF0);
+PPC_FUNC(sub_8257FAF0)
+{
+    // 0.5.859: what it sees of a bot driver (botveh858: still "drove 0"): his
+    // state's moves (+1960..+1962), +240 and +44 flags, his lock byte
+    {
+        const uint32_t vehicle = ctx.r3.u32;
+        const uint32_t handle = vehicle ? Guest::Read32(base, vehicle + 432) : 0, index = handle & 0x3FFF;
+        const uint32_t driver = index < 4096 && (handle >> 14) == Guest::Read32(base, 0x82BD1FC0 + 8 * index + 4) ? Guest::Read32(base, 0x82BD1FC0 + 8 * index) : 0;
+        const uint32_t record = driver ? Guest::Read32(base, driver + 512) : 0;
+        const uint32_t slot = driver ? BotSlot(base, driver) : MaxClients;
+        static uint32_t calls = 0;
+        if (calls++ % 3000 == 0 && calls < 60000) { printf("bots: vehicle driving called %u times (this one: vehicle %08X, driver %08X, %s)\n", calls, vehicle, driver, slot < MaxClients ? "a bot" : driver ? "not a bot" : "none"); fflush(stdout); }
+        static int told = 0;
+        if (slot < MaxClients && record && told < 60)
+        {
+            static uint32_t last[MaxClients] = {};
+            if (GetTickCount() - last[slot] > 2500)
+            {
+                last[slot] = GetTickCount(); told++;
+                const uint32_t lockIndex = Guest::Read32(base, record + 2804);
+                printf("bots: vehicle driving for slot %u: moves %d %d %d, +240 %08X, +44 %08X, +2784 %u, +1300 %d, lock[%u] %u\n", slot,
+                       int8_t(Guest::Read8(base, record + 1960)), int8_t(Guest::Read8(base, record + 1961)), int8_t(Guest::Read8(base, record + 1962)),
+                       Guest::Read32(base, record + 240), Guest::Read32(base, record + 44), Guest::Read8(base, record + 2784),
+                       int32_t(Guest::Read32(base, record + 1300)), lockIndex, lockIndex < 64 ? Guest::Read8(base, MoveLocked + lockIndex) : 255u);
+                fflush(stdout);
+            }
+        }
+    }
+    BotLocksClear clear(base);
+    __imp__sub_8257FAF0(ctx, base);
 }
 
 // true: this bot is the tank_fire bot this frame (his orders are set here)
@@ -6419,6 +6687,27 @@ static bool BotTankFire(PPCContext& ctx, uint8_t* base, uint32_t slot, uint32_t 
             fflush(stdout);
         }
         if (now < t.shotUntil) orders.buttons |= 1u;
+        // 0.5.863: COD3_TANK_DRIVE_TEST=1: he also drives forward, and the tank's
+        // place and his state are logged every 2.5 s (why the bots' tanks stand)
+        static const bool drive = getenv("COD3_TANK_DRIVE_TEST") != nullptr;
+        if (drive)
+        {
+            orders.forward = 127; orders.right = 40;
+            static uint32_t lastLog = 0;
+            static int lines = 0;
+            if (now - lastLog > 2500 && lines < 60 && tank)
+            {
+                lastLog = now; lines++;
+                const uint32_t li = Guest::Read32(base, record + 2804);
+                printf("bots: tank drive test: tank at %.1f %.1f %.1f yaw %.1f (entity +336), he at %.1f %.1f; his moves %d %d %d, +1940 %08X, lock[%u] %u, +44 %08X, +240 %08X, +1936 %u\n",
+                       ReadFloat(base, tank->entity + 336), ReadFloat(base, tank->entity + 340), ReadFloat(base, tank->entity + 344), ReadFloat(base, tank->entity + 356),
+                       ReadFloat(base, record), ReadFloat(base, record + 4),
+                       int8_t(Guest::Read8(base, record + 1960)), int8_t(Guest::Read8(base, record + 1961)), int8_t(Guest::Read8(base, record + 1962)),
+                       Guest::Read32(base, record + 1940), li, li < 64 ? Guest::Read8(base, MoveLocked + li) : 255u, Guest::Read32(base, record + 44), Guest::Read32(base, record + 240),
+                       Guest::Read32(base, record + 1936));
+                fflush(stdout);
+            }
+        }
         return true;
     }
     if (t.inside) { t.inside = false; t.tries = 0; printf("bots: tank_fire: slot %u is out of the tank: in again\n", slot); fflush(stdout); }
@@ -6599,6 +6888,7 @@ static void BotSeats(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& o
             {
                 const bool arrived = seat.haveDriveTo;
                 seat.haveDriveTo = false;
+                seat.route.clear();   // 0.5.853
                 if (demo && arrived && now - seat.boardedAt > 25000)
                 { leave = true; printf("bots: vehicle: slot %u (demolitionist) is there: gets out to fight\n", slot); fflush(stdout); }
                 if (demo && g_mapKnow.Ready())
@@ -6627,20 +6917,85 @@ static void BotSeats(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& o
             orders.buttons &= ~(1u | UseButtons | SprintButton);
             if (seat.haveDriveTo)
             {
-                const float bearing = atan2f(seat.driveTo.y - mine->at.y, seat.driveTo.x - mine->at.x) * 57.29578f;
+                // 0.5.853: along the learnt map's route (the ways the players walk), not
+                // straight at the place: straight lines drove the tanks into walls ("is
+                // stuck: backs up" ~24 a match, botveh8). The point steered at: the first of
+                // the route 250 or more from the tank (the last when none is); straight
+                // when the map knows no way. The route again every 6 s, and after a back-up.
+                if (g_mapKnow.Ready() && (seat.route.empty() || now - seat.routeAt > 6000))
+                {
+                    // (botveh854: every route empty: Path looks for a start within 300 of the
+                    // tank, and tanks stand off the ways the players walk: within 900 now)
+                    const int32_t goalCell = g_mapKnow.Nearest(seat.driveTo, 900.0f);
+                    const int32_t startCell = g_mapKnow.Nearest(mine->at, 900.0f);
+                    seat.route = goalCell >= 0 && startCell >= 0 ? g_mapKnow.PathFrom(startCell, goalCell) : std::vector<Point>{};
+                    if (!seat.route.empty()) seat.route.push_back(seat.driveTo);
+                    seat.routeAt = now;
+                    static int told = 0;
+                    if ((told < 60 && told++ < 60)) { printf("bots: vehicle: slot %u's route to %.0f %.0f: %zu spots%s\n", slot, seat.driveTo.x, seat.driveTo.y, seat.route.size(), seat.route.empty() ? " (none known: straight)" : ""); printf("bots: vehicle:   (cells %d -> %d of %zu known)\n", startCell, goalCell, g_mapKnow.nodes.size()); fflush(stdout); }
+                }
+                Point aim = seat.driveTo;
+                for (const Point& p : seat.route)
+                    if (Distance(mine->at, p) >= 250.0f) { aim = p; break; }
+                const float bearing = atan2f(aim.y - mine->at.y, aim.x - mine->at.x) * 57.29578f;
                 const float turn = AngleDifference(bearing, mine->yaw);
                 const bool reversing = now < seat.reverseUntil;
                 orders.forward = reversing ? -127 : (std::fabs(turn) > 100.0f ? 70 : 127);
                 const float steer = std::clamp(-turn * 2.5f, -127.0f, 127.0f);
                 orders.right = int8_t(reversing ? -steer : steer);
-                g_yaw[slot] += std::clamp(AngleDifference(bearing, g_yaw[slot]), -3.0f, 3.0f);
+                // 0.5.856 (the user: bots should drive the tanks "and shoot too"): the view
+                // (the turret) on an enemy he sees 250-3000 off while he drives on, and a
+                // shell when it is on him (within 4 degrees) with no mate within 350 of
+                // him, one every 3.5 s (fire held 0.3 s, as tank_fire); else the view the
+                // way he drives. Fire was cleared above for every driver: no bot had
+                // fired a tank in normal play (botveh854: no tank fire events).
+                bool aimingAtEnemy = false;
+                if (sees && g_seeDist[slot] > 250.0f && g_seeDist[slot] < 3000.0f && IsTankKind(mine->kind))
+                {
+                    const float eye = BotAim::EyeHeight(ReadFloat(base, record + 220));
+                    const float dx = g_seeAt[slot][0] - ReadFloat(base, record), dy = g_seeAt[slot][1] - ReadFloat(base, record + 4);
+                    const float dz = g_seeAt[slot][2] - (ReadFloat(base, record + 8) + eye);
+                    if (std::isfinite(dx) && std::isfinite(dy) && std::isfinite(dz))
+                    {
+                        aimingAtEnemy = true;
+                        const float enemyBearing = atan2f(dy, dx) * 57.29578f;
+                        const float viewYaw = ReadFloat(base, record + 208);
+                        g_yaw[slot] += std::clamp(AngleDifference(enemyBearing, viewYaw), -4.0f, 4.0f);
+                        const float want = BotAim::Pitch(dx, dy, dz) * PitchSign();
+                        g_pitch[slot] += std::clamp(want - g_pitch[slot], -3.0f, 3.0f);
+                        g_wantYaw[slot] = enemyBearing; g_wantPitch[slot] = want;
+                        static uint32_t nextShell[MaxClients] = {}, shellUntil[MaxClients] = {};
+                        const bool onHim = std::fabs(AngleDifference(enemyBearing, viewYaw)) < 4.0f;
+                        if (onHim && now >= nextShell[slot] && !MateNear(base, self, Side(base, self), g_seeAt[slot], 350.0f))
+                        {
+                            shellUntil[slot] = now + 300; nextShell[slot] = now + 3500;
+                            static int told = 0;
+                            if (told++ < 60) { printf("bots: vehicle: slot %u fires his %s at an enemy %.0f away\n", slot, mine->kind, g_seeDist[slot]); fflush(stdout); }
+                        }
+                        if (now < shellUntil[slot]) { orders.buttons |= 1u; orders.wantsFire = true; }
+                    }
+                }
+                if (!aimingAtEnemy) g_yaw[slot] += std::clamp(AngleDifference(bearing, g_yaw[slot]), -3.0f, 3.0f);
                 // Stopped (under 40 units in 2.5 s): back up for 1.5 s, the wheel the other way.
                 if (now - seat.moveCheck >= 2500)
                 {
                     const float moved = Distance(mine->at, seat.lastVehicleAt);
+                    {   // 0.5.857: why the tanks do not move (botmix856: every stint 6 back-ups, out at 16 s)
+                        static int toldDrive = 0;
+                        if (toldDrive++ < 80) { printf("bots: vehicle: slot %u drove %.0f in 2.5 s (forward %d, steer %d%s), tank at %.0f %.0f %.0f yaw %.0f, he at %.0f %.0f, aim %.0f %.0f, %zu route spots\n",
+                            slot, moved, orders.forward, orders.right, reversing ? ", reversing" : "", mine->at.x, mine->at.y, mine->at.z, mine->yaw,
+                            feet.x, feet.y, aim.x, aim.y, seat.route.size());
+                            const uint32_t li = Guest::Read32(base, record + 2804);
+                            printf("bots: vehicle:   his state: moves %d %d %d, +1940 %08X, +1936 %u, lock[%u] %u, +44 %08X, +240 %08X\n",
+                                int8_t(Guest::Read8(base, record + 1960)), int8_t(Guest::Read8(base, record + 1961)), int8_t(Guest::Read8(base, record + 1962)),
+                                Guest::Read32(base, record + 1940), Guest::Read32(base, record + 1936), li, li < 64 ? Guest::Read8(base, MoveLocked + li) : 255u,
+                                Guest::Read32(base, record + 44), Guest::Read32(base, record + 240));
+                            fflush(stdout); }
+                    }
                     if (moved < 40.0f && !reversing)
                     {
                         seat.reverseUntil = now + 1500;
+                        seat.routeAt = 0;   // 0.5.853: the route again after backing up
                         static uint32_t told[MaxClients] = {};
                         if (told[slot]++ < 20) { printf("bots: vehicle: slot %u is stuck: backs up\n", slot); fflush(stdout); }
                         if (++seat.leaveTries >= 6) leave = true;
@@ -6692,12 +7047,16 @@ static void BotSeats(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders& o
         if (best)
         {
             seat.vehicle = best->entity; seat.driver = asDriver; seat.claimedAt = now; seat.enterTries = 0; seat.nextEnter = 0;
+            seat.claimDistance = bestDistance;
             mine = best;   // 0.5.198: 0.5.197 looked for it before the claim and gave up at once ("gone") every time
             printf("bots: vehicle: slot %u goes for %s %.0f away as %s\n", slot, best->kind, bestDistance, asDriver ? "driver" : "gunner"); fflush(stdout);
         }
     }
     if (!seat.vehicle) return;
-    if (!mine || busy || now - seat.claimedAt > (demo ? 60000u : 45000u))
+    // 0.5.853: the time to get in grows with how far the vehicle was (a walker covers
+    // ~190 a second; botveh8: ~9 "took too long" a match, most of them far ones)
+    const uint32_t allowed = (demo ? 60000u : 45000u) + uint32_t(std::min(seat.claimDistance, 3000.0f) / 150.0f * 1000.0f);
+    if (!mine || busy || now - seat.claimedAt > allowed)
     {
         printf("bots: vehicle: slot %u gives up on his vehicle (%s)\n", slot, !mine ? "gone" : busy ? "a fight" : "took too long"); fflush(stdout);
         seat.vehicle = 0; seat.cooldown = now + (busy ? (demo ? 8000 : 15000) : (demo ? 30000 : 90000));
@@ -7002,7 +7361,10 @@ static void BotRusher2(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders&
     const float dist = g_seeDist[slot];
     const BotExplore& ex = g_explore[slot];
     // the artillery
-    if (r.stage == 0 && r.ready > 0 && sees && dist > 900.0f && dist < 4500.0f && now >= r.nextCall && owns(bino) && BotWeaponRounds(base, record, bino) > 0)
+    // 0.5.852: not onto teammates (a barrage spreads; one killed a mate on
+    // the user's 0.5.851 Seelow match, means 18)
+    const bool matesThere = MateNear(base, self, Side(base, self), g_seeAt[slot], 750.0f);
+    if (r.stage == 0 && r.ready > 0 && sees && dist > 900.0f && dist < 4500.0f && now >= r.nextCall && owns(bino) && BotWeaponRounds(base, record, bino) > 0 && !matesThere)
     {
         memset(r.back, 0, sizeof(r.back));
         const char* back = owns(sten) ? "sten" : owns(bren) ? "bren" : "";
@@ -7022,6 +7384,7 @@ static void BotRusher2(PPCContext& ctx, uint8_t* base, uint32_t slot, BotOrders&
             r.stage = 0; r.nextSwitch = now + 3000;
         };
         if (sees && dist < 600.0f) { backToGun("someone close"); return; }
+        if (r.stage <= 3 && matesThere) { backToGun("a teammate near the spot"); return; }
         orders.forward = orders.right = 0;
         orders.buttons &= ~(SprintButton | 0x1u | GrenadeButton);
         orders.wantsFire = false;
@@ -10246,7 +10609,8 @@ static void FeedBots(PPCContext& ctx, uint8_t* base)
                 const uint32_t sent = orders.buttons;
                 const uint32_t tick = GetTickCount();
                 if ((g_throwFrames[slot] || (sent & 0x2u)) && tick >= traceUntil[slot] + 3000 && traces < 24) { traceUntil[slot] = tick + 1200; traces++; }
-                if (tick < traceUntil[slot])
+                static int traceLines = 0;
+                if (tick < traceUntil[slot] && BotDiagLine(traceLines, 400))
                 {
                     printf("bots: throw trace slot %u: buttons %08X weapon word %08X | +160:", slot, sent, Guest::Read32(base, command + 8));
                     for (uint32_t w = 160; w < 216; w += 4) printf(" %08X", Guest::Read32(base, record + w));
@@ -10429,9 +10793,12 @@ static void FeedBots(PPCContext& ctx, uint8_t* base)
         }
     }
     // Where each bot is, every two seconds, for watching it.
+    // 0.5.853: every second for the first 120 dumps of a run, then every 15 s
     static uint32_t last = 0;
-    if (serverTime - last > 1000)
+    static int dumps = 0;
+    if (serverTime - last > ((BotDiagAll() || dumps < 120) ? 1000u : 15000u))
     {
+        dumps++;
         last = serverTime;
         const uint32_t entities = Guest::Read32(base, EntityList);
         for (uint32_t slot = 0; slot < ActiveSlots() && entities; slot++)
@@ -11178,8 +11545,9 @@ static void SendBotStates(uint8_t* base)
     using namespace BotRoster;
     static uint32_t last = 0;
     const uint32_t now = GetTickCount();
-    if (now - last < 250) return;
+    if (now - last < 250 && !(g_sendStatesNow.load() && now - last >= 30)) return;
     last = now;
+    g_sendStatesNow.store(false);
     if (Session(base) == 0 || !ThisMachineHosts(base) || g_bots <= 0) return;
     uint8_t packet[StateHeader + MaxEntries * StateBytes] = { 'C', '3', 'B', 'S', Version, LocalNumber(base), 0, 0 };
     const uint32_t entities = Guest::Read32(base, EntityList);
@@ -11388,9 +11756,19 @@ static void MirrorHostBots(PPCContext& ctx, uint8_t* base)
                         fflush(stdout);
                     }
                 }
-                else if (!b.alive && aliveHere && g_mirrorKilledLife[b.number] != b.life)
+                else if (!b.alive && g_mirrorKilledLife[b.number] != b.life &&
+                         (aliveHere || Guest::Read32(base, record + 1924) == 3))
                 {
+                    // 0.5.852: the friend's 0.5.851 log: 245 mirror deaths
+                    // ("health 100 -> 0") and not one "dies here": the bot's
+                    // health came to 0 through the game's own updates before
+                    // the host's state did, so this needed "alive here" and
+                    // never ran; and nothing put the bots' deaths in his kill
+                    // feed (13 lines, all you or him). Now the death is played
+                    // here unless the game's routine already ran for him in
+                    // the last 2 s, and the kill feed line is made below.
                     g_mirrorKilledLife[b.number] = b.life;
+                    const bool playedHere = now - g_slotDiedAt[slot] < 2000;
                     uint32_t killer = 0;
                     if (b.killer < SessionMaxNow())
                     {
@@ -11398,20 +11776,60 @@ static void MirrorHostBots(PPCContext& ctx, uint8_t* base)
                         if (ks >= 0 && ks < int32_t(MaxClients)) killer = Guest::Read32(base, entities + 4 * (ks + 1));
                     }
                     if (!killer) killer = entity;   // no known killer: his own
-                    const bool dir = b.dir[0] || b.dir[1] || b.dir[2];
-                    for (int k = 0; k < 3 && dirMemory; k++) { const float f = b.dir[k] / 30000.0f; uint32_t w; memcpy(&w, &f, 4); Guest::Write32(base, dirMemory + 4 * k, w); }
+                    // 0.5.868: THE CARTWHEELS. The routine takes the hit point in r9 and the
+                    // push direction in r10, both pointers. This call gave r9 a vector of
+                    // about +-1 (a point at the world's origin, thousands of units from the
+                    // body) and r10 a small number, so the push was applied far from the
+                    // body and spun it. Now r10 is the host's direction and r9 the body's
+                    // own middle. With no direction from the host: killer to victim, level.
+                    float push[3] = { b.dir[0] / 30000.0f, b.dir[1] / 30000.0f, b.dir[2] / 30000.0f };
+                    const float bodyAt[3] = { F(base, entity + 336), F(base, entity + 340), F(base, entity + 344) + 30.0f };
+                    if (push[0] == 0.0f && push[1] == 0.0f && push[2] == 0.0f)
+                    {
+                        const float dx = bodyAt[0] - F(base, killer + 336), dy = bodyAt[1] - F(base, killer + 340);
+                        const float length = sqrtf(dx * dx + dy * dy);
+                        push[0] = length > 1.0f ? dx / length : 1.0f;
+                        push[1] = length > 1.0f ? dy / length : 0.0f;
+                    }
+                    for (int k = 0; k < 3 && dirMemory; k++) { WriteF(base, dirMemory + 4 * k, push[k]); WriteF(base, dirMemory + 16 + 4 * k, bodyAt[k]); }
                     PPCContext call = ctx;
                     call.r1.u32 = (ctx.r1.u32 - 0x3000) & ~0xFu;
                     call.r3.u32 = entity; call.r4.u32 = killer; call.r5.u32 = killer;
                     call.r6.u32 = uint32_t(int32_t(b.damage)); call.r7.u32 = b.means; call.r8.u32 = b.weapon;
-                    call.r9.u32 = dir && dirMemory ? dirMemory : 0; call.r10.u32 = b.hitLoc;
+                    call.r9.u32 = dirMemory + 16; call.r10.u32 = dirMemory;
                     Guest::Write32(base, call.r1.u32 + 0x54, uint32_t(int32_t(b.timeOffset)));
                     call.lr = 0;
-                    Guest::Lookup(0x82587268)(call, base);
+                    const int32_t healthBefore = int32_t(Guest::Read32(base, record + 304));
+                    if (!playedHere && dirMemory) Guest::Lookup(0x82587268)(call, base);
+                    // The kill feed line, the way the game makes it after a
+                    // death with no session (sub_823FD118): the obituary
+                    // callback *(0x82BCBF64)+3300 with the victim's, the
+                    // inflictor's and the killer's handles (+484), weapon,
+                    // means and the victim's +776.
+                    bool fed = false;
+                    {
+                        static uint32_t obit = 0;
+                        if (!obit) { obit = Guest::AllocatePhysical(16); if (obit) memset(base + obit, 0, 16); }
+                        const uint32_t table = Guest::Read32(base, 0x82BCBF64u);
+                        const uint32_t feed = table ? Guest::Read32(base, table + 3300) : 0;
+                        if (obit && feed >= 0x82000000u && feed < 0x83000000u)
+                        {
+                            Guest::Write32(base, obit, Guest::Read32(base, entity + 484));
+                            Guest::Write32(base, obit + 4, Guest::Read32(base, killer + 484));
+                            PPCContext f = ctx;
+                            f.r1.u32 = (ctx.r1.u32 - 0x3000) & ~0xFu;
+                            f.r3.u32 = obit; f.r4.u32 = obit + 4; f.r5.u32 = obit + 4;
+                            f.r6.u32 = b.weapon; f.r7.u32 = b.means; f.r8.u32 = Guest::Read32(base, entity + 776);
+                            f.lr = 0;
+                            Guest::Lookup(feed)(f, base);
+                            fed = true;
+                        }
+                    }
                     if ((told < 300 && told++ < 300))
                     {
-                        printf("bots: mirror number %u (slot %d) dies here as on the host (life %u, killer number %u, means %u, weapon %u): health %d, state %d\n",
-                               b.number, slot, b.life, b.killer, b.means, b.weapon, int32_t(Guest::Read32(base, record + 304)), int32_t(Guest::Read32(base, record + 1924)));
+                        printf("bots: mirror number %u (slot %d) dies here as on the host (life %u, killer number %u, means %u, weapon %u): health %d -> %d, state %d%s%s\n",
+                               b.number, slot, b.life, b.killer, b.means, b.weapon, healthBefore, int32_t(Guest::Read32(base, record + 304)), int32_t(Guest::Read32(base, record + 1924)),
+                               playedHere ? " (the game's death already ran here)" : "", fed ? ", kill feed line made" : ", NO kill feed callback");
                         fflush(stdout);
                     }
                 }
@@ -13046,7 +13464,8 @@ PPC_FUNC(sub_824B4270)
         if (entity && Guest::Read32(base, entity + 512) == record) bot = true;
     }
     static uint32_t count = 0;
-    const bool say = bot && count++ % 60 == 0;
+    static int pmoveLines = 0;
+    const bool say = bot && count++ % 60 == 0 && BotDiagLine(pmoveLines, 120);
     if (say)
     {
         printf("bots: Pmove for a bot (%u): flags %08X, type %d, +2048 %d, forward %d right %d, buttons %X, time %d, last %d, ground %d, +36..+60:",
@@ -13090,7 +13509,8 @@ PPC_FUNC(sub_8256B8E0)
         const float originZ = ReadFloat(base, entity + 344), muzzleZ = ReadFloat(base, out + 8);
         const uint32_t record = Guest::Read32(base, entity + 512);
         static uint32_t said = 0;
-        if (said++ % 40 == 0)
+        static int muzzleLines = 0;
+        if (said++ % 40 == 0 && BotDiagLine(muzzleLines, 120))
         {
             printf("bots: slot %u muzzle %.1f above his origin (eye height %.1f)\n", slot, muzzleZ - originZ,
                    record ? ReadFloat(base, record + 220) : -1.0f);
@@ -13673,9 +14093,27 @@ PPC_FUNC(sub_82433440)
 extern "C" PPC_FUNC(__imp__sub_8243E2B8);
 PPC_FUNC(sub_8243E2B8)
 {
-    // 0.5.369: the loop check only while the killcam plays (loops only ever
-    // came from the replay's double adds, now refused at the add)
-    if (!Killcam::Replaying()) { __imp__sub_8243E2B8(ctx, base); return; }
+    // 0.5.369: the full check only while the killcam plays. 0.5.868: 867's log
+    // froze here with no killcam (the main thread in this list's walk for ever),
+    // so outside the replay a two-speed walk (no memory, one pass) looks for a
+    // loop every frame; only a loop found goes on to the check below, which cuts it.
+    if (!Killcam::Replaying())
+    {
+        const auto step = [&](uint32_t n) -> uint32_t {
+            if (!n || n == 0x825FFB78u || n < 0x40000000u || n >= 0xC0000000u) return 0;
+            return Guest::Read32(base, n);
+        };
+        uint32_t slow = Guest::Read32(base, 0x825FFB74u), fast = slow;
+        bool loops = false;
+        for (int k = 0; k < 20000 && !loops; k++)
+        {
+            slow = step(slow);
+            fast = step(step(fast));
+            if (!fast || !slow) break;
+            loops = slow == fast && slow != 0x825FFB78u;
+        }
+        if (!loops) { __imp__sub_8243E2B8(ctx, base); return; }
+    }
     static std::vector<uint32_t> seen;
     seen.clear();
     uint32_t prev = 0, node = Guest::Read32(base, 0x825FFB74u);
@@ -13827,6 +14265,7 @@ PPC_FUNC(sub_823A3690)
     }
     __imp__sub_823A3690(ctx, base);
 }
+float g_localViewFov = 0.0f;   // 0.5.852: this machine's view's field of view, as drawn (camera +96)
 PPC_FUNC(sub_82463150)
 {
     const uint32_t camera=ctx.r3.u32;
@@ -13835,6 +14274,7 @@ PPC_FUNC(sub_82463150)
     // 0.5.703: the view as drawn, for the flames drawn in the world (flamethrower.cpp):
     // the local view block's origin (+4960) and axes (+4976: forward, left, up),
     // just made from its angles above, and the camera's fov
+    if (camera && Guest::Read32(base,camera+480)==0) g_localViewFov=ReadFloat(base,camera+96);   // 0.5.852: the Mosin's scope (mp_fixes)
     if (camera && Guest::Read32(base,camera+480)==0)
     {
         const uint32_t view=0x82C7D490u;
@@ -13902,7 +14342,8 @@ PPC_FUNC(sub_8251ED08)
     {
         ++calls[slot];
         const uint32_t now=GetTickCount();
-        if (calls[slot]==1 || now-logged[slot]>=2000)
+        static int modelLines=0;   // 0.5.853: (each of the two) capped
+        if ((calls[slot]==1 || now-logged[slot]>=2000) && BotDiagLine(modelLines,150))
         {
             logged[slot]=now;
             const uint32_t extra=Guest::Read32(base,entity+524);
@@ -13927,7 +14368,8 @@ PPC_FUNC(sub_8251E5F0)
     {
         ++calls[slot];
         const uint32_t now=GetTickCount();
-        if (calls[slot]==1 || now-logged[slot]>=2000)
+        static int modelLines=0;   // 0.5.853: (each of the two) capped
+        if ((calls[slot]==1 || now-logged[slot]>=2000) && BotDiagLine(modelLines,150))
         {
             logged[slot]=now;
             printf("bots: animated model update slot %u calls %u model %u mode %d pose %08X\n",
@@ -14495,7 +14937,8 @@ PPC_FUNC(sub_82404580)
             Guest::Write32(base,at,clocksBefore[i]);
         }
         static uint32_t lastNetworkReport[MaxClients]={};
-        if(GetTickCount()-lastNetworkReport[slot]>=5000) {
+        static int replicationLines=0;   // 0.5.853: capped
+        if(GetTickCount()-lastNetworkReport[slot]>=5000 && BotDiagLine(replicationLines,150)) {
             lastNetworkReport[slot]=GetTickCount();
             printf("bots: replication slot %u built %u sends %u clocks %u %u %u\n",slot,
                 g_botPacketsBuilt[slot],g_botPacketsSent[slot],networkClock.sent[0],networkClock.sent[1],networkClock.sent[2]);fflush(stdout);
@@ -14760,15 +15203,24 @@ extern "C" PPC_FUNC(__imp__sub_82587268);
 PPC_FUNC(sub_82587268)
 {
     const uint32_t victim=ctx.r3.u32,slot=BotSlot(base,victim);
+    {   // 0.5.852: any slot (a joiner's mirrors are not g_bot there), for the mirror deaths
+        const uint32_t list=Guest::Read32(base,EntityList);
+        for(uint32_t s=0;list && s<ActiveSlots() && s<MaxClients;s++)
+            if(Guest::Read32(base,list+4*(s+1))==victim){g_slotDiedAt[s]=GetTickCount();break;}
+    }
     if(slot>=FirstBotSlot() && slot<MaxClients && g_bot[slot]) {
+        g_sendStatesNow.store(true);   // 0.5.852: tell the joiners now
         // 0.5.207: the death as the routine was given it (self, inflictor,
         // attacker, damage, means, weapon, direction, hit location; the
         // time offset is its ninth, on the stack at +0x54), for the joiners.
         BotDeathInfo& d=g_botDeath[slot];
         d.inflictor=ctx.r4.u32;d.attacker=ctx.r5.u32;d.damage=int32_t(ctx.r6.u32);d.means=int32_t(ctx.r7.u32);
-        d.weapon=int32_t(ctx.r8.u32);d.hitLoc=int32_t(ctx.r10.u32);d.timeOffset=int32_t(Guest::Read32(base,ctx.r1.u32+0x54));
-        d.haveDir=ctx.r9.u32>=0x40000000u && ctx.r9.u32<0xA0000000u;
-        for(int k=0;k<3;k++)d.dir[k]=d.haveDir?ReadFloat(base,ctx.r9.u32+4*k):0.0f;
+        // 0.5.868: r9 is the hit POINT and r10 the push DIRECTION, both pointers
+        // (the two callers build them on the stack; sub_82584188 reads r10's as the
+        // direction). 0.5.207 took r9 for the direction and r10 for a hit location.
+        d.weapon=int32_t(ctx.r8.u32);d.hitLoc=0;d.timeOffset=int32_t(Guest::Read32(base,ctx.r1.u32+0x54));
+        d.haveDir=ctx.r10.u32>=0x40000000u && ctx.r10.u32<0xA0000000u;
+        for(int k=0;k<3;k++)d.dir[k]=d.haveDir?ReadFloat(base,ctx.r10.u32+4*k):0.0f;
         const uint32_t ps=Guest::Read32(base,victim+512);
         if(ps) {
             const uint32_t first=Guest::Read8(base,ps+1065),second=Guest::Read8(base,ps+1066);

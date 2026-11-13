@@ -35,6 +35,8 @@
 // drawn by sub_824D7E60 (the campaign's exact twin).
 
 #include "menu_mouse.h"
+#include "DividerFilter.h"
+namespace MenuMouse { bool RemasteredBackdrop(); }
 #include "input.h"
 #include "kernel.h"
 #include "window.h"
@@ -140,7 +142,8 @@ namespace
         if (cw < 2.0f || ch < 2.0f) return false;
         const float aspect = 16.0f / 9.0f;
         float w = cw, h = cw / aspect;
-        if (h > ch) { h = ch; w = h * aspect; }
+        if (MenuMouse::RemasteredBackdrop()) { auto cover=JarcMenu::Cover(cw,ch); w=cover.width; h=cover.height; }
+        else if (h > ch) { h = ch; w = h * aspect; }
         const float x0 = std::floor((cw - w) * 0.5f), y0 = std::floor((ch - h) * 0.5f);
         const float u = (float(p.x) + 0.5f - x0) / std::floor(w), v = (float(p.y) + 0.5f - y0) / std::floor(h);
         if (u < 0.0f || u > 1.0f || v < 0.0f || v > 1.0f) return false;
@@ -1038,7 +1041,24 @@ PPC_FUNC(sub_824D5FC0)
 #else
 PPC_FUNC(sub_824BFDD8)
 {
-    NoteDrawn(ctx.r3.u32);
+    const uint32_t quad = ctx.r3.u32;
+    static const bool keepDivider = [] { const char* p=getenv("COD3_KEEP_MENU_DIVIDER"); return p && p[0]=='1'; }();
+    if (!keepDivider && Valid(quad) && quad <= 0x9FFFFF90u) {
+        JarcMenu::Vertex vertices[4];
+        for (uint32_t k=0;k<4;k++) {
+            vertices[k]={ReadFloat(base,quad+16+20*k),ReadFloat(base,quad+20+20*k),Guest::Read32(base,quad+32+20*k)};
+        }
+        static uint32_t tracedQuads[64]={}; static unsigned traced=0; bool alreadyTraced=false; for(unsigned i=0;i<traced;i++)alreadyTraced=alreadyTraced||tracedQuads[i]==quad;
+        if (getenv("COD3_DIVIDER_TRACE") && traced<64 && !alreadyTraced) {
+            printf("divider probe: menu %08X quad %08X xy %.2f,%.2f %.2f,%.2f %.2f,%.2f %.2f,%.2f colors %08X %08X %08X %08X\n",g_menuVtable.load(),quad,vertices[0].x,vertices[0].y,vertices[1].x,vertices[1].y,vertices[2].x,vertices[2].y,vertices[3].x,vertices[3].y,vertices[0].color,vertices[1].color,vertices[2].color,vertices[3].color);fflush(stdout);tracedQuads[traced++]=quad;
+        }
+        if (JarcMenu::IsMainDivider(g_menuVtable.load(),vertices)) {
+            static bool reported=false;
+            if(!reported){printf("menu: JARC main-menu gold divider suppressed\n");fflush(stdout);reported=true;}
+            return;
+        }
+    }
+    NoteDrawn(quad);
     __imp__sub_824BFDD8(ctx, base);
 }
 
@@ -1694,3 +1714,5 @@ void SystemUpdate(PPCContext& ctx, uint8_t* base)
     }
 }
 }
+
+namespace MenuMouse { bool RemasteredBackdrop() { return MenuUp() && JarcMenu::IsMenuClass(g_menuVtable.load()); } }

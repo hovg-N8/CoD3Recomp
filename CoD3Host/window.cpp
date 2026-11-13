@@ -320,6 +320,10 @@ namespace
                 static int appliedWidth = 0, appliedHeight = 0;
                 int width, height;
                 Settings::Resolution(settings, width, height);
+                // (0.5.936) a window put somewhere by COD3_WINDOW_RECT (the co-op tests, side by side) keeps its place:
+                // the settings' resolution applied on the first pass centred it over the whole screen (t935c)
+                static bool rectGiven = getenv("COD3_WINDOW_RECT") != nullptr;
+                if (rectGiven) { rectGiven = false; appliedWidth = width; appliedHeight = height; }
                 if (!borderless && (width != appliedWidth || height != appliedHeight))
                 {
                     appliedWidth = width;

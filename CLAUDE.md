@@ -19,11 +19,13 @@ pools that ran empty, guard hits, CTF bot actions, and the most common trouble l
 Never cat or broadly grep the whole log into context; use `grep -c`, `sed -n 'A,Bp'`, `cut -c1-200`.
 
 ## Build and test loop
-1. New `## 0.5.N:` entry at the top of `docs/PATCH-NOTES.md`.
+1. New `## 0.6.N:` entry at the top of `docs/PATCH-NOTES.md` (one higher than the newest).
+   Versions roll over: the last number stops at 999, then the middle one goes up
+   (0.5.999 -> 0.6.0, 0.6.999 -> 0.7.0). Never write 0.x.1000.
 2. Write `build-request.txt` in the source root (no test-request unless asked; don't run .bat files).
-3. Wait for `build-status.txt` to match `^(built|failed): 0\.5\.N` (run the wait in the background).
+3. Wait for `build-status.txt` to match `^(built|failed): 0\.6\.N` (run the wait in the background).
 4. ON HOLD since 2026-10-25 (user: solo tests for now, friend later): skip the zip unless asked.
-   Make the friend zip (`D:\Call of Duty 3 (USA, Europe)\CoD3MP-update-0.5.N.zip`):
+   Make the friend zip (`D:\Call of Duty 3 (USA, Europe)\CoD3MP-update-0.6.N.zip`):
    `powershell -NoProfile -ExecutionPolicy Bypass -File "D:\Call of Duty 3 (USA, Europe)\CoD3-PC-Port-0.4.0\MAKE-FRIEND-UPDATE.ps1"`.
    Finish by stating the version and zip path.
 5. The user and their friend play, then say "check the log".

@@ -1,0 +1,10 @@
+bin/
+player/*.exe
+release-candidate/
+publisher-state/
+private-key.xml
+.wrangler/
+*.log
+*.exe
+*.dll
+GAME-FOLDER.txt

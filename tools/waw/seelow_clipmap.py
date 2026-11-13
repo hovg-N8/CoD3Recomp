@@ -85,6 +85,20 @@ PIPE_ROOF = ((855.0, 1142.0, 6146.0, 6210.0, -56.0, -48.0),)
 # a bot unstuck at 3344 2834 (2026-11-03).
 # (z bottom too: only faces above the tunnel's roof, its own walls below stay)
 KERBS = ((3320.0, 3370.0, 2770.0, 2870.0, -205.0, -165.0),)
+# The railway's rails (metal, surface 0xD00000): four upright 4-unit steel strips on a flat gravel
+# bed (z 18) the user "get[s] caught up a lot ... trying to cross the tracks" on, at the top of the
+# hill by the middle War flag (2026-11-07, 2624 2090 7). (x0, x1, y0, y1, z0, z1): the rails'
+# UPRIGHT metal faces wholly inside are left out (their tops and every floor stay: the bed between
+# the rails is metal too in places, and taking all metal out opened gaps there), and no rail gets a
+# backstop slab (a solid 2-unit edge): a one-sided top is passed from the side, so the feet no longer
+# meet an edge. 2100-4400 1960-2100: the double track over the hilltop (rails at z 5-9 west of x
+# 2840, 18-22 east of it); -1110..-60 2500-2640: its western stretch.
+RAILS = ((2100.0, 4400.0, 1960.0, 2100.0, 0.0, 27.0), (-1110.0, -60.0, 2500.0, 2640.0, 12.0, 30.0))
+
+
+def in_rails(materials, m, tri):
+    return materials[m][1] & 0x1F00000 == 0xD00000 and \
+        any(all(k[0] <= q[0] <= k[1] and k[2] <= q[1] <= k[3] and k[4] <= q[2] <= k[5] for q in tri) for k in RAILS)
 # Blasted holes in walls whose jagged edge and sill pieces (detail brushes, 0x8000001) leave a
 # crouching player a band too narrow to find: those pieces out, the wall round the hole kept
 # (its top strips reach above z1). (x0, x1, y0, y1, z0, z1): a brush wholly inside is left out.
@@ -191,6 +205,13 @@ def read(z):
             terrain[t] = None
             kerbs += 1
     terrain = [t for t in terrain if t is not None]
+    rails = 0
+    for t, (m, front, tri) in enumerate(terrain):
+        ln = math.sqrt(sum(x * x for x in front)) or 1.0
+        if abs(front[2]) / ln < 0.3 and in_rails(materials, m, tri):
+            terrain[t] = None
+            rails += 1
+    terrain = [t for t in terrain if t is not None]
 
     cmodels_at = aabb_at + 32 * AABB_COUNT
     cmodels = [struct.unpack_from("<6f", z, cmodels_at + 72 * i) for i in range(CMODEL_COUNT)]
@@ -202,6 +223,7 @@ def read(z):
     report["terrain floors made solid (shot-only material)"] = floors_solid
     report["terrain triangles left out: the drain pipe's end rings"] = caps
     report["terrain triangles left out: buried walls' edges (KERBS)"] = kerbs
+    report["terrain triangles left out: the railway's rails' upright faces (RAILS)"] = rails
     contents_mat = {}
     for r in raw:
         lo, cont, hi, n, ptr, axial = r[0:3], cod3_contents(r[3]), r[4:7], r[7], r[8], r[9:15]
@@ -437,6 +459,8 @@ def model_collision(z, materials, report):
                             + (hi[0] - lo[0]) * (hi[2] - lo[2]))
             fill = area / box_area if box_area else 1.0
             out.append((r[9], r[10], lo, hi, planes, exact, tris, fill))
+        if name in TREES:
+            out = trunk(name, out, report)
         hulls[name] = out
     # the non-convex hulls as meshes, worst-filled first, within MESH_BUDGET triangles
     # placed (each .cgb holds ~21800 mesh triangles, the ground ~10000 of them).
@@ -493,15 +517,110 @@ def model_collision(z, materials, report):
     return brushes, terrain
 
 
+# 2026-11-07 (0.5.852): the user, stuck by a maple at 2909 2592 (between its collision, a 51 x 54
+# block and three meshes of its root flare, and a stone wall 25-30 east: a player is 30 wide):
+# "it just needs to be a little smoother by this tree". The trees' collision becomes one upright
+# box: the trunk's own width where its collision triangles cross chest height (40-80 over its base),
+# from its base to 200 up (the forks and canopy above were never solid to a walker).
+# (Not in use: the user then found it was the hill, not the tree: "im like in the ground frozen".
+# Names to turn it on: "foliage_cod5_tree_maple_01_large", "foliage_cod5_tree_pine_01_large".)
+TREES = ()
+
+
+def trunk(name, hulls, report):
+    solid = [h for h in hulls if h[0] & 1]
+    tris = [c for h in solid for _n, c in h[6]]
+    if not solid or not tris:
+        return hulls
+    base = min(h[2][2] for h in solid)
+    xs, ys = [], []
+    for h_up in (40.0, 60.0, 80.0):
+        level = base + h_up
+        for c in tris:
+            for p, q in ((c[0], c[1]), (c[1], c[2]), (c[2], c[0])):
+                if (p[2] - level) * (q[2] - level) < 0:
+                    t = (level - p[2]) / (q[2] - p[2])
+                    xs.append(p[0] + (q[0] - p[0]) * t)
+                    ys.append(p[1] + (q[1] - p[1]) * t)
+    if len(xs) < 3:
+        return hulls
+    lo = [min(xs), min(ys), base]
+    hi = [max(xs), max(ys), min(base + 200.0, max(h[3][2] for h in solid))]
+    planes = []
+    for a in range(3):
+        n = [0.0, 0.0, 0.0]
+        n[a] = 1.0
+        planes.append((*n, hi[a]))
+        n = [0.0, 0.0, 0.0]
+        n[a] = -1.0
+        planes.append((*n, -lo[a]))
+    was = [max(h[3][a] for h in solid) - min(h[2][a] for h in solid) for a in range(2)]
+    report[f"trees: {name} as its trunk: {hi[0] - lo[0]:.0f} x {hi[1] - lo[1]:.0f} (was {was[0]:.0f} x {was[1]:.0f}, {len(solid)} pieces)"] += 1
+    return [(solid[0][0], solid[0][1], lo, hi, planes, True, [], 1.0)]
+
+
+def backstops(materials, terrain, report):
+    """2026-11-07 (0.5.852): a solid slab under each world ground triangle. The user fell
+    under the map three times on Seelow (2959 2624 -135, 2856 1537 -225, 1643 1722 -265)
+    while walking on whole, rightly wound ground (one mesh under each path, no gap on a
+    2-unit grid, boxes holding their points): CoD3's one-sided mesh triangles let a player
+    who starts a step a little under one (crossing from one big WaW triangle to the next)
+    drop through, and nothing solid lay under them till the -352 floor. Each ground
+    triangle (front n.z > 0.3, area over SEELOW_BACKSTOP_AREA) gets a brush under it:
+    its own plane BACKSTOP_GAP under the surface on top, BACKSTOP_THICK thick, sides
+    upright through its edges: never above the ground, so walking is as before. The
+    props' own hulls (houses, cars) get none (their roofs would hang slabs in rooms)."""
+    # 0 (was 2): the user then stood frozen "in the ground" on the same hill (2950 2606, 0.6 under
+    # the mesh): sunk into the one-sided ground and held there by the slab 2 under it. With the slab's
+    # top ON the ground the player stands on a brush and never gets into the mesh.
+    gap = float(os.environ.get("SEELOW_BACKSTOP_GAP", "0"))
+    thick = float(os.environ.get("SEELOW_BACKSTOP_THICK", "16"))
+    min_area = float(os.environ.get("SEELOW_BACKSTOP_AREA", "300"))
+    out = []
+    for m, front, tri in terrain:
+        if not cod2collision.collides(materials[m][2]):
+            continue
+        ln = math.sqrt(sum(x * x for x in front)) or 1.0
+        n = [x / ln for x in front]
+        if n[2] <= 0.3 or ln / 2 < min_area:   # |front| = twice the area ((b-a)x(c-a))
+            continue
+        if in_rails(materials, m, tri):   # (a rail's top: a slab under it would be a solid edge)
+            continue
+        a, b, c = tri
+        d_top = sum(n[k] * a[k] for k in range(3)) - gap
+        planes = [(n[0], n[1], n[2], d_top), (-n[0], -n[1], -n[2], -(d_top - thick))]
+        ok = True
+        for p, q, r in ((a, b, c), (b, c, a), (c, a, b)):
+            ex, ey = q[0] - p[0], q[1] - p[1]
+            el = math.hypot(ex, ey)
+            if el < 1e-3:
+                ok = False
+                break
+            nx, ny = ey / el, -ex / el
+            if nx * (r[0] - p[0]) + ny * (r[1] - p[1]) > 0:
+                nx, ny = -nx, -ny
+            planes.append((nx, ny, 0.0, nx * p[0] + ny * p[1]))
+        if not ok:
+            continue
+        corners = [[v[k] - n[k] * s for k in range(3)] for v in tri for s in (gap, gap + thick)]
+        lo = [min(v[k] for v in corners) for k in range(3)]
+        hi = [max(v[k] for v in corners) for k in range(3)]
+        out.append((m, [m], [lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]], planes))
+    report["brushes added: slabs under the world's ground triangles (backstops)"] = len(out)
+    return out
+
+
 def main():
     zone, template, prefix = sys.argv[1:4]
     zones = int(sys.argv[4]) if len(sys.argv) > 4 else 4
     z = open(zone, "rb").read()
     materials, terrain, brushes, world, report = read(z)
+    slabs = backstops(materials, terrain, report) if os.environ.get("SEELOW_BACKSTOP", "1") == "1" else []
     if os.environ.get("SEELOW_MODEL_COLLISION", "1") == "1":
         model_brushes, model_tris = model_collision(z, materials, report)
     if os.environ.get("SEELOW_SMALL_CLIP", "0") != "1":
         brushes = drop_small_clip(brushes, materials, terrain, report)
+    brushes = brushes + slabs
     if os.environ.get("SEELOW_MODEL_COLLISION", "1") == "1":
         brushes, terrain = brushes + model_brushes, terrain + model_tris
     boxes, brushes3 = cod2collision.convert_brushes(materials, brushes, report)

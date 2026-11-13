@@ -32,7 +32,7 @@ CRASH_NOISE = re.compile(r"0x406D1388|0x4001000[6A]")
 TROUBLE = re.compile(r"\b(failed|error|refused|overflow|stuck|timed out|skipped)\b", re.I)
 # Routine once-a-second status lines that merely contain "failed"/"refused"/"skipped" counters.
 TROUBLE_NOISE = re.compile(r"^(bots: native error (enqueue|drain)|bots: Pmove|hitch:|audio:|render:|xma:|\s+skipped:)")
-WATCH = ("heapwait:", "fxguard:", "killcam guard:", "flagwatch: ", "ctf sides", "TAKEN by", "has the flag", "SLIDES", "scriptvars", "a hop toward", "the title reads the depth", "prompts: the button icon font")
+WATCH = ("heapwait:", "heapguard:", "fxguard:", "killcam guard:", "flagwatch: ", "ctf sides", "TAKEN by", "has the flag", "SLIDES", "scriptvars", "a hop toward", "the title reads the depth", "prompts: the button icon font")
 
 
 def pct(values, p):

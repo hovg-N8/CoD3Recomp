@@ -100,6 +100,11 @@ if (Test-Path $Notes) {
 if (-not $Version) {
     $Parts = $Current.Split('.')
     $Parts[$Parts.Count - 1] = [string]([int]$Parts[$Parts.Count - 1] + 1)
+    # The last number stops at 999: after 0.5.999 comes 0.6.0.
+    if ([int]$Parts[$Parts.Count - 1] -gt 999) {
+        $Parts[$Parts.Count - 1] = '0'
+        $Parts[$Parts.Count - 2] = [string]([int]$Parts[$Parts.Count - 2] + 1)
+    }
     $Version = $Parts -join '.'
 }
 Set-Content -Path (Join-Path $Root 'CoD3Host\version_number.h') -Value "#define COD3_VERSION `"$Version`"" -Encoding ASCII

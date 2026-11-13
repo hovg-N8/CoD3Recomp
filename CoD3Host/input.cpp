@@ -430,6 +430,7 @@ namespace
         return 0;
     }
 
+    std::atomic<bool> g_holdAim{ false };   // 0.5.853: Input::HoldAim
     // 0.5.231: Input::PressButton's press, from the game's thread.
     std::atomic<uint16_t> g_pressButtons{ 0 };
     std::atomic<int> g_pressReads{ 0 };
@@ -457,6 +458,12 @@ namespace
                     if (rest.compare(0, 3, "lt/") == 0 || rest.compare(0, 3, "rt/") == 0)
                     {
                         g_holds.push_back({ press.at, press.at + atof(rest.c_str() + 3), rest[0] == 'l' ? 0 : 1, 1.0f });
+                        continue;
+                    }
+                    // (0.5.875) A button held: "40:x/4" holds X for four seconds (co-op's revive).
+                    if (const size_t slash = rest.find('/'); slash != std::string::npos && ButtonNamed(rest.substr(0, slash)))
+                    {
+                        g_holds.push_back({ press.at, press.at + atof(rest.c_str() + slash + 1), 0x10000 | int(ButtonNamed(rest.substr(0, slash))), 1.0f });
                         continue;
                     }
                     // A stick: "rx+/3" holds the right stick fully right for
@@ -515,6 +522,7 @@ namespace
         for (const ScriptedHold& hold : g_holds)
         {
             if (seconds < hold.at || seconds >= hold.until) continue;
+            if (hold.control & 0x10000) { pad.buttons |= uint16_t(hold.control & 0xFFFF); continue; }
             const int16_t stick = int16_t(std::clamp(hold.amount, -1.0f, 1.0f) * 32767.0f);
             switch (hold.control)
             {
@@ -917,6 +925,12 @@ namespace
     std::atomic<bool> g_mortarPassFire{false};   // 0.5.300
     bool g_mortarFireWas = false;
     std::atomic<int> g_crouchTap{0};   // 0.5.307: reads left of a crouch tap
+    std::atomic<long long> g_weaponTapUntil{0};   // 0.5.948: a weapon-cycle tap held till then (steady ns)
+    std::atomic<long long> g_holdUntil{0};   // 0.5.972: Input::HoldButtons, held till then (steady ns)
+    std::atomic<uint32_t> g_holdMask{0};
+    // 0.5.979: Input::SetLook / PullTriggers (tests steering the view like a player)
+    std::atomic<long long> g_testLookUntil{0}; std::atomic<int> g_testLookX{0}, g_testLookY{0};
+    std::atomic<long long> g_leftUntil{0}, g_rightUntil{0};
     std::mutex g_mutex;
     Input::Pad g_pad{};
     uint32_t g_packet = 1;
@@ -965,6 +979,7 @@ namespace
         uint16_t fromPad = 0;
         pad.buttons |= fromScript;
         ScriptedHolds(pad);
+        if (g_holdAim.load()) pad.leftTrigger = 255;   // 0.5.853: Input::HoldAim (tests)
         // COD3_NOPAD=1 ignores a physical pad the same way, for the same
         // reason: one lying on the desk with a button pressed walked the
         // title's menus in place of the script.
@@ -1146,6 +1161,12 @@ namespace
         if (g_dualHeld.load()) { pad.leftTrigger = 0; if (g_dualNoFire.load()) pad.rightTrigger = 0; }
         // 0.5.307: a crouch tap asked for by the mortar (down at it, up after).
         if (g_crouchTap.load() > 0) { pad.buttons |= PadB; g_crouchTap.fetch_sub(1); }
+        // 0.5.948: a tap of the weapon cycle (Y) asked for by co-op (a gun given, none held)
+        if (now.time_since_epoch().count() < g_weaponTapUntil.load()) pad.buttons |= PadY;
+        if (now.time_since_epoch().count() < g_holdUntil.load()) pad.buttons |= uint16_t(g_holdMask.load());
+        if (now.time_since_epoch().count() < g_testLookUntil.load()) { pad.thumbRX = int16_t(g_testLookX.load()); pad.thumbRY = int16_t(g_testLookY.load()); }
+        if (now.time_since_epoch().count() < g_leftUntil.load()) pad.leftTrigger = 255;
+        if (now.time_since_epoch().count() < g_rightUntil.load()) pad.rightTrigger = 255;
 
         if (!Same(pad, g_pad))
         {
@@ -1217,6 +1238,10 @@ void Input::SetDualPistols(bool held, bool noFire) { g_dualHeld.store(held); g_d
 void Input::SetMortar(bool on) { g_mortar.store(on); if (!on) { g_mortarFires.store(0); g_mortarPassFire.store(false); } }
 void Input::SetMortarPassFire(bool pass) { g_mortarPassFire.store(pass); }
 void Input::PressCrouch() { g_crouchTap.store(3); }
+void Input::SetLook(float rx, float ry, int ms) { g_testLookX.store(int(std::clamp(rx, -1.0f, 1.0f) * 32767.0f)); g_testLookY.store(int(std::clamp(ry, -1.0f, 1.0f) * 32767.0f)); g_testLookUntil.store((std::chrono::steady_clock::now() + std::chrono::milliseconds(ms)).time_since_epoch().count()); }
+void Input::PullTriggers(int leftMs, int rightMs) { const auto n = std::chrono::steady_clock::now(); if (leftMs > 0) g_leftUntil.store((n + std::chrono::milliseconds(leftMs)).time_since_epoch().count()); if (rightMs > 0) g_rightUntil.store((n + std::chrono::milliseconds(rightMs)).time_since_epoch().count()); }
+void Input::HoldButtons(uint16_t mask, int ms) { g_holdMask.store(mask); g_holdUntil.store((std::chrono::steady_clock::now() + std::chrono::milliseconds(ms)).time_since_epoch().count()); }
+void Input::PressWeaponCycle() { g_weaponTapUntil.store((std::chrono::steady_clock::now() + std::chrono::milliseconds(120)).time_since_epoch().count()); }
 int Input::TakeMortarFires() { Refresh(); return g_mortarFires.exchange(0); }
 bool Input::Running() { Refresh(); return g_sprinting.load(); }
 bool Input::SprintHeld() { Refresh(); return g_sprintHeld.load(); }
@@ -1334,6 +1359,8 @@ void Input::ArmNoclipTap() {g_noclipArmed.store(true);}
 void Input::SetTacticalPointInput(bool active,bool canReturn) {g_tacticalPointActive.store(active);g_tacticalPointCanReturn.store(canReturn);}
 bool Input::TacticalPointSaveHeld() {Refresh();return g_tacticalPointSaveHeld.load();}
 bool Input::TacticalPointReturnHeld() {Refresh();return g_tacticalPointReturnHeld.load();}
+
+void Input::HoldAim(bool held) { g_holdAim.store(held); }
 
 void Input::PressButton(const char* name)
 {

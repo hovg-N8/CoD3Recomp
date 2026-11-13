@@ -15,6 +15,7 @@
 
 #include "coop.h"
 #include "overlay.h"
+#include "input.h"
 
 #include <algorithm>
 #include <cmath>
@@ -30,7 +31,8 @@ namespace Coop
 {
     namespace
     {
-        struct Player { bool down = false; double downAt = -1, bleedUntil = -1, reviveFrom = -1; float revive = 0; uint32_t means = 0; };
+        struct Player { bool down = false; double downAt = -1, bleedUntil = -1, reviveFrom = -1, safeUntil = -1; float revive = 0; uint32_t means = 0; };
+        bool g_allDown = false;       // (0.5.869) everyone is down: back to the checkpoint, done in the frame
         Player g_p[2];
         bool g_injecting = false;     // a hit given on purpose (not dropped on the joining copy)
         // competitive co-op's scores (values ours): 10 a kill, 50 a revive, 25 lost going down;
@@ -39,7 +41,9 @@ namespace Coop
         Score g_score[2];
         std::string g_scoreMap;
         int ScoreOf(const Score& c) { return c.kills * 10 + c.revives * 50 - c.downs * 25; }
-        double Bleedout() { static const double v = [] { const char* t = getenv("COD3_COOP_BLEEDOUT"); return t ? std::clamp(atof(t), 5.0, 300.0) : 30.0; }(); return v; }
+        // (0.5.869, the user's rule) a player brought to nothing is down for 10 s (0.5.875; COD3_COOP_RESPAWN), then comes back
+        // beside the other player with full health; with everyone down, both go back to the checkpoint. (0.5.875) The other player holding Use beside him for 3 s revives him where he lies.
+        double Bleedout() { static const double v = [] { const char* t = getenv("COD3_COOP_RESPAWN"); return t ? std::clamp(atof(t), 1.0, 300.0) : 10.0; }(); return v; }
         float ReviveRadius() { static const float v = [] { const char* t = getenv("COD3_COOP_REVIVERADIUS"); return t ? std::clamp(float(atof(t)), 30.0f, 400.0f) : 80.0f; }(); return v; }
         double ReviveTime() { static const double v = [] { const char* t = getenv("COD3_COOP_REVIVE"); return t ? std::clamp(atof(t), 0.5, 20.0) : 3.0; }(); return v; }
         int Who(const uint8_t* base, uint32_t e) { if (!e) return -1; if (e == Me(base)) return 0; if (e == SecondPlayer()) return 1; return -1; }
@@ -71,9 +75,9 @@ namespace Coop
             g_score[who].downs++;
             // the AI no longer aims at him (WaW's ignoreme): the entity's FL_NOTARGET (+632 bit 2, the notarget cheat's)
             if (const uint32_t e = PlayerEnt(base, who)) Guest::Write32(base, e + 632, Guest::Read32(base, e + 632) | 2u);
-            printf("coop: last stand: %s is down (means %u): %.0f s to be revived\n", who == 0 ? "the host" : "the joining player", means, Bleedout()); fflush(stdout);
-            if (who == 0) Notice("You are down! Your friend can revive you: hold on.", 4000);
-            else Notice("Your friend is down! Go to them and hold Use to revive.", 4000);
+            printf("coop: last stand: %s is down (means %u): back in %.0f s\n", who == 0 ? "the host" : "the joining player", means, Bleedout()); fflush(stdout);
+            if (who == 0) Notice("You are down! Back in a few seconds.", 4000);
+            else Notice("Your friend is down! Stay alive: they are back in a few seconds.", 4000);
             SendState(Now());
             (void)base;
         }
@@ -160,23 +164,16 @@ namespace Coop
         const int who = Who(base, player);
         if (who < 0 || !TwoPlayers(base)) return false;
         if (g_p[who].down) return true;   // (already down: no second death)
-        // what last stand takes: the enemy's doing (WaW: bullets, melee, grenades,
-        // projectiles, explosives, fire); not a fall, a trigger, crushing or suicide
-        bool allowed = means != 25;
-        if (attacker && Valid(attacker) && attacker != player)
-        {
-            const uint8_t t = base[attacker];
-            // (v45o) anything of the enemy's (an actor, a missile, a vehicle of the scripts whatever its type:
-            // Hostage's halftrack is a script_vehicle that is not type 10 here), not the world
-            allowed = allowed && t != 0 && t != 1;
-        }
-        else allowed = false;
-        if (!allowed) { printf("coop: last stand: %s killed by what last stand does not take (means %d, by %s): mission failed\n", who == 0 ? "the host" : "the joining player", means, attacker ? BrocText(base, attacker + 564).c_str() : "the world"); fflush(stdout); return false; }
+        // (0.5.869) whatever killed him (the enemy, a fall, a trigger, his friend): down, and back in 5 s, while
+        // the other player is up. The other down too: everyone is down, back to the checkpoint for both (done in
+        // the frame, by the host's player's own death: the game's mission failed and its checkpoint).
+        (void)attacker;
         const int other = 1 - who;
         if (g_p[other].down)
         {
-            printf("coop: last stand: both players down: mission failed\n"); fflush(stdout);
-            return false;   // (the game's own death: mission failed)
+            printf("coop: last stand: both players down (%s by means %d): back to the checkpoint\n", who == 0 ? "the host" : "the joining player", means); fflush(stdout);
+            g_allDown = true;
+            return true;
         }
         GoDown(base, who, uint32_t(means));
         return true;
@@ -188,9 +185,9 @@ namespace Coop
         if (IsJoin() && kind == R_LASTSTAND && size >= sizeof(State))
         {
             State s; memcpy(&s, data, sizeof s);
-            if (s.down[1] && !g_shown.down[1]) Notice("You are down! Hold on: your friend can revive you.", 4000);
-            if (!s.down[1] && g_shown.down[1]) Notice("You have been revived.", 3000);
-            if (s.down[0] && !g_shown.down[0]) Notice("Your friend is down! Go to them and hold Use to revive.", 4000);
+            if (s.down[1] && !g_shown.down[1]) Notice("You are down! Back in a few seconds.", 4000);
+            if (!s.down[1] && g_shown.down[1]) Notice("You are back in.", 3000);
+            if (s.down[0] && !g_shown.down[0]) Notice("Your friend is down! Stay alive: they are back in a few seconds.", 4000);
             if (!s.down[0] && g_shown.down[0]) Notice("Your friend is back up.", 3000);
             g_shown = s;
         }
@@ -205,12 +202,55 @@ namespace Coop
 
     void LastStandFrame(PPCContext& ctx, uint8_t* base)
     {
+        // (0.5.886) DIAGNOSTIC: the host's player's health as it changes (the entity's +776, +780, the record's +272
+        // and the record's first words), to see how a grenade kills him: t885b, no G_Damage and no die were called
+        if (IsHost())
+        {
+            static int32_t was[3] = { -99999, -99999, -99999 }; static uint32_t wasType = 99, wasW0 = 0; static int told = 0;
+            const uint32_t me = Me(base), rec = Record(base, me);
+            if (me && rec)
+            {
+                const int32_t now[3] = { int32_t(Guest::Read32(base, me + 776)), int32_t(Guest::Read32(base, me + 780)), int32_t(Guest::Read32(base, rec + 272)) };
+                const uint32_t w0 = Guest::Read32(base, rec + 4 * 3), flags = Guest::Read32(base, me + 632);
+                if ((now[0] != was[0] || now[2] != was[2] || base[me] != wasType) && (now[0] <= 0 || now[2] <= 0 || base[me] != wasType) && told < 100)
+                {
+                    told++;
+                    printf("coop: health: the host's entity %d of %d (record %d), type %u, record +12 %08X, +44 %08X, flags %08X, takedamage %u, at %.1f s (level %d ms)\n", now[0], now[1], now[2], base[me], w0, Guest::Read32(base, rec + 44), flags, Guest::Read32(base, me + 624), Now(), int32_t(Guest::Read32(base, Level + 156)));
+                    fflush(stdout);
+                }
+                memcpy(was, now, sizeof was); wasType = base[me]; wasW0 = w0;
+            }
+        }
         // DIAGNOSTIC: the buttons the game keeps in the player's record (+1352), when they change (to find Use)
         {
             static uint32_t was = 0; static int told = 0;
             const uint32_t rec = Record(base, Me(base));
             const uint32_t b = rec ? Guest::Read32(base, rec + 1352) : 0;
             if (b != was && told < 60) { told++; printf("coop: buttons %08X -> %08X at %.1f s in the mission\n", was, b, MissionTime()); fflush(stdout); }
+            // (0.5.882) the record's words that change in the 2.5 s after a button changes (not the ones that change
+            // all the time): to map the weapon's state, the ammunition, on the ground or in the air
+            {
+                static uint32_t prev[556], first[556]; static uint16_t changes[556]; static double until = -1; static uint32_t why = 0; static int reports = 0;
+                if (rec && b != was && until < 0 && reports < 40 && ((b | was) & 0x17u)) { for (int i = 0; i < 556; i++) { prev[i] = first[i] = Guest::Read32(base, rec + 4u * i); changes[i] = 0; } until = Now() + 2.5; why = b ? b : was; }
+                else if (rec && until >= 0)
+                {
+                    for (int i = 0; i < 556; i++) { const uint32_t w = Guest::Read32(base, rec + 4u * i); if (w != prev[i]) { if (changes[i] < 60000) changes[i]++; prev[i] = w; } }
+                    if (Now() >= until)
+                    {
+                        until = -1; reports++;
+                        std::string line; int n = 0;
+                        for (int i = 0; i < 556 && n < 40; i++) if (changes[i] >= 1 && changes[i] <= 8) { char t[64]; snprintf(t, sizeof t, " +%d:%08X>%08X(x%u)", 4 * i, first[i], prev[i], changes[i]); line += t; n++; }
+                        printf("coop: record after buttons %08X:%s\n", why, line.c_str()); fflush(stdout);
+                    }
+                }
+            }
+            // (0.5.883) the weapon's state (+136) as it changes, with the clip (+668) and the weapon's animation (+1280)
+            {
+                static uint32_t wsWas = 0xFFFFFFFFu; static int toldWs = 0;
+                const uint32_t ws = rec ? Guest::Read32(base, rec + 136) : 0;
+                if (rec && ws != wsWas && toldWs < 300) { toldWs++; printf("coop: weapon state %u -> %u (clip %u, weapon animation %03X, buttons %08X, velocity up %.0f)\n", wsWas, ws, Guest::Read32(base, rec + 668), Guest::Read32(base, rec + 1280), b, F(base, rec + 24)); fflush(stdout); }
+                wsWas = ws;
+            }
             was = b;
         }
         if (!IsHost()) return;
@@ -228,8 +268,20 @@ namespace Coop
                 }
             }
         }
+        // (0.5.869) COD3_COOP_TESTDOWN0=t: the host goes down t s into the mission (tests of the respawn; with
+        // COD3_COOP_TESTDOWN at the same time: everyone down)
+        {
+            static uint32_t done = 0;
+            const double t = TestTime("COD3_COOP_TESTDOWN0");
+            if (t >= 0 && done != MissionCount() + 1 && MissionTime() >= t && TwoPlayers(base))
+            {
+                done = MissionCount() + 1; printf("coop: test: the host goes down now\n"); fflush(stdout);
+                if (g_p[1].down) g_allDown = true; else if (!g_p[0].down) GoDown(base, 0, 2);
+            }
+        }
         static double sentAt = 0;
         if (!TwoPlayers(base)) { for (Player& p : g_p) p = Player{}; return; }
+        if (g_allDown) { g_allDown = false; MissionFailed(ctx, base, 0, "everyone is down"); return; }
         bool changed = false;
         DownStance(base, Me(base), g_p[0].down);
         if (const uint32_t two = SecondPlayer()) DownStance(base, two, g_p[1].down);
@@ -240,10 +292,18 @@ namespace Coop
             if (!p.down || !e) continue;
             // kept at 1 while down
             if (int32_t(Guest::Read32(base, e + 776)) < 1) Guest::Write32(base, e + 776, 1);
-            if (now >= p.bleedUntil)
+            if (now >= p.bleedUntil && p.reviveFrom < 0)   // (0.5.875: a revive under way holds the clock)
             {
-                MissionFailed(ctx, base, who, who == 0 ? "the host bled out" : "your friend bled out");
-                return;
+                // (0.5.869) back in beside the other player, whole, and safe for 3 s
+                const int32_t full = int32_t(Guest::Read32(base, e + 780));
+                Guest::Write32(base, e + 776, uint32_t(full > 0 ? full : 100));
+                Guest::Write32(base, e + 632, Guest::Read32(base, e + 632) & ~2u);
+                p = Player{}; p.safeUntil = now + 3.0;
+                HostRespawn(ctx, base, who);
+                printf("coop: last stand: %s is back in beside %s (health %d)\n", who == 0 ? "the host" : "the joining player", who == 0 ? "the joining player" : "the host", full); fflush(stdout);
+                if (who == 0) Notice("You are back in.", 3000); else Notice("Your friend is back in.", 3000);
+                changed = true;
+                continue;
             }
             // the other player holding Use beside him
             const int other = 1 - who;
@@ -265,7 +325,7 @@ namespace Coop
                 {
                     const int32_t full = int32_t(Guest::Read32(base, e + 780));
                     Guest::Write32(base, e + 776, uint32_t(full > 0 ? full : 100));
-                    p = Player{};
+                    p = Player{}; p.safeUntil = now + 3.0;
                     g_score[other].revives++;
                     Guest::Write32(base, e + 632, Guest::Read32(base, e + 632) & ~2u);
                     printf("coop: last stand: %s revived\n", who == 0 ? "the host" : "the joining player"); fflush(stdout);
@@ -291,7 +351,6 @@ namespace Coop
             const uint32_t rec = Record(base, e);
             if (!rec) return false;
             // the buttons the game keeps in the record (+1352; bit 0 attack): Use is found in the first test
-            static const uint32_t mask = [] { const char* t = getenv("COD3_COOP_USEMASK"); return t ? uint32_t(strtoul(t, nullptr, 16)) : 0x40u; }();
             // COD3_COOP_TESTUSE="a b": the host holds Use from a to b s into the mission (a test of revive)
             if (who == 0)
             {
@@ -300,7 +359,9 @@ namespace Coop
                 const double mt = MissionTime();
                 if (a >= 0 && mt >= a && mt <= b) return true;
             }
-            return (Guest::Read32(base, rec + 1352) & mask) != 0;
+            // (0.5.875) Use is the pad's X (the keyboard's Use and Reload are X too): read from each player's own pad,
+            // the joining player's sent in his commands (the record's +1352 bits never showed a Use)
+            return who == 0 ? (Input::Buttons() & 0x4000) != 0 : JoinerUseHeld();
         }
     }
 }
@@ -328,6 +389,20 @@ PPC_FUNC(sub_82564888)
     if (IsHost())
     {
         const int who = Who(base, target);
+        // (0.5.924) NO FRIENDLY FIRE between the two players (World at War's co-op default): since 0.5.915 the joining
+        // player's shots and grenades are real in the host's world, and t923a he shot the host (150, 150, 176). A
+        // player's own grenade still hurts himself. COD3_COOP_FF=1: friendly fire on.
+        {
+            static const bool ff = []() { const char* t = getenv("COD3_COOP_FF"); return t && t[0] == '1'; }();
+            const int by = Who(base, attacker);
+            if (!ff && who >= 0 && by >= 0 && by != who && TwoPlayers(base))
+            {
+                static int told = 0;
+                if (told++ < 20) { printf("coop: host: %s hit by %s for %d (means %d): no friendly fire\n", who == 0 ? "the host" : "the joining player", by == 0 ? "the host" : "the joining player", damage, means); fflush(stdout); }
+                return;
+            }
+        }
+        if (who >= 0 && !g_p[who].down && Now() < g_p[who].safeUntil && TwoPlayers(base)) return;   // (0.5.869: just back in)
         if (who >= 0 && g_p[who].down && TwoPlayers(base))
         {
             // (down: no more damage; how often the AI still shoots at him, for the log)
@@ -343,11 +418,64 @@ PPC_FUNC(sub_82564888)
         // client 1 hurt by the world here (his falls are his own game's: R_SELFHIT brings them)
         if (who == 1 && !g_injecting && (!attacker || !Valid(attacker) || attacker == target || base[attacker] == 0)) return;
     }
+    // (0.5.907) THE JOINING PLAYER'S HITS ON THE LEVEL'S THINGS. The level's scripts are compiled code that acts for
+    // the host's player only (as with touches, 0.5.897): a damage trigger or a target that the joining player shoots
+    // or blows up is told as the host's player's doing, so the mission hears it. Soldiers and players keep their real
+    // attacker (who to shoot back at, the scores, team damage). COD3_COOP_DMGASHOST=0: as before.
+    if (IsHost() && attacker && attacker == SecondPlayer() && Valid(target) && Who(base, target) < 0 && base[target] != 11 && Me(base))
+    {
+        static const bool off = []() { const char* t = getenv("COD3_COOP_DMGASHOST"); return t && t[0] == '0'; }();
+        static int told = 0;
+        if (told++ < 80) { printf("coop: host: the joining player hit %s (entity %d, type %u) for %d, means %d%s\n", BrocText(base, target + 564).c_str(), IndexOf(base, target), base[target], damage, means, off ? "" : ": told as the host's player's"); fflush(stdout); }
+        if (!off) ctx.r5.u64 = Me(base);
+    }
+    // (0.5.887) With two players a player never dies INSIDE the game's damage: he takes the hit behind a shield
+    // of health, what it took is measured, and a hit that would have taken him to nothing is the rule's (down,
+    // revive, back in). t885b: a grenade at the host's feet failed the mission with neither this hook's line
+    // after the call nor the die hook's: the game's own death left this call without coming back, by a way
+    // that is not sub_8255F320. Now there is no death in there to leave by.
+    int shielded = -1;
+    constexpr int32_t Shield = 1000000;
+    if (IsHost() && TwoPlayers(base) && before > 0 && before < Shield && damage > 0)
+    {
+        shielded = Who(base, target);
+        if (shielded >= 0) Guest::Write32(base, target + 776, uint32_t(before + Shield));
+    }
     __imp__sub_82564888(ctx, base);
+    if (shielded >= 0)
+    {
+        const int32_t held = int32_t(Guest::Read32(base, target + 776));
+        const int32_t took = std::clamp(before + Shield - held, 0, Shield);
+        int32_t left = before - took;
+        // (0.5.888) every hit a player takes behind the shield, for the log (t887a: five grenades at the host's
+        // feet, no death and no line: was he hit at all?)
+        { static int told = 0; if (told++ < 120) { printf("coop: shield: %s hit %d (means %d, flags %08X, by %s type %u, inflictor %s): took %d of %d, %d left\n", shielded == 0 ? "the host" : "the joining player", damage, means, ctx.r9.u32,
+              attacker && Valid(attacker) ? BrocText(base, attacker + 564).c_str() : "nothing", attacker && Valid(attacker) ? base[attacker] : 0u, ctx.r4.u32 && Valid(ctx.r4.u32) ? BrocText(base, ctx.r4.u32 + 564).c_str() : "nothing", took, before, left); fflush(stdout); } }
+        if (left <= 0)
+        {
+            printf("coop: last stand: %s would have died here (hit %d, took %d of %d, means %d, by %s)\n", shielded == 0 ? "the host" : "the joining player", damage, took, before, means, attacker && Valid(attacker) ? BrocText(base, attacker + 564).c_str() : "nothing"); fflush(stdout);
+            LastStandTakes(ctx, base, target, damage, means, attacker);
+            left = 1;
+        }
+        Guest::Write32(base, target + 776, uint32_t(left));
+    }
     Probe40Damage(base, target, attacker, damage, means, ctx.r9.u32, before);
     if (IsHost())
     {
         const int who = Who(base, target);
+        // (0.5.885) every hit on a player that takes him to nothing, and big ones: which way a death comes
+        // (t884a: the host "killed by a grenade", the mission failed, and no line of the rule in the log)
+        if (who >= 0)
+        {
+            const int32_t after = int32_t(Guest::Read32(base, target + 776));
+            static int told = 0;
+            if ((after <= 0 || damage >= 100) && told++ < 60)
+            {
+                printf("coop: damage: %s hit for %d (means %d, by %s type %u), health %d -> %d, down %d, two players %d\n", who == 0 ? "the host" : "the joining player", damage, means,
+                       attacker && Valid(attacker) ? BrocText(base, attacker + 564).c_str() : "nothing", attacker && Valid(attacker) ? base[attacker] : 0u, before, after, g_p[who].down ? 1 : 0, TwoPlayers(base) ? 1 : 0);
+                fflush(stdout);
+            }
+        }
         if (who >= 0 && g_p[who].down && int32_t(Guest::Read32(base, target + 776)) < 1) Guest::Write32(base, target + 776, 1);
         // a kill for the scores: an enemy soldier (axis) brought to nothing by one of the two players
         const int by = Who(base, attacker);
@@ -391,12 +519,37 @@ PPC_FUNC(sub_8255F320)
         Guest::Write32(base, ctx.r3.u32 + 776, uint32_t(mx > 0 ? mx : 100));
         return;
     }
+    if (IsHost())
+    {
+        // (0.5.885) every death of a player that comes here, and what the rule is asked with
+        static int told = 0;
+        if (told++ < 40)
+        {
+            const uint32_t s = SecondPlayer();
+            printf("coop: die: entity %08X (the host's %08X, client 1's %08X) means %d damage %d by %08X, from %08X; peer %d, client 1 type %u\n", ctx.r3.u32, Me(base), s, int32_t(ctx.r7.u32), int32_t(ctx.r6.u32), ctx.r5.u32, uint32_t(ctx.lr), PeerConnected() ? 1 : 0, s && Valid(s) ? base[s] : 255u);
+            fflush(stdout);
+        }
+    }
     if (IsHost() && LastStandTakes(ctx, base, ctx.r3.u32, int32_t(ctx.r6.u32), int32_t(ctx.r7.u32), ctx.r5.u32))
     {
         Guest::Write32(base, ctx.r3.u32 + 776, 1);
         return;
     }
     __imp__sub_8255F320(ctx, base);
+}
+
+// (0.5.886) DIAGNOSTIC: the two other ways into a death, logged with who called
+extern "C" PPC_FUNC(__imp__sub_8255EF30);
+PPC_FUNC(sub_8255EF30)
+{
+    if (IsHost()) { static int told = 0; if (told++ < 20) { printf("coop: death routine sub_8255EF30: r3 %08X r4 %08X r5 %08X, from %08X\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, uint32_t(ctx.lr)); fflush(stdout); } }
+    __imp__sub_8255EF30(ctx, base);
+}
+extern "C" PPC_FUNC(__imp__sub_8255F488);
+PPC_FUNC(sub_8255F488)
+{
+    if (IsHost()) { static int told = 0; if (told++ < 20) { printf("coop: sub_8255F488: r3 %08X r4 %08X r5 %08X r6 %08X, from %08X\n", ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, uint32_t(ctx.lr)); fflush(stdout); } }
+    __imp__sub_8255F488(ctx, base);
 }
 
 #endif

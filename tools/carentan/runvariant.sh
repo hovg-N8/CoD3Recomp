@@ -19,6 +19,8 @@ if [ "${SCENE:-1}" = 1 ]; then
     python -I scene.py zone "$W/test$V/zn01.cod" "$W/test$V/zn02.cod" "$W/test$V/zn03.cod" | cut -c1-160
     python -I scene.py level "$W/scene/carentan.cod.orig" "$W/scene/carentan.cod" "$W/c2/mp_carentan.d3dbsp" | tail -1
     LEVEL="$W/scene/carentan.cod"
+    # 2026-11-07 (0.5.852): War/Dom/HQ trigger boxes moved into the .dcgb (CoD3 does not move them by origin)
+    python -I triggers.py "$LEVEL" | tail -1
     # every BSP leaf in cell 001 (Carentan's one cell): ONE_CELL_BSP=0 keeps Rouen's
     [ "${ONE_CELL_BSP:-1}" = 1 ] && python -I scene.py onecell "$LEVEL" | tail -1
     # Rouen's grass (level.bgib) out of the level's directory: DROP_GRASS=0 keeps it

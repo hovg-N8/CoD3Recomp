@@ -43,6 +43,8 @@ namespace Input
     // the team and class menus): "a", "b", "start", ... for two of the
     // title's reads of the pad, as COD3_PAD's presses.
     void PressButton(const char* name);
+    // 0.5.853: the left trigger held from code while true (tests: COD3_ADS_TEST)
+    void HoldAim(bool held);
     // 0.5.454: once noclip has been typed in the console, a double tap of A
     // (or jump) puts noclip on and off
     void ArmNoclipTap();
@@ -113,6 +115,10 @@ namespace Input
     // mortar (the campaign mortar interaction reads it to load a round).
     void SetMortarPassFire(bool pass);
     void PressCrouch();   // 0.5.307: one tap of crouch (B) for a few reads
+    void HoldButtons(uint16_t mask, int ms);
+    void SetLook(float rx, float ry, int ms);   // 0.5.979: the right stick held there (-1..1) for ms (tests)
+    void PullTriggers(int leftMs, int rightMs);   // 0.5.979: the triggers pulled for so long (tests)   // 0.5.972: pad buttons (XInput bits) held for ms (tests)
+    void PressWeaponCycle();   // 0.5.948: one tap of the weapon cycle (Y) for a few reads
     int TakeMortarFires();
     // MP gameplay consumes each Y/wheel edge once through the native weapon
     // command; native menu/vehicle Y remains available when the bridge is off.

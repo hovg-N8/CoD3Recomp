@@ -100,13 +100,16 @@ set(COD3_HOST_SOURCES
     "native_options.cpp"
     "coop_swap.cpp"       # co-op v46: the joining copy's checkpoint reload behind its window
     "coop.cpp"            # co-op v40 (Team Friend, 0.5.622 merge; COD3_COOP=host|join; empty in multiplayer)
+    "coop_inventory.cpp"  # co-op (0.5.901): the joining player's weapons and rounds, kept by the host
     "coop_host.cpp"       # co-op v40: the host's second player, snapshots, config strings
     "coop_join.cpp"       # co-op v40: the joining copy's frozen world and puppets
     "coop_laststand.cpp"  # co-op v40: last stand, revive, mission failed
     "coop_hud.cpp"        # co-op v40: the co-op HUD (names, revive, scores)
     "coop_lobby.cpp"      # co-op v40: the lobby (F2: host, find, join, ready, start)
     "coop_events.cpp"     # co-op v40: the host's sounds, speech, music, earthquakes on the joining copy
-    "coop_probe.cpp")     # co-op v40 design probe (COD3_PROBE40)
+    "coop_probe.cpp"      # co-op v40 design probe (COD3_PROBE40)
+    "coop_actionprobe.cpp"    # (0.5.972) the scripted-action probe (COD3_COOP_ACTIONPROBE, generated)
+    "coop_memscan.cpp")       # (0.5.987) committed-memory test for co-op probes
 add_executable(CoD3 WIN32 ${COD3_HOST_SOURCES} "resources/CoD3.rc")
 
 # The HDR mode's shaders (hdr/cod3_hdr.hlsl on RenoDX's shader library and

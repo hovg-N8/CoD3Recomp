@@ -1,0 +1,9 @@
+name = "cod3-updates"
+main = "worker.mjs"
+account_id = "03a45a9eaa5b72d0e95aca3957568b5f"
+compatibility_date = "2026-11-08"
+workers_dev = true
+
+[[r2_buckets]]
+binding = "RELEASES"
+bucket_name = "cod3-port-updates"

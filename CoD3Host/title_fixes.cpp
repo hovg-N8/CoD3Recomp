@@ -150,7 +150,7 @@ PPC_FUNC(sub_824D0470)
     if (coop)
     {
         __imp__sub_824D0470(ctx, base);
-        const bool pressed = (ctx.r3.u32 & 0xFF) == 1;
+        const bool pressed = autoSkip || (ctx.r3.u32 & 0xFF) == 1;   // (0.5.870: COD3_SKIPFILMS in co-op counts as the press: tests need no A)
         ctx.r3.u64 = CoopFilmStop(pressed) ? 1 : 0;
         return;
     }
