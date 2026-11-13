@@ -1,3 +1,5 @@
+**2026-11-13 (Claude): 0.6.4 EVERYWHERE, no game code changed. Versions roll over at 999 (0.5.1000-1004 renamed 0.6.0-0.6.4; next build 0.6.5). Exes rebuilt to say 0.6.4; friend zip CoD3MP-update-0.6.4.zip; launcher feed published 0.6.4; GitHub fork main ee2d32e (source + launcher/ + README) and release v0.6.4. Read docs/CLAUDE-SESSION-2026-11-13.md (launcher publish steps, the key never leaves AppData). Game work open: as below.**
+
 **2026-11-12 afternoon (Claude): 0.6.4 built. Joiner lands with the host after Saint-Lo's wall (0.5.991/0.5.993, t993a); live-grenade pick-up works for the host (t993a); the joiner's went to the host (t999a); held back since 0.6.4 (t1004a). Nothing committed, no zip.**
 
 **2026-11-12 morning (Claude): 0.5.990 built (a sprinting host no longer starts a false ride for the joiner, t990b). The joiner's cutscene camera is closed: Saint-Lo's hop is the host's own moved view (t990a). Nothing committed, no zip.**

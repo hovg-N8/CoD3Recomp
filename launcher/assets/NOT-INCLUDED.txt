@@ -1,0 +1,10 @@
+Not in this repository (put them here yourself before running BUILD.ps1):
+
+- battle-ambience.wav, normandy-score.wav, field-radio.wav, frontline-mix.wav:
+  the launcher's audio. frontline-mix.wav contains a supplied commercial
+  recording and field-radio.wav supplied radio audio, so none of the audio
+  is shared here. tools/make_ambience.py, make_score.py, mix_field_radio.py
+  and Make-FieldRadio.ps1 show how they were made.
+- treyarch-logo.png: Treyarch's logo (credits screen).
+
+The background art and the JARC emblem in this folder are the launcher's own.

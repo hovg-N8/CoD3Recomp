@@ -159,6 +159,13 @@ if (Test-Path $replace) {
 } else {
     Write-Host '  (lean update: the executables, version, notes and installer only; MAKE-FRIEND-UPDATE.bat full for everything)'
 }
+# 0.6.4: the player launcher (V3) rides along in CoD3Launcher\ (exe, config, public key, readme),
+# in lean and full zips alike.
+$launcher = Join-Path $Here 'CoD3Launcher'
+if (Test-Path -LiteralPath (Join-Path $launcher 'CoD3Launcher.exe')) {
+    Write-Host '  copying CoD3Launcher (the player launcher)'
+    Copy-Item -LiteralPath $launcher $Out -Recurse
+}
 
 $version = (Get-Content (Join-Path $Here 'VERSION.txt') -Raw).Trim()
 $entries = foreach ($name in 'CoD3MP.exe','CoD3.exe') {

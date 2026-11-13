@@ -10,6 +10,18 @@ using System.Net;
 using System.Windows.Forms;
 
 namespace Cod3Launcher {
+ public sealed class CloudMetadata { public long size; public string etag; }
+ public interface ICloudObjects { CloudMetadata Head(string key); byte[] Get(string key,int max); }
+ public sealed class HttpCloudObjects : ICloudObjects {
+  public CloudMetadata Head(string key) {
+   ServicePointManager.SecurityProtocol=SecurityProtocolType.Tls12;
+   var request=(HttpWebRequest)WebRequest.Create("https://cod3-updates.hovgtv.workers.dev/"+key);
+   request.Method="HEAD";request.AllowAutoRedirect=false;request.Timeout=15000;request.Headers["Cache-Control"]="no-cache";
+   try{using(var response=(HttpWebResponse)request.GetResponse()){if(response.StatusCode!=HttpStatusCode.OK)throw new IOException("Unexpected cloud metadata response");return new CloudMetadata {size=response.ContentLength,etag=response.Headers[HttpResponseHeader.ETag]};}}
+   catch(WebException e){if(e.Response is HttpWebResponse&&((HttpWebResponse)e.Response).StatusCode==HttpStatusCode.NotFound){e.Response.Dispose();return null;}throw;}
+  }
+  public byte[] Get(string key,int max){return new HttpTransport("https://cod3-updates.hovgtv.workers.dev").Get(key,max);}
+ }
  public static class Selection {
   public static List<string> Inventory(string root) {
    Rules.BaseInstall(root);
@@ -52,7 +64,7 @@ namespace Cod3Launcher {
    foreach(var file in release.files) using(var fullHash=SHA256.Create()) {
     foreach(var chunk in file.chunks) {
      string path=SafePaths.Resolve(output,chunk.key);
-     if(!File.Exists(path) || new FileInfo(path).Length!=chunk.packedSize) throw new InvalidDataException("Missing or damaged release object: "+chunk.key);
+     if(!File.Exists(path) || new FileInfo(path).Length!=chunk.packedSize || Codec.HashFile(path)!=chunk.key.Substring(8,64)) throw new InvalidDataException("Missing or damaged release object: "+chunk.key);
      using(var input=File.OpenRead(path)) using(var gzip=new GZipStream(input,CompressionMode.Decompress)) using(var hash=SHA256.Create()) {
       byte[] buffer=new byte[65536];int n;long count=0;
       while((n=gzip.Read(buffer,0,buffer.Length))>0) {count+=n;if(count>chunk.size)throw new InvalidDataException("Oversized release chunk");hash.TransformBlock(buffer,0,n,null,0);fullHash.TransformBlock(buffer,0,n,null,0);}
@@ -83,12 +95,23 @@ namespace Cod3Launcher {
    string version=File.ReadAllText(SafePaths.Resolve(root,"VERSION.txt")).Trim(); Version parsed;
    if(!Version.TryParse(version,out parsed)) throw new InvalidDataException("Invalid VERSION.txt");
    Directory.CreateDirectory(Path.Combine(output,"objects"));
+   string privateXml=File.ReadAllText(privateFile);
+   var previous=new Dictionary<string,ContentFile>(StringComparer.OrdinalIgnoreCase);
+   string previousCandidate=Path.Combine(output,"candidate.json");
+   if(File.Exists(previousCandidate))using(var key=Codec.Rsa()) {
+    key.FromXmlString(privateXml);
+    foreach(var file in Codec.Verify(File.ReadAllText(previousCandidate),key.ToXmlString(false)).files)previous.Add(file.path,file);
+   }
    var release=new Release {version=version};
    string notes=SafePaths.Resolve(root,"PATCH-NOTES.txt");
    if(File.Exists(notes)) { string all=File.ReadAllText(notes); release.notes=all.Substring(0,Math.Min(6000,all.Length)); }
-   int index=0;
+   int index=0,reused=0,built=0;
    foreach(string path in paths) {
-    if(report!=null) report((++index)+"/"+paths.Count+" "+path);
+    if(report!=null) report("Checking "+(++index)+"/"+paths.Count+" "+path);
+    ContentFile existing;
+    if(previous.TryGetValue(path,out existing)&&Reusable(root,output,existing)) {
+     release.files.Add(existing);reused++;if(report!=null)report("Reused: "+path);continue;
+    }
     var entry=new ContentFile {path=path};
     using(var source=new FileStream(SafePaths.Resolve(root,path),FileMode.Open,FileAccess.Read,FileShare.Read)) using(var fullHash=SHA256.Create()) {
      byte[] buffer=new byte[Rules.ChunkSize]; int n;
@@ -105,42 +128,74 @@ namespace Cod3Launcher {
      fullHash.TransformFinalBlock(new byte[0],0,0); entry.sha256=BitConverter.ToString(fullHash.Hash).Replace("-","").ToLowerInvariant();
     }
     release.files.Add(entry);
+    built++;if(report!=null)report("Built: "+path);
    }
    var after=Selection.Inventory(root);
    if(!paths.SequenceEqual(after,StringComparer.OrdinalIgnoreCase) || snapshots.Any(p=>Stamp(SafePaths.Resolve(root,p.Key))!=p.Value)) throw new IOException("Source files changed during packaging. Candidate was not published; rerun with a stable install.");
    Rules.Validate(release);
-   Codec.AtomicText(Path.Combine(output,"candidate.json"),Codec.Sign(release,File.ReadAllText(privateFile)));
-   Codec.AtomicText(Path.Combine(output,"inventory.json"),Codec.Json().Serialize(new {version=version,files=paths.Count,bytes=release.files.Sum(f=>f.size),groups=release.files.GroupBy(f=>Selection.Group(f.path)).Select(g=>new {name=g.Key,files=g.Count(),bytes=g.Sum(f=>f.size)}).ToArray()}));
+   Codec.AtomicText(Path.Combine(output,"candidate.json"),Codec.Sign(release,privateXml));
+   Codec.AtomicText(Path.Combine(output,"inventory.json"),Codec.Json().Serialize(new {version=version,files=paths.Count,bytes=release.files.Sum(f=>f.size),build=new {checkedFiles=paths.Count,reusedFiles=reused,builtFiles=built},groups=release.files.GroupBy(f=>Selection.Group(f.path)).Select(g=>new {name=g.Key,files=g.Count(),bytes=g.Sum(f=>f.size)}).ToArray()}));
+   if(report!=null)report("Build summary: "+reused+" reused, "+built+" built; "+paths.Count+" files in the complete release.");
    return release;
+  }
+  static bool Reusable(string root,string output,ContentFile previous) {
+   string source=SafePaths.Resolve(root,previous.path);
+   if(!Engine.Matches(source,previous.size,previous.sha256))return false;
+   foreach(var chunk in previous.chunks)if(!Engine.Matches(SafePaths.Resolve(output,chunk.key),chunk.packedSize,chunk.key.Substring(8,64)))return false;
+   return true;
   }
   static string Stamp(string file) { var info=new FileInfo(file); return info.Length+":"+info.LastWriteTimeUtc.Ticks; }
   static int ReadChunk(Stream input,byte[] bytes) { int count=0,n; while(count<bytes.Length && (n=input.Read(bytes,count,bytes.Length-count))>0) count+=n; return count; }
  }
  public static class Publisher {
+  public static string ValidatedMd5(Stream file,Chunk chunk) {
+   using(var sha=SHA256.Create())using(var md5=MD5.Create()) {
+    byte[] buffer=new byte[65536];int n;long size=0;
+    while((n=file.Read(buffer,0,buffer.Length))>0){size+=n;sha.TransformBlock(buffer,0,n,null,0);md5.TransformBlock(buffer,0,n,null,0);}
+    sha.TransformFinalBlock(new byte[0],0,0);md5.TransformFinalBlock(new byte[0],0,0);
+    string digest=BitConverter.ToString(sha.Hash).Replace("-","").ToLowerInvariant();
+    if(size!=chunk.packedSize||digest!=chunk.key.Substring(8,64))throw new InvalidDataException("Local upload object changed or is damaged; release was not published.");
+    return BitConverter.ToString(md5.Hash).Replace("-","").ToLowerInvariant();
+   }
+  }
+  public static bool HasObject(Chunk chunk,string expectedMd5,ICloudObjects cloud) {
+   var metadata=cloud.Head(chunk.key);
+   if(metadata==null||metadata.size!=chunk.packedSize)return false;
+   if(MetadataMatches(metadata.size,metadata.etag,chunk,expectedMd5))return true;
+   return RemoteObjectValid(cloud.Get(chunk.key,Rules.ChunkSize+65536),chunk);
+  }
+  public static bool MetadataMatches(long remoteSize,string remoteEtag,Chunk chunk,string localMd5) {
+   return remoteSize==chunk.packedSize&&!String.IsNullOrEmpty(localMd5)&&localMd5.Length==32&&String.Equals(remoteEtag,"\""+localMd5+"\"",StringComparison.OrdinalIgnoreCase);
+  }
   public static bool RemoteObjectValid(byte[] data,Chunk chunk) { return data.Length==chunk.packedSize&&Codec.Hash(data)==chunk.key.Substring(8,64); }
   static string Quote(string value) { if(value.IndexOfAny(new[]{'"','%','!','\r','\n'})>=0)throw new InvalidDataException("Unsupported character in author-tool argument");return "\""+value+"\""; }
   static void Wrangler(params string[] args) {
    string command="/d /v:off /s /c \"npx.cmd "+String.Join(" ",new[]{"wrangler"}.Concat(args).Select(Quote))+"\"";
    using(var process=Process.Start(new ProcessStartInfo("cmd.exe",command){UseShellExecute=false})) {process.WaitForExit();if(process.ExitCode!=0)throw new IOException("Cloudflare command failed. Current release was not deliberately advanced; inspect the output above.");}
   }
-  static bool RemoteObjectExists(Chunk chunk) {
-   try {return RemoteObjectValid(new HttpTransport("https://cod3-updates.hovgtv.workers.dev").Get(chunk.key,Rules.ChunkSize+65536),chunk);}
-   catch(WebException e) {if(e.Response is HttpWebResponse && ((HttpWebResponse)e.Response).StatusCode==HttpStatusCode.NotFound){e.Response.Dispose();return false;}throw;}
-  }
   static void Publish(string output,string publicFile,string config) {
-   string candidate=Path.Combine(output,"candidate.json");var release=ReleaseBuilder.Verify(output,publicFile);string manifestHash=Codec.HashFile(candidate);
-   var chunks=release.files.SelectMany(f=>f.chunks).GroupBy(c=>c.key).Select(g=>g.First()).ToList();int index=0;
+   string candidate=Path.Combine(output,"candidate.json");
+   using(var candidateLease=new FileStream(candidate,FileMode.Open,FileAccess.Read,FileShare.Read)) {
+   var release=ReleaseBuilder.Verify(output,publicFile);string manifestHash=Codec.HashFile(candidate);var cloud=new HttpCloudObjects();
+   var chunks=release.files.SelectMany(f=>f.chunks).GroupBy(c=>c.key).Select(g=>g.First()).ToList();int index=0,skipped=0,uploaded=0;long uploadBytes=0;
    foreach(var chunk in chunks) {
-    Console.WriteLine("Content "+(++index)+"/"+chunks.Count);
-    if(!RemoteObjectExists(chunk)) {
-     Wrangler("r2","object","put","cod3-port-updates/"+chunk.key,"--file",SafePaths.Resolve(output,chunk.key),"--content-type","application/octet-stream","--remote","--config",config);
-     if(!RemoteObjectExists(chunk))throw new IOException("Uploaded object could not be confirmed; public release was not changed.");
+    Console.WriteLine("Checking cloud content "+(++index)+"/"+chunks.Count);
+    string localFile=SafePaths.Resolve(output,chunk.key);
+    using(var objectLease=new FileStream(localFile,FileMode.Open,FileAccess.Read,FileShare.Read)) {
+    string expectedMd5=ValidatedMd5(objectLease,chunk);
+    if(HasObject(chunk,expectedMd5,cloud)) {skipped++;Console.WriteLine("Already present - skipped ("+chunk.packedSize+" bytes)");continue;}
+    Console.WriteLine("Uploading new or repaired content ("+chunk.packedSize+" bytes)");
+    Wrangler("r2","object","put","cod3-port-updates/"+chunk.key,"--file",localFile,"--content-type","application/octet-stream","--remote","--config",config);
+    if(!HasObject(chunk,expectedMd5,cloud))throw new IOException("Uploaded object could not be confirmed; public release was not changed.");
+    uploaded++;uploadBytes+=chunk.packedSize;
     }
    }
    if(Codec.HashFile(candidate)!=manifestHash)throw new IOException("Candidate changed during upload; public release was not changed.");
    Wrangler("r2","object","put","cod3-port-updates/releases/"+release.version+"-"+manifestHash+".json","--file",candidate,"--content-type","application/json","--remote","--config",config);
    Wrangler("r2","object","put","cod3-port-updates/stable.json","--file",candidate,"--content-type","application/json","--remote","--config",config);
+   Console.WriteLine("Publish summary: "+skipped+" existing objects skipped, "+uploaded+" uploaded ("+uploadBytes+" bytes). Only release metadata is always republished.");
    Console.WriteLine("Published "+release.version+". Verify the launcher on a second PC before announcing the release.");
+   }
   }
   static void Prepare(string kitRoot) {
    kitRoot=Path.GetFullPath(kitRoot);string root="";string hint=Path.Combine(kitRoot,"GAME-FOLDER.txt");if(File.Exists(hint))root=File.ReadAllText(hint).Trim();
@@ -154,6 +209,7 @@ namespace Cod3Launcher {
   [STAThread]
   public static int Main(string[] args) {
    try {
+    Console.WriteLine("COD3 Author Tools 0.1.1 - incremental build and publish");
     if(args.Length==2&&args[0]=="prepare"){Prepare(args[1]);return 0;}
     if(args.Length==4&&args[0]=="publish"){Publish(args[1],args[2],args[3]);return 0;}
     if(args.Length==3 && args[0]=="keygen") { ReleaseBuilder.Keygen(args[1],args[2]); Console.WriteLine("Publisher key ready. Keep private-key.xml private and backed up."); return 0; }

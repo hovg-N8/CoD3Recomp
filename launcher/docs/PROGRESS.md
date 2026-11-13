@@ -28,7 +28,18 @@ Actual install inventory: 0.5.867, 317 files, ~3.25 GiB; all six map packs and
 or signing key included in the deliverable ZIP. Signing identity is generated
 by the author's first BUILD-RELEASE run in their real local application data.
 
-Live status: multiplayer master deployed and health-verified earlier. R2 UI
-confirms enabled, no buckets. Update Worker, bucket and first content release
-are not deployed. Command-line network access from this restricted session was
-unavailable; host-side complete author kit is provided for that step.
+Live status after initial delivery: user deployed the R2 bucket/update Worker
+and published initial release 0.5.867. Its live signed manifest was verified
+against the local candidate. Actual client download/gameplay testing remains
+separate from this manifest check.
+
+Author tools 0.1.1: complete source/file verification remains; unchanged build
+files reuse signed previous entries and compressed objects. Cloud comparisons
+use HEAD and matching local/R2 metadata to avoid full-body transfers, retaining
+SHA-256 fallback for unknown/mismatched metadata. Expected MD5 is bound to the
+compressed SHA-256 key and fixed while the local object is held read-only;
+candidate metadata is also held read-only during publishing.
+New regression tests cover reuse, corrupt cache repair, source changes with
+unchanged timestamps, client skip behavior, metadata fallback and upload locks.
+Independent review's mutation-race finding was fixed with tests. Final local
+suite: 36 core/publisher, 1 UI construction, 7 Worker tests pass.

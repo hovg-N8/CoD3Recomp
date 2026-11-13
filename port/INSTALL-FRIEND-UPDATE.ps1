@@ -57,7 +57,8 @@ foreach ($name in 'world_models.txt','dom_flags.txt','ctf-flags.txt','ctf-routes
 }
 # 0.5.851: 'saves' brings the map packs (Carentan, Seelow, Seelow Night) and 'game' the tank, Stuka
 # and mortar files: both merged into his folders, nothing of his removed.
-foreach ($name in 'dlc-tool','textures','kangaroo-technical-dossier','custom','saves','game') {
+# 0.6.4: 'CoD3Launcher' = the player launcher; run CoD3Launcher\CoD3Launcher.exe for later updates.
+foreach ($name in 'dlc-tool','textures','kangaroo-technical-dossier','custom','saves','game','CoD3Launcher') {
     $from = Join-Path $payload $name
     if ((Test-Path -LiteralPath $from) -and $target -ne $payload) { Copy-Item -LiteralPath $from -Destination $target -Recurse -Force }
 }

@@ -37,3 +37,9 @@ from the developer's changing live folder. Do not downgrade newer local builds.
 First release needs a publisher key, R2 bucket, deployed read-only Worker,
 uploaded verified candidate and a real two-PC campaign/multiplayer playtest.
 Local tests can prove transfer, repair and rollback before any cloud upload.
+
+Launcher visual/audio update requested November 8: original WWII battlefield
+art with dark readable UI, optional quiet original war ambience and a saved
+mute/on preference. Embed media in the executable so player packages retain
+the same simple companions. Pause audio while a launched game is running and
+stop/dispose it when closing. Preserve update and publishing protocols.

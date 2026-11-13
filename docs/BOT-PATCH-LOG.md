@@ -1,3 +1,7 @@
+<!-- claude-2026-11-13-handoff -->
+**Bots, 2026-11-13 (Claude):** no bot changes since 0.5.868 (the co-op work 0.5.869-0.6.4 left bots.cpp's behaviour alone). Bot state as of 0.6.4 is the 0.5.852-0.5.868 work below; it is on GitHub now (release v0.6.4). Versions roll over at 999 (0.5.1000 = 0.6.0).
+<!-- /claude-2026-11-13-handoff -->
+
 <!-- claude-2026-11-08-handoff -->
 **Bots, 2026-11-08 (Claude), 0.5.852-0.5.865:** bullets hold for a mate within 34 + 4% of the line (sidestep); grenades as 0.5.851 (user OK with grenade team damage); tank/artillery spare mates near the target. Tanks: drivers follow g_mapKnow routes (cells within 900), aim the turret and fire at enemies 250-3000; a bot's tank never moved because the vehicle think's routines zero moves for a set move-lock byte: BotLocksClear around sub_82591B40 (tanks take the +540 way: sub_82589C98/82591450/82590FC8). Moves now, ~5 u/s: open. Extra guns: ~60% of bots without a kit second gun (not anti-armor) get one of 17 (std::mt19937), flamethrower out within 450, others a third of lives; kept via g_wantGun.
 <!-- claude-2026-11-08-handoff -->

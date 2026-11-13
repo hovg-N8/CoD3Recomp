@@ -8,3 +8,7 @@ private-key.xml
 *.exe
 *.dll
 GAME-FOLDER.txt
+# Audio and the Treyarch logo are not shared here (see assets/NOT-INCLUDED.txt).
+*.wav
+tools/radio-voice/
+assets/treyarch-logo.png

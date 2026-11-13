@@ -88,6 +88,41 @@ class Tests {
   Test("same-length remote corruption fails content-address verification",delegate {byte[] correct=Encoding.UTF8.GetBytes("correct");var chunk=new Chunk {key="objects/"+Codec.Hash(correct)+".gz",packedSize=7};True(Publisher.RemoteObjectValid(correct,chunk));True(!Publisher.RemoteObjectValid(Encoding.UTF8.GetBytes("corrupt"),chunk));});
   Test("launch callback runs under the update lock",delegate {var f=new Fixture();var engine=new Engine(f.root);bool called=false;engine.Launch(delegate{called=true;Reject(delegate{new Engine(f.root).Apply(f.Release("CoD3MP.exe"),f.transport,null);});});True(called);Equal(0,f.transport.calls);});
   Test("known damaged install stays blocked after failed repair",delegate {var f=new Fixture();f.Put("VERSION.txt","0.5.867");var release=f.Release("CoD3MP.exe");using(var key=Codec.Rsa()){string pub=key.ToXmlString(false);string signed=Codec.Sign(release,key.ToXmlString(true));LocalState.Remember(f.root,signed,pub);True(!LocalState.CanPlay(f.root,pub));f.transport.failAt=1;Reject(delegate{new Engine(f.root).Apply(release,f.transport,null);});True(!LocalState.CanPlay(f.root,pub));f.transport.failAt=0;new Engine(f.root).Apply(release,f.transport,null);True(LocalState.CanPlay(f.root,pub));f.Put("CoD3MP.exe","corrupt after closing launcher");True(!LocalState.CanPlay(f.root,pub));}});
+  Test("second build reuses unchanged files and repairs a damaged cached object",delegate {
+   var f=FullFixture();string output=f.root+"-incremental";string state=f.root+"-state";string pub=Path.Combine(state,"public.xml");ReleaseBuilder.Keygen(state,pub);
+   var first=ReleaseBuilder.Build(f.root,output,Path.Combine(state,"private-key.xml"),null);var messages=new List<string>();
+   var second=ReleaseBuilder.Build(f.root,output,Path.Combine(state,"private-key.xml"),messages.Add);
+   Equal(first.files.Count,second.files.Count);Equal(first.files.Count,messages.Count(m=>m.StartsWith("Reused: ")));True(messages.Any(m=>m.StartsWith("Build summary:")));
+   var texture=second.files.Single(p=>p.path=="textures/replace/maps/campaign.png");File.WriteAllText(SafePaths.Resolve(output,texture.chunks[0].key),"damaged cache");
+   messages.Clear();ReleaseBuilder.Build(f.root,output,Path.Combine(state,"private-key.xml"),messages.Add);True(messages.Contains("Built: textures/replace/maps/campaign.png"));ReleaseBuilder.Verify(output,pub);
+  });
+  Test("changed source is rebuilt despite unchanged size and timestamp",delegate {
+   var f=FullFixture();string output=f.root+"-incremental";string state=f.root+"-state";string pub=Path.Combine(state,"public.xml");ReleaseBuilder.Keygen(state,pub);var one=ReleaseBuilder.Build(f.root,output,Path.Combine(state,"private-key.xml"),null);
+   string path=f.PathOf("textures/replace/maps/campaign.png");DateTime stamp=File.GetLastWriteTimeUtc(path);f.Put("textures/replace/maps/campaign.png","CAMPAIGN TEXTURE");File.SetLastWriteTimeUtc(path,stamp);var messages=new List<string>();var two=ReleaseBuilder.Build(f.root,output,Path.Combine(state,"private-key.xml"),messages.Add);
+   True(one.files.Single(p=>p.path.EndsWith("campaign.png")).sha256!=two.files.Single(p=>p.path.EndsWith("campaign.png")).sha256);True(messages.Contains("Built: textures/replace/maps/campaign.png"));True(messages.Count(m=>m.StartsWith("Reused: "))==two.files.Count-1);
+  });
+  Test("cloud metadata must match exact size and R2 ETag",delegate {
+   var chunk=new Chunk {packedSize=42};string md5=new string('a',32);
+   True(Publisher.MetadataMatches(42,"\""+md5+"\"",chunk,md5));True(!Publisher.MetadataMatches(41,"\""+md5+"\"",chunk,md5));True(!Publisher.MetadataMatches(42,"\""+new string('b',32)+"\"",chunk,md5));True(!Publisher.MetadataMatches(42,"W/\""+md5+"\"",chunk,md5));True(!Publisher.MetadataMatches(42,"\""+md5+"-2\"",chunk,md5));True(!Publisher.MetadataMatches(42,null,chunk,md5));
+  });
+  Test("a new client update skips matching files and fetches only its added file",delegate {
+   var f=new Fixture();var first=f.Release("CoD3MP.exe","textures/replace/menu.png");var engine=new Engine(f.root);engine.Apply(first,f.transport,null);int before=f.transport.calls;
+   var next=f.Release("CoD3MP.exe","textures/replace/menu.png","textures/replace/new.png");next.version="0.5.868";engine.Apply(next,f.transport,null);Equal(before+1,f.transport.calls);Equal("updated: textures/replace/menu.png",f.Read("textures/replace/menu.png"));Equal("updated: textures/replace/new.png",f.Read("textures/replace/new.png"));
+  });
+  Test("publisher binds metadata checksum to the immutable compressed object key",delegate {
+   byte[] bytes=Encoding.UTF8.GetBytes("correct");var c=new Chunk {key="objects/"+Codec.Hash(bytes)+".gz",packedSize=bytes.Length};
+   using(var correct=new MemoryStream(bytes)){string expected=Publisher.ValidatedMd5(correct,c);True(expected.Length==32);}
+   using(var changed=new MemoryStream(Encoding.UTF8.GetBytes("corrupt")))Reject(delegate{Publisher.ValidatedMd5(changed,c);});
+  });
+  Test("metadata fast path skips body while unusual ETags use SHA256 fallback",delegate {
+   byte[] bytes=Encoding.UTF8.GetBytes("correct");var c=new Chunk {key="objects/"+Codec.Hash(bytes)+".gz",packedSize=bytes.Length};string md5;
+   using(var input=new MemoryStream(bytes))md5=Publisher.ValidatedMd5(input,c);
+   var cloud=new FakeCloud {body=bytes,metadata=new CloudMetadata {size=bytes.Length,etag="\""+md5+"\""}};
+   True(Publisher.HasObject(c,md5,cloud));Equal(0,cloud.gets);
+   foreach(string etag in new[]{null,"W/\""+md5+"\"","\""+md5+"-2\"","\""+new string('b',32)+"\""}){cloud.metadata.etag=etag;cloud.gets=0;True(Publisher.HasObject(c,md5,cloud));Equal(1,cloud.gets);}
+   cloud.body=Encoding.UTF8.GetBytes("corrupt");True(!Publisher.HasObject(c,md5,cloud));cloud.metadata=null;cloud.gets=0;True(!Publisher.HasObject(c,md5,cloud));Equal(0,cloud.gets);
+  });
+  Test("publisher holds local upload object against modification",delegate {var f=new Fixture();string path=f.PathOf("object.gz");File.WriteAllText(path,"correct");var c=new Chunk {key="objects/"+Codec.Hash(File.ReadAllBytes(path))+".gz",packedSize=7};using(var held=new FileStream(path,FileMode.Open,FileAccess.Read,FileShare.Read)){Publisher.ValidatedMd5(held,c);Reject(delegate{File.WriteAllText(path,"corrupt");});Equal("correct",File.ReadAllText(path));}});
   Console.WriteLine("RESULT: "+passed+" passed, "+failed+" failed"); return failed==0?0:1;
  }
  static Fixture FullFixture() {
@@ -100,4 +135,9 @@ class Tests {
 sealed class DiskTransport : ITransport {
  readonly string folder;public DiskTransport(string directory){folder=directory;}
  public byte[] Get(string key,int max){byte[] data=File.ReadAllBytes(SafePaths.Resolve(folder,key));if(data.Length>max)throw new InvalidDataException("Too much data");return data;}
+}
+sealed class FakeCloud : ICloudObjects {
+ public CloudMetadata metadata;public byte[] body;public int gets;
+ public CloudMetadata Head(string key){return metadata;}
+ public byte[] Get(string key,int max){gets++;if(body.Length>max)throw new InvalidDataException("Too large");return body;}
 }

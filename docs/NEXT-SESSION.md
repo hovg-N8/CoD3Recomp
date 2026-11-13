@@ -1,5 +1,10 @@
-# NEXT SESSION (updated 2026-11-12 ~14:20, Claude): source+install 0.6.4 built OK; nothing committed (fork 0.5.851); no friend zip.
-Read docs/CLAUDE-SESSION-2026-11-12.md FIRST. Headlines:
+# NEXT SESSION (updated 2026-11-13, Claude): source+install 0.6.4; on GitHub (fork main ee2d32e, release v0.6.4); launcher feed 0.6.4; friend zip CoD3MP-update-0.6.4.zip.
+Read docs/CLAUDE-SESSION-2026-11-13.md for versions, the launcher and GitHub (no game code changed there).
+- The next build is 0.6.5 (`## 0.6.5:`). The last number stops at 999 (0.6.999 -> 0.7.0).
+- A new launcher release: Publisher.exe prepare, ASK the user, then publish (steps in that file).
+- The 2026-11-13 handoff docs are not in the fork yet (copy + commit, the user pushes in GitHub Desktop).
+- Game work: the user planned a co-op test with the friend on 0.6.4; "check the log" after. Then as below.
+Read docs/CLAUDE-SESSION-2026-11-12.md for the co-op state. Headlines:
 00. AFTERNOON: the joiner lands WITH the host after Saint-Lo's wall (0.5.991 + 0.5.993, t993a). Live-grenade
    pick-up works for the host (t993a); the JOINER'S used to play on the HOST (t999a); since 0.6.4 it is held back (t1004a). The user plans a co-op test with the friend today.
 0. MORNING: the joiner's cutscene camera lead is CLOSED (the hop is the host's own moved view; t990a). 0.5.990: a

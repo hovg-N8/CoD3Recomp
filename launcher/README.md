@@ -1,4 +1,13 @@
-# COD3 PC Launcher — first build (0.1.0)
+# COD3 PC Launcher - author tools 0.1.1 / player launcher v2 (0.2.0)
+
+Launcher v2 adds a left-hand Campaign/Multiplayer menu, battlefield artwork,
+compact JARC and original-game Treyarch credits, and optional quiet battle
+ambience. The audio preference is remembered and audio pauses while the game
+runs. Read docs/LAUNCHER-V2.md for installation and artwork credits.
+
+Author tools now reuse unchanged build files and skip matching cloud objects
+with small metadata checks. Read docs/INCREMENTAL-UPDATES.md when upgrading an
+existing author folder. Existing player launchers already skip matching files.
 
 This kit contains the compiled Windows player launcher, your publishing tools,
 the update-service source, tests and build source. It does not contain the
@@ -8,7 +17,9 @@ Those are selected from your existing installation when you prepare a release.
 Your existing multiplayer directory is live at
 https://cod3-master.hovgtv.workers.dev. This kit targets a separate update
 service at https://cod3-updates.hovgtv.workers.dev, in the same Cloudflare
-account. The update service has not been deployed by this build session.
+account. Update hosting was configured and the first signed release was
+published after the initial kit was delivered. This author-tool upgrade does
+not change your live release or require deploying the Worker again.
 
 ## First setup on Justin's PC
 
@@ -76,10 +87,10 @@ The actual install inventory at preparation was version 0.5.867, 317 selected
 files, approximately 3.25 GiB uncompressed; details are in docs/INSTALL-INVENTORY.json.
 No writes were made to the live installation or original game source.
 
-Still required: live R2/Worker setup, the first full release build/upload,
-and a real two-PC update/repair and campaign/multiplayer playtest. A health
-response alone does not prove a game session can be joined. This is a first
-build, not a public-release certification.
+The initial R2/Worker setup and first release upload were completed after
+delivery. Still required: a real two-PC update/repair and campaign/multiplayer
+playtest, plus a publishing run with the new incremental author tools. A health
+response alone does not prove a game session can be joined.
 
 Source maintenance: BUILD.ps1 compiles and runs the .NET 4.8 tests; run
 node --test tests/worker.test.mjs for the Worker tests. Use x64 Windows.
